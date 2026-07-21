@@ -217,7 +217,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                             modifier = Modifier.size(32.dp)
                         )
                         Text(
-                            text = "رفيق الراتب الذكي",
+                            text = "حساب العامل الذكي",
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
@@ -2665,7 +2665,7 @@ fun AppLockScreen(
             }
 
             Text(
-                text = "رفيق الراتب الذكي",
+                text = "حساب العامل الذكي",
                 style = MaterialTheme.typography.headlineMedium,
                 color = Color.White,
                 fontWeight = FontWeight.Bold
@@ -2866,7 +2866,7 @@ fun WelcomeLoginScreen(
             }
             
             Text(
-                text = "مرحباً بك في رفيق الراتب الذكي 👋",
+                text = "مرحباً بك في حساب العامل الذكي 👋",
                 style = MaterialTheme.typography.headlineSmall,
                 color = Color.White,
                 fontWeight = FontWeight.Bold,

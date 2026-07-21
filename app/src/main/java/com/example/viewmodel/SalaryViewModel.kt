@@ -497,7 +497,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             💵 *المبلغ المتبقي الصافي له: ${m.netBalance.toInt()} $cur*
             ========================
             
-            تم التصدير بواسطة تطبيق رفيق الراتب الذكي 📱
+            تم التصدير بواسطة تطبيق حساب العامل الذكي 📱
         """.trimIndent()
     }
 

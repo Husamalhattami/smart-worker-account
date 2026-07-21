@@ -212,7 +212,7 @@ object PdfPrintHelper {
                 <body>
                     <div class="header-container">
                         <div>
-                            <h1 class="app-title">رفيق الراتب الذكي 📱</h1>
+                            <h1 class="app-title">حساب العامل الذكي 📱</h1>
                             <p class="report-subtitle">كشف حساب مالي رسمي ودقيق للموظف</p>
                         </div>
                         <div style="text-align: left; font-size: 12px; color: #64748b;">
@@ -367,7 +367,7 @@ object PdfPrintHelper {
                     </table>
 
                     <div class="footer-container">
-                        <span>تم إصدار هذا الكشف تلقائياً وبأمان عبر رفيق الراتب الذكي</span>
+                        <span>تم إصدار هذا الكشف تلقائياً وبأمان عبر حساب العامل الذكي</span>
                         <span>توقيع الموظف: ............................</span>
                     </div>
                 </body>

@@ -58,7 +58,7 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 channelId,
-                "تنبيهات رفيق الراتب اليومية",
+                "تنبيهات حساب العامل الذكي اليومية",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "قناة لتذكيرك اليومي بتسجيل بياناتك لتفادي النسيان"
@@ -86,7 +86,7 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
 
         val notification = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-            .setContentTitle("تذكير رفيق الراتب الذكي ⏰")
+            .setContentTitle("تذكير حساب العامل الذكي ⏰")
             .setContentText("يا $nameToCall، يرجى تسجيل بيانات يومك (شغل، غياب، أو صرفة)")
             .setStyle(NotificationCompat.BigTextStyle()
                 .bigText("يا $nameToCall، يرجى تسجيل بيانات يومك (شغل، غياب، أو صرفة) لضمان عدم نسيان التسجيل لحساب راتبك الصافي بدقة."))
