@@ -1,0 +1,6 @@
+{
+  "name": "رفيق الراتب",
+  "description": "تطبيق ذكي وبسيط لمساعدة محمد خالد العريفي على إدارة راتبه وحسابه اليومي بالصوت والأيقونات والألوان دون الحاجة للقراءة والكتابة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
