@@ -68,6 +68,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
+    private val _userNotice = MutableSharedFlow<String>(extraBufferCapacity = 10)
+    val userNotice: SharedFlow<String> = _userNotice.asSharedFlow()
+
     private val _updateInfo = MutableStateFlow(UpdateInfo())
     val updateInfo: StateFlow<UpdateInfo> = _updateInfo.asStateFlow()
 
@@ -323,6 +326,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 else -> "تم تسجيل عملية جديدة"
             }
+            _userNotice.tryEmit("✅ $announceText")
             speakOutText(announceText)
         }
     }
@@ -437,6 +441,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     file.delete()
                 }
             }
+            _userNotice.tryEmit("🗑️ تم مسح العملية بنجاح")
             speakOutText("تم مسح العملية")
         }
     }
@@ -444,6 +449,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     fun updateTransaction(tx: Transaction) {
         viewModelScope.launch {
             repository.insertTransaction(tx)
+            _userNotice.tryEmit("✏️ تم تحديث العملية بنجاح")
             speakOutText("تم تحديث العملية بنجاح")
         }
     }
@@ -598,15 +604,19 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                             changelog = changelog,
                             updateUrl = updateUrl
                         )
+                        _userNotice.tryEmit("📢 يتوفر تحديث جديد $versionName!")
                     } else {
                         _updateInfo.value = UpdateInfo(hasUpdate = false)
+                        _userNotice.tryEmit("✅ تطبيقك يعمل بأحدث إصدار v1.2.0")
                     }
                 } else {
                     _updateInfo.value = UpdateInfo(hasUpdate = false)
+                    _userNotice.tryEmit("✅ تطبيقك يعمل بأحدث إصدار v1.2.0")
                 }
             } catch (e: Exception) {
                 Log.e("SalaryViewModel", "Error checking for updates", e)
                 _updateInfo.value = UpdateInfo(hasUpdate = false)
+                _userNotice.tryEmit("✅ تطبيقك يعمل بأحدث إصدار v1.2.0")
             }
         }
     }

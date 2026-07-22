@@ -82,7 +82,7 @@ data class VoiceParseResult(
 )
 
 interface GeminiService {
-    @POST("v1beta/models/gemini-3.5-flash:generateContent")
+    @POST("v1beta/models/gemini-1.5-flash:generateContent")
     suspend fun parseVoiceCommand(
         @Body request: GeminiRequest,
         @Query("key") apiKey: String = BuildConfig.GEMINI_API_KEY
@@ -162,12 +162,12 @@ object LocalArabicParser {
         
         // Check transaction type
         val type = when {
-            normalizedText.contains("غياب") || normalizedText.contains("غبت") || normalizedText.contains("غايب") || normalizedText.contains("غائب") || normalizedText.contains("ما اشتغلت") || normalizedText.contains("غائب") -> "ABSENCE"
-            normalizedText.contains("سحب") || normalizedText.contains("سلفة") || normalizedText.contains("سلفه") || normalizedText.contains("سحبية") || normalizedText.contains("سحبيه") || normalizedText.contains("اخذت") -> "DRAW"
+            normalizedText.contains("غياب") || normalizedText.contains("غبت") || normalizedText.contains("غايب") || normalizedText.contains("غائب") || normalizedText.contains("ما اشتغلت") -> "ABSENCE"
+            normalizedText.contains("سحب") || normalizedText.contains("سلفة") || normalizedText.contains("سلفه") || normalizedText.contains("سحبية") || normalizedText.contains("سحبيه") || normalizedText.contains("اخذت") || normalizedText.contains("دين") -> "DRAW"
             else -> "SPENDING" // Default is spending
         }
         
-        // Find digits
+        // Find amount
         val amount = extractNumber(normalizedText)
         
         return VoiceParseResult(type, amount)
@@ -181,27 +181,59 @@ object LocalArabicParser {
     }
 
     private fun extractNumber(text: String): Double {
-        // Convert Hindi digits to standard digits
+        // 1. Convert Hindi digits to standard Western digits
         var normalized = text
         val hindiDigits = arrayOf("٠", "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩")
         for (i in 0..9) {
             normalized = normalized.replace(hindiDigits[i], i.toString())
         }
 
-        // Try extracting numeric digit sequence
-        val digitRegex = """\d+(\.\d+)?""".toRegex()
-        val match = digitRegex.find(normalized)
-        if (match != null) {
-            return match.value.toDoubleOrNull() ?: 0.0
+        // 2. Check explicitly for digit followed by "الف" / "آلاف" / "الاف" / "k" / "ك"
+        // Example: "7 الف", "7الف", "7.5 الف", "7 الاف", "7,000"
+        val thousandPattern = """(\d+(?:\.\d+)?)\s*(?:الف|الاف|آلاف|الآلاف|k|ك)""".toRegex(RegexOption.IGNORE_CASE)
+        val thousandMatch = thousandPattern.find(normalized)
+        if (thousandMatch != null) {
+            val baseNum = thousandMatch.groupValues[1].toDoubleOrNull() ?: 0.0
+            return baseNum * 1000.0
         }
 
-        // Textual Arabic numbers fallback
-        val textNumbers = mapOf(
-            "عشره" to 10.0, "عشرين" to 20.0, "ثلاثين" to 30.0, "اربعين" to 40.0, "خمسين" to 50.0,
-            "ستين" to 60.0, "سبعين" to 70.0, "ثمانين" to 80.0, "تسعين" to 90.0, "ميه" to 100.0,
-            "مائة" to 100.0, "ميتين" to 200.0, "خمسمائه" to 500.0, "خمسميه" to 500.0, "الف" to 1000.0
+        val millionPattern = """(\d+(?:\.\d+)?)\s*(?:مليون|ملايين)""".toRegex(RegexOption.IGNORE_CASE)
+        val millionMatch = millionPattern.find(normalized)
+        if (millionMatch != null) {
+            val baseNum = millionMatch.groupValues[1].toDoubleOrNull() ?: 0.0
+            return baseNum * 1000000.0
+        }
+
+        // 3. Spoken Arabic words combined with "الف" (e.g. "سبعة الف", "خمسة آلاف", "عشرة الف")
+        val wordMultipliers = mapOf(
+            "واحد" to 1.0, "واحدة" to 1.0, "اثنين" to 2.0, "ثلاثة" to 3.0, "ثلاثه" to 3.0,
+            "اربعة" to 4.0, "اربعه" to 4.0, "خمسة" to 5.0, "خمسه" to 5.0, "ستة" to 6.0, "سته" to 6.0,
+            "سبعة" to 7.0, "سبعه" to 7.0, "ثمانية" to 8.0, "ثمانيه" to 8.0, "تسعة" to 9.0, "تسعه" to 9.0,
+            "عشرة" to 10.0, "عشره" to 10.0, "عشرين" to 20.0, "ثلاثين" to 30.0, "اربعين" to 40.0,
+            "خمسين" to 50.0, "ستين" to 60.0, "سبعين" to 70.0, "ثمانين" to 80.0, "تسعين" to 90.0, "مية" to 100.0
         )
-        for ((word, value) in textNumbers) {
+        for ((word, numVal) in wordMultipliers) {
+            if (normalized.contains("$word الف") || normalized.contains("$word الاف") || normalized.contains("$word آلاف")) {
+                return numVal * 1000.0
+            }
+        }
+
+        // 4. Try extracting standard multi-digit numbers (e.g., 7000, 1500, 500)
+        val digitRegex = """\d+""".toRegex()
+        val allDigitMatches = digitRegex.findAll(normalized).map { it.value.toDoubleOrNull() ?: 0.0 }.toList()
+        if (allDigitMatches.isNotEmpty()) {
+            val maxNum = allDigitMatches.maxOrNull() ?: 0.0
+            if (maxNum > 0) return maxNum
+        }
+
+        // 5. Standalone Arabic word numbers fallback
+        val standaloneWords = mapOf(
+            "الفين" to 2000.0, "الف" to 1000.0, "خمسمية" to 500.0, "خمسمائه" to 500.0,
+            "ميتين" to 200.0, "مية" to 100.0, "مائة" to 100.0, "تسعين" to 90.0,
+            "ثمانين" to 80.0, "سبعين" to 70.0, "ستين" to 60.0, "خمسين" to 50.0,
+            "اربعين" to 40.0, "ثلاثين" to 30.0, "عشرين" to 20.0, "عشرة" to 10.0, "عشره" to 10.0
+        )
+        for ((word, value) in standaloneWords) {
             if (normalized.contains(word)) {
                 return value
             }

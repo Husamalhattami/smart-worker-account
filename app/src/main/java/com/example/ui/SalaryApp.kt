@@ -39,6 +39,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
@@ -85,7 +86,15 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     val errorMessage by viewModel.errorMessage.collectAsState()
     val speechInputText by viewModel.speechInputText.collectAsState()
     val updateInfoState by viewModel.updateInfo.collectAsState()
+    LaunchedEffect(Unit) {
+        viewModel.userNotice.collect { notice ->
+            Toast.makeText(context, notice, Toast.LENGTH_SHORT).show()
+        }
+    }
 
+    var showMainMenuDialog by remember { mutableStateOf(false) }
+    var showDeveloperInfoDialog by remember { mutableStateOf(false) }
+    var settingsInitialTab by remember { mutableStateOf(0) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(true) }
     var showAddTxDialog by remember { mutableStateOf(false) }
@@ -220,7 +229,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                             text = "حساب العامل الذكي",
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            color = LocalAppColors.current.text
                         )
                     }
                 },
@@ -240,15 +249,15 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     IconButton(
-                        onClick = { showSettingsDialog = true },
+                        onClick = { showMainMenuDialog = true },
                         modifier = Modifier
-                            .background(Color.White.copy(alpha = 0.1f), shape = CircleShape)
+                            .background(LocalAppColors.current.text.copy(alpha = 0.08f), shape = CircleShape)
                             .padding(4.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "تعديل إعدادات الراتب والعمل",
-                            tint = Color.White
+                            imageVector = Icons.Default.Menu,
+                            contentDescription = "القائمة الرئيسية والخيارات",
+                            tint = LocalAppColors.current.text
                         )
                     }
                 },
@@ -370,10 +379,42 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     }
     }
 
+    // --- MAIN MENU DIALOG ---
+    if (showMainMenuDialog) {
+        MainMenuDialog(
+            onDismiss = { showMainMenuDialog = false },
+            onOpenAppSettings = {
+                showMainMenuDialog = false
+                settingsInitialTab = 1
+                showSettingsDialog = true
+            },
+            onOpenUserSettings = {
+                showMainMenuDialog = false
+                settingsInitialTab = 0
+                showSettingsDialog = true
+            },
+            onOpenDeveloperInfo = {
+                showMainMenuDialog = false
+                showDeveloperInfoDialog = true
+            }
+        )
+    }
+
+    // --- DEVELOPER INFO DIALOG ---
+    if (showDeveloperInfoDialog) {
+        DeveloperAndUpdateDialog(
+            onDismiss = { showDeveloperInfoDialog = false },
+            onCheckUpdate = {
+                viewModel.checkForUpdates()
+            }
+        )
+    }
+
     // --- SETTINGS DIALOG ---
     if (showSettingsDialog) {
         SettingsDialog(
             currentSettings = settingsState ?: SalarySettings(),
+            initialTab = settingsInitialTab,
             onDismiss = { showSettingsDialog = false },
             onSave = { salary, startDate, currency, standardSpending, priorAbsences, priorSpendings, priorDraws, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, employeeName, voiceEnabled, openingBalance, securityEnabled, securityPin, biometricEnabled, autoAddDailySpending, themeMode ->
                 viewModel.updateSalarySettings(
@@ -507,9 +548,9 @@ fun WelcomeSection(settings: SalarySettings) {
     
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = DarkSlateSurface),
+        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
         shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -520,14 +561,14 @@ fun WelcomeSection(settings: SalarySettings) {
                 text = "مرحباً يا $employeeName 👋",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
-                color = Color.White,
+                color = LocalAppColors.current.text,
                 textAlign = TextAlign.Right
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = dateString,
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color.LightGray,
+                color = LocalAppColors.current.textSub,
                 textAlign = TextAlign.Right
             )
         }
@@ -580,6 +621,8 @@ fun BalanceDial(
     onSpeakClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val borderArcColor = LocalAppColors.current.border
+    val textSubColor = LocalAppColors.current.textSub
     Box(
         modifier = modifier.size(240.dp),
         contentAlignment = Alignment.Center
@@ -592,7 +635,7 @@ fun BalanceDial(
 
             // Background arc (full circle)
             drawArc(
-                color = Color.LightGray.copy(alpha = 0.1f),
+                color = borderArcColor,
                 startAngle = 0f,
                 sweepAngle = 360f,
                 useCenter = false,
@@ -672,7 +715,7 @@ fun BalanceDial(
             Text(
                 text = "المتبقي لك",
                 style = MaterialTheme.typography.titleMedium,
-                color = Color.LightGray
+                color = textSubColor
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
@@ -786,7 +829,7 @@ fun StatCard(
 ) {
     Card(
         modifier = modifier,
-        colors = CardDefaults.cardColors(containerColor = DarkSlateSurface),
+        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(1.dp, color.copy(alpha = 0.3f))
     ) {
@@ -811,7 +854,7 @@ fun StatCard(
                 Text(
                     text = title,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color.LightGray,
+                    color = LocalAppColors.current.textSub,
                     textAlign = TextAlign.Right
                 )
             }
@@ -825,7 +868,7 @@ fun StatCard(
                     Text(
                         text = "$unit ",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color.LightGray,
+                        color = LocalAppColors.current.textMuted,
                         modifier = Modifier.padding(bottom = 2.dp)
                     )
                 }
@@ -866,7 +909,7 @@ fun VoiceInputSection(
             Text(
                 text = if (isRecording) "جاري التسجيل... تكلم الآن" else "تكلم لتسجيل صرفية، سحبية، أو غياب",
                 style = MaterialTheme.typography.titleMedium,
-                color = Color.White,
+                color = LocalAppColors.current.text,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
@@ -901,7 +944,7 @@ fun VoiceInputSection(
                 Text(
                     text = "سمعتك تقول: \"$speechInput\"",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color.LightGray,
+                    color = LocalAppColors.current.textSub,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(top = 8.dp)
                 )
@@ -927,7 +970,7 @@ fun QuickActionsSection(
             text = "إضافة سريعة بلمسة واحدة 👇",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
-            color = Color.White,
+            color = LocalAppColors.current.text,
             modifier = Modifier.align(Alignment.End)
         )
 
@@ -938,9 +981,9 @@ fun QuickActionsSection(
             Box(modifier = Modifier.weight(1f)) {
                 QuickActionCard(
                     title = "صرفة اليوم المعتادة",
-                    amountText = "+${standardSpending.toInt()} $cur",
+                    amountText = "${standardSpending.toInt()} $cur",
                     color = CrimsonRed,
-                    icon = Icons.Default.ShoppingCart,
+                    icon = Icons.Default.Payments,
                     onClick = { onSpendingClick(standardSpending) },
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -992,7 +1035,7 @@ fun QuickActionCard(
             Text(
                 text = title,
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color.White,
+                color = LocalAppColors.current.text,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
@@ -1023,18 +1066,18 @@ fun TransactionsFeedSection(
             text = "شريط العمليات الأخيرة 📜",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
-            color = Color.White,
+            color = LocalAppColors.current.text,
             modifier = Modifier.align(Alignment.End)
         )
 
         if (transactions.isEmpty()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = DarkSlateSurface)
+                colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface)
             ) {
                 Text(
                     text = "لا توجد أي عمليات مسجلة حتى الآن",
-                    color = Color.Gray,
+                    color = LocalAppColors.current.textMuted,
                     textAlign = TextAlign.Center,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1084,7 +1127,7 @@ fun TransactionItem(
     }
 
     val icon = when (transaction.type) {
-        "SPENDING" -> Icons.Default.ShoppingCart
+        "SPENDING" -> Icons.Default.Payments
         "DRAW" -> Icons.Default.Payments
         "ABSENCE" -> Icons.Default.EventBusy
         else -> Icons.Default.CheckCircle
@@ -1097,104 +1140,111 @@ fun TransactionItem(
         else -> "عملية"
     }
 
+    val amountLabel = when (transaction.type) {
+        "ABSENCE" -> {
+            val hrs = transaction.amount
+            if (hrs == 12.0 || hrs <= 0.0) "غياب يوم كامل" else "غياب ${hrs.toInt()} ساعات"
+        }
+        "SPENDING" -> "-${transaction.amount.toInt()} $currency"
+        "DRAW" -> "-${transaction.amount.toInt()} $currency"
+        else -> "${transaction.amount.toInt()} $currency"
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onCardClick() },
-        colors = CardDefaults.cardColors(containerColor = DarkSlateSurface),
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, color.copy(alpha = 0.3f))
+        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, color.copy(alpha = 0.25f))
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Voice player if note exists
-            if (transaction.voiceNotePath != null) {
-                IconButton(
-                    onClick = { if (isPlaying) onStopAudio() else onPlayVoice() },
-                    modifier = Modifier
-                        .size(40.dp)
-                        .background(
-                            if (isPlaying) CrimsonRed.copy(alpha = 0.2f) else EmeraldGreen.copy(alpha = 0.2f),
-                            shape = CircleShape
-                        )
-                ) {
-                    Icon(
-                        imageVector = if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
-                        contentDescription = "تشغيل المذكرة الصوتية للعملية",
-                        tint = if (isPlaying) CrimsonRed else EmeraldGreen,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.weight(1f))
-
-            // Details
-            Column(
-                horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.Center,
-                modifier = Modifier.weight(1f).padding(end = 4.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    val amountLabel = when (transaction.type) {
-                        "ABSENCE" -> {
-                            val hrs = transaction.amount
-                            if (hrs == 12.0 || hrs <= 0.0) "غياب يوم كامل" else "غياب ${hrs.toInt()} ساعات"
-                        }
-                        else -> "${transaction.amount.toInt()} $currency"
-                    }
-                    Text(
-                        text = amountLabel,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = color,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = typeLabel,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-                Spacer(modifier = Modifier.height(2.dp))
-                if (transaction.voiceText != null) {
-                    Text(
-                        text = transaction.voiceText,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray,
-                        textAlign = TextAlign.Right
-                    )
-                    Spacer(modifier = Modifier.height(2.dp))
-                }
-                // Date & Time is ALWAYS shown here!
-                Text(
-                    text = dateStr,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Gray,
-                    textAlign = TextAlign.Right
-                )
-            }
-
-            // Category Icon Badge
+            // 1. Category Icon Badge (RTL First = Far Right)
             Box(
                 modifier = Modifier
                     .size(44.dp)
-                    .background(color.copy(alpha = 0.15f), shape = CircleShape),
+                    .background(color.copy(alpha = 0.15f), shape = CircleShape)
+                    .border(1.dp, color.copy(alpha = 0.3f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
                     tint = color,
-                    modifier = Modifier.size(24.dp)
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+
+            // 2. Details Column (RTL Middle = Aligned right)
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalAlignment = Alignment.Start
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = typeLabel,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = LocalAppColors.current.text,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "• $dateStr",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textMuted
+                    )
+                }
+
+                if (!transaction.voiceText.isNullOrBlank()) {
+                    Text(
+                        text = transaction.voiceText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textSub,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // 3. Amount & Voice Button (RTL Last = Far Left)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (transaction.voiceNotePath != null) {
+                    IconButton(
+                        onClick = { if (isPlaying) onStopAudio() else onPlayVoice() },
+                        modifier = Modifier
+                            .size(36.dp)
+                            .background(
+                                if (isPlaying) CrimsonRed.copy(alpha = 0.2f) else EmeraldGreen.copy(alpha = 0.15f),
+                                shape = CircleShape
+                            )
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
+                            contentDescription = "تشغيل المذكرة الصوتية للعملية",
+                            tint = if (isPlaying) CrimsonRed else EmeraldGreen,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    text = amountLabel,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = color,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.End
                 )
             }
         }
@@ -1341,7 +1391,7 @@ fun AddTransactionDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(8.dp),
-            colors = CardDefaults.cardColors(containerColor = DarkSlateSurface),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
             shape = RoundedCornerShape(24.dp)
         ) {
             Column(
@@ -1355,19 +1405,19 @@ fun AddTransactionDialog(
                 Text(
                     text = "📝 تسجيل عملية جديدة",
                     style = MaterialTheme.typography.titleLarge,
-                    color = Color.White,
+                    color = LocalAppColors.current.text,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.fillMaxWidth(),
                     textAlign = TextAlign.Center
                 )
 
-                HorizontalDivider(color = Color.Gray.copy(alpha = 0.3f), thickness = 1.dp)
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
                 // Type Tab-like buttons
                 Text(
                     text = "نوع العملية:",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color.LightGray
+                    color = LocalAppColors.current.textSub
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1390,7 +1440,7 @@ fun AddTransactionDialog(
                                 )
                                 .border(
                                     width = 1.5.dp,
-                                    color = if (isSelected) Color.White else color.copy(alpha = 0.4f),
+                                    color = if (isSelected) color else color.copy(alpha = 0.4f),
                                     shape = RoundedCornerShape(10.dp)
                                 )
                                 .clickable {
@@ -1415,26 +1465,26 @@ fun AddTransactionDialog(
                     Text(
                         text = if (selectedType == "DRAW") "مبلغ السحبيّة السلفة (${settings.currency}):" else "مبلغ الصرفة (${settings.currency}):",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = amountInput,
                         onValueChange = { amountInput = it },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         placeholder = {
                             Text(
                                 text = if (selectedType == "SPENDING") "${settings.standardSpendingAmount.toInt()}" else "أدخل المبلغ هنا...",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = Color.Gray
+                                color = LocalAppColors.current.textMuted
                             )
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = if (selectedType == "SPENDING") CrimsonRed else AmberOrange,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
 
@@ -1442,17 +1492,17 @@ fun AddTransactionDialog(
                     Text(
                         text = "ملاحظة وبيان العملية (اختياري - لأيش):",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = noteInput,
                         onValueChange = { noteInput = it },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         placeholder = {
                             Text(
                                 text = if (selectedType == "SPENDING") "مثال: صرفة غداء، باص..." else "مثال: سلفة لمصاريف العيد...",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = Color.Gray
+                                color = LocalAppColors.current.textMuted
                             )
                         },
                         trailingIcon = {
@@ -1468,7 +1518,7 @@ fun AddTransactionDialog(
                                 Icon(
                                     imageVector = if (isListeningForNote) Icons.Default.Mic else Icons.Default.MicNone,
                                     contentDescription = "تحدث لكتابة الملاحظة",
-                                    tint = if (isListeningForNote) CrimsonRed else Color.LightGray,
+                                    tint = if (isListeningForNote) CrimsonRed else LocalAppColors.current.textSub,
                                     modifier = Modifier.size(24.dp)
                                 )
                             }
@@ -1476,9 +1526,9 @@ fun AddTransactionDialog(
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = if (selectedType == "SPENDING") CrimsonRed else AmberOrange,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
                     
@@ -1495,7 +1545,7 @@ fun AddTransactionDialog(
                     Text(
                         text = "مدة الغياب:",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1512,12 +1562,12 @@ fun AddTransactionDialog(
                                     .weight(1f)
                                     .height(44.dp)
                                     .background(
-                                        if (isSel) Color.Gray else Color.Gray.copy(alpha = 0.15f),
+                                        if (isSel) Color.Gray else LocalAppColors.current.text.copy(alpha = 0.08f),
                                         shape = RoundedCornerShape(10.dp)
                                     )
                                     .border(
                                         width = 1.dp,
-                                        color = if (isSel) Color.White else Color.Transparent,
+                                        color = if (isSel) LocalAppColors.current.text else Color.Transparent,
                                         shape = RoundedCornerShape(10.dp)
                                     )
                                     .clickable { absenceIsFullDay = isFull },
@@ -1527,7 +1577,7 @@ fun AddTransactionDialog(
                                     text = label,
                                     style = MaterialTheme.typography.bodySmall,
                                     fontWeight = FontWeight.Bold,
-                                    color = if (isSel) Color.White else Color.LightGray
+                                    color = if (isSel) Color.White else LocalAppColors.current.textSub
                                 )
                             }
                         }
@@ -1538,26 +1588,26 @@ fun AddTransactionDialog(
                         Text(
                             text = "عدد ساعات الغياب (يوم الشغل ١٢ ساعة):",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = Color.LightGray
+                            color = LocalAppColors.current.textSub
                         )
                         OutlinedTextField(
                             value = absenceHoursInput,
                             onValueChange = { absenceHoursInput = it },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                            textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                             placeholder = {
                                 Text(
                                     text = "مثال: ٣ ساعات",
                                     style = MaterialTheme.typography.bodyMedium,
-                                    color = Color.Gray
+                                    color = LocalAppColors.current.textMuted
                                 )
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = Color.Gray,
-                                unfocusedBorderColor = Color.Gray,
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
+                                unfocusedBorderColor = LocalAppColors.current.border,
+                                focusedTextColor = LocalAppColors.current.text,
+                                unfocusedTextColor = LocalAppColors.current.text
                             )
                         )
                     }
@@ -1566,17 +1616,17 @@ fun AddTransactionDialog(
                     Text(
                         text = "ملاحظة أو سبب الغياب (اختياري):",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = noteInput,
                         onValueChange = { noteInput = it },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         placeholder = {
                             Text(
                                 text = "مثال: عذر مرضي، غياب جزئي...",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = Color.Gray
+                                color = LocalAppColors.current.textMuted
                             )
                         },
                         trailingIcon = {
@@ -1592,7 +1642,7 @@ fun AddTransactionDialog(
                                 Icon(
                                     imageVector = if (isListeningForNote) Icons.Default.Mic else Icons.Default.MicNone,
                                     contentDescription = "تحدث لكتابة الملاحظة",
-                                    tint = if (isListeningForNote) CrimsonRed else Color.LightGray,
+                                    tint = if (isListeningForNote) CrimsonRed else LocalAppColors.current.textSub,
                                     modifier = Modifier.size(24.dp)
                                 )
                             }
@@ -1600,9 +1650,9 @@ fun AddTransactionDialog(
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = Color.Gray,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
                     
@@ -1622,13 +1672,13 @@ fun AddTransactionDialog(
                 Text(
                     text = "تاريخ العملية (تعديل لإضافة الأيام السابقة):",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color.LightGray
+                    color = LocalAppColors.current.textSub
                 )
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color.White.copy(alpha = 0.05f), shape = RoundedCornerShape(12.dp))
-                        .border(1.dp, Color.Gray.copy(alpha = 0.5f), shape = RoundedCornerShape(12.dp))
+                        .background(LocalAppColors.current.text.copy(alpha = 0.05f), shape = RoundedCornerShape(12.dp))
+                        .border(1.dp, LocalAppColors.current.border, shape = RoundedCornerShape(12.dp))
                         .clickable { datePickerDialog.show() }
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1642,7 +1692,7 @@ fun AddTransactionDialog(
                     Text(
                         text = dateSdf.format(Date(transactionDate)),
                         style = MaterialTheme.typography.bodyLarge,
-                        color = Color.White,
+                        color = LocalAppColors.current.text,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -1656,10 +1706,10 @@ fun AddTransactionDialog(
                     Button(
                         onClick = onDismiss,
                         colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
-                        border = BorderStroke(1.dp, Color.Gray),
+                        border = BorderStroke(1.dp, LocalAppColors.current.border),
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("إلغاء", color = Color.LightGray)
+                        Text("إلغاء", color = LocalAppColors.current.textSub)
                     }
 
                     Button(
@@ -1699,6 +1749,7 @@ fun AddTransactionDialog(
 @Composable
 fun SettingsDialog(
     currentSettings: SalarySettings,
+    initialTab: Int = 0,
     onDismiss: () -> Unit,
     onSave: (Double, Long, String, Double, Int, Double, Double, Boolean, Int, Int, String, Boolean, Double, Boolean, String, Boolean, Boolean, String) -> Unit
 ) {
@@ -1773,7 +1824,7 @@ fun SettingsDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                var selectedTab by remember { mutableStateOf(0) } // 0 = User Info, 1 = App Settings & Developer Info
+                var selectedTab by remember { mutableStateOf(initialTab) } // 0 = User Info, 1 = App Settings
                 
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -2398,7 +2449,7 @@ fun EditTransactionDialog(
             title = {
                 Text(
                     text = "تأكيد الحذف ⚠️",
-                    color = Color.White,
+                    color = LocalAppColors.current.text,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Right,
                     modifier = Modifier.fillMaxWidth()
@@ -2407,7 +2458,7 @@ fun EditTransactionDialog(
             text = {
                 Text(
                     text = "هل أنت متأكد من رغبتك في حذف هذه العملية نهائياً؟ لا يمكن استرجاع البيانات بعد الحذف.",
-                    color = Color.LightGray,
+                    color = LocalAppColors.current.textSub,
                     textAlign = TextAlign.Right,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -2426,10 +2477,10 @@ fun EditTransactionDialog(
             },
             dismissButton = {
                 TextButton(onClick = { showDeleteConfirm = false }) {
-                    Text("إلغاء", color = Color.LightGray)
+                    Text("إلغاء", color = LocalAppColors.current.textSub)
                 }
             },
-            containerColor = DarkSlateSurface
+            containerColor = LocalAppColors.current.surface
         )
     }
 
@@ -2442,7 +2493,7 @@ fun EditTransactionDialog(
             ) {
                 Text(
                     text = "تعديل العملية 📝",
-                    color = Color.White,
+                    color = LocalAppColors.current.text,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Right
                 )
@@ -2469,7 +2520,7 @@ fun EditTransactionDialog(
 
                 Text(
                     text = inputLabel,
-                    color = Color.LightGray,
+                    color = LocalAppColors.current.textSub,
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Right,
                     modifier = Modifier.fillMaxWidth()
@@ -2479,20 +2530,20 @@ fun EditTransactionDialog(
                     value = amountInput,
                     onValueChange = { amountInput = it },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = typeColor,
-                        unfocusedBorderColor = Color.Gray,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
                     )
                 )
 
                 // Optional voice text / details
                 Text(
                     text = "التفاصيل / الملاحظات:",
-                    color = Color.LightGray,
+                    color = LocalAppColors.current.textSub,
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Right,
                     modifier = Modifier.fillMaxWidth()
@@ -2501,14 +2552,14 @@ fun EditTransactionDialog(
                 OutlinedTextField(
                     value = voiceTextInput,
                     onValueChange = { voiceTextInput = it },
-                    placeholder = { Text("مثلاً: غداء، سلفة طارئة، إلخ", color = Color.Gray) },
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                    placeholder = { Text("مثلاً: غداء، سلفة طارئة، إلخ", color = LocalAppColors.current.textMuted) },
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = typeColor,
-                        unfocusedBorderColor = Color.Gray,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
                     )
                 )
             }
@@ -2557,10 +2608,10 @@ fun EditTransactionDialog(
                 onClick = onDismiss,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("إلغاء", color = Color.LightGray)
+                Text("إلغاء", color = LocalAppColors.current.textSub)
             }
         },
-        containerColor = DarkSlateSurface
+        containerColor = LocalAppColors.current.surface
     )
 }
 
@@ -2640,7 +2691,7 @@ fun AppLockScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkSlateBackground),
+            .background(LocalAppColors.current.bg),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -2667,14 +2718,14 @@ fun AppLockScreen(
             Text(
                 text = "حساب العامل الذكي",
                 style = MaterialTheme.typography.headlineMedium,
-                color = Color.White,
+                color = LocalAppColors.current.text,
                 fontWeight = FontWeight.Bold
             )
 
             Text(
                 text = statusMessage,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (isError) CrimsonRed else Color.LightGray,
+                color = if (isError) CrimsonRed else LocalAppColors.current.textSub,
                 textAlign = TextAlign.Center
             )
 
@@ -2747,12 +2798,12 @@ fun AppLockScreen(
                                     },
                                     modifier = Modifier
                                         .size(64.dp)
-                                        .background(Color.White.copy(alpha = 0.05f), shape = CircleShape)
+                                        .background(LocalAppColors.current.text.copy(alpha = 0.05f), shape = CircleShape)
                                 ) {
                                     Icon(
                                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                                         contentDescription = "مسح",
-                                        tint = Color.White,
+                                        tint = LocalAppColors.current.text,
                                         modifier = Modifier.size(24.dp)
                                     )
                                 }
@@ -2775,14 +2826,14 @@ fun AppLockScreen(
                                             }
                                         }
                                     },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.05f)),
+                                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.text.copy(alpha = 0.05f)),
                                     shape = CircleShape,
                                     modifier = Modifier.size(64.dp)
                                 ) {
                                     Text(
                                         text = key,
                                         style = MaterialTheme.typography.titleLarge,
-                                        color = Color.White,
+                                        color = LocalAppColors.current.text,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
@@ -2835,7 +2886,7 @@ fun WelcomeLoginScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkSlateBackground)
+            .background(LocalAppColors.current.bg)
             .statusBarsPadding()
             .navigationBarsPadding(),
         contentAlignment = Alignment.Center
@@ -2868,7 +2919,7 @@ fun WelcomeLoginScreen(
             Text(
                 text = "مرحباً بك في حساب العامل الذكي 👋",
                 style = MaterialTheme.typography.headlineSmall,
-                color = Color.White,
+                color = LocalAppColors.current.text,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
@@ -2876,7 +2927,7 @@ fun WelcomeLoginScreen(
             Text(
                 text = "الرجاء إدخال اسمك وبياناتك المالية لإعداد حسابك والبدء في تتبع راتبك وصرفياتك بكل سهولة.",
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color.LightGray,
+                color = LocalAppColors.current.textSub,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(horizontal = 8.dp)
             )
@@ -2884,7 +2935,7 @@ fun WelcomeLoginScreen(
             // Form Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = DarkSlateSurface),
+                colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
                 shape = RoundedCornerShape(20.dp)
             ) {
                 Column(
@@ -2898,20 +2949,20 @@ fun WelcomeLoginScreen(
                     Text(
                         text = "الاسم الكريم:",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = nameInput,
                         onValueChange = { nameInput = it },
-                        placeholder = { Text("مثلاً: محمد خالد العريفي", color = Color.Gray) },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        placeholder = { Text("مثلاً: محمد خالد العريفي", color = LocalAppColors.current.textMuted) },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().testTag("onboarding_name_input"),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
                     
@@ -2919,20 +2970,20 @@ fun WelcomeLoginScreen(
                     Text(
                         text = "الراتب الشهري الأساسي:",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = salaryInput,
                         onValueChange = { salaryInput = it },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
                     
@@ -2940,19 +2991,19 @@ fun WelcomeLoginScreen(
                     Text(
                         text = "العملة (مثلاً: ريال يمني):",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = currencyInput,
                         onValueChange = { currencyInput = it },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
 
@@ -2960,21 +3011,21 @@ fun WelcomeLoginScreen(
                     Text(
                         text = "رصيد سابق / حساب مستحق لك (رصيد افتتاحي):",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = openingBalanceInput,
                         onValueChange = { openingBalanceInput = it },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        placeholder = { Text("مثلاً: 50000 أو 0 إذا لا يوجد", color = Color.Gray) },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                        placeholder = { Text("مثلاً: 50000 أو 0 إذا لا يوجد", color = LocalAppColors.current.textMuted) },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = Color.Gray,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
                     
@@ -2982,11 +3033,11 @@ fun WelcomeLoginScreen(
                     Text(
                         text = "تاريخ بدء العمل في هذا الشهر:",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.LightGray
+                        color = LocalAppColors.current.textSub
                     )
                     Button(
                         onClick = { showDatePicker = true },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.1f)),
+                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.text.copy(alpha = 0.05f)),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth().height(48.dp)
                     ) {
@@ -3002,7 +3053,7 @@ fun WelcomeLoginScreen(
                             )
                             Text(
                                 text = sdf.format(Date(selectedDateInMillis)),
-                                color = Color.White,
+                                color = LocalAppColors.current.text,
                                 style = MaterialTheme.typography.bodyMedium
                             )
                         }
@@ -3027,7 +3078,7 @@ fun WelcomeLoginScreen(
                         Text(
                             text = "تفعيل التنبيه الصوتي اليومي لعدم النسيان",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = Color.White,
+                            color = LocalAppColors.current.text,
                             textAlign = TextAlign.Right
                         )
                     }
@@ -3035,7 +3086,7 @@ fun WelcomeLoginScreen(
                     if (dailyReminderEnabled) {
                         Button(
                             onClick = { timePickerDialog.show() },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.1f)),
+                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.text.copy(alpha = 0.05f)),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth().height(48.dp)
                         ) {
@@ -3056,7 +3107,7 @@ fun WelcomeLoginScreen(
                                 )
                                 Text(
                                     text = "وقت التنبيه: $timeText",
-                                    color = Color.White,
+                                    color = LocalAppColors.current.text,
                                     style = MaterialTheme.typography.bodyMedium
                                 )
                             }
@@ -3129,4 +3180,298 @@ private fun shareReport(context: Context, reportText: String, employeeName: Stri
         putExtra(Intent.EXTRA_TEXT, reportText)
     }
     context.startActivity(Intent.createChooser(intent, "تصدير التقرير عبر:"))
+}
+
+@Composable
+fun MainMenuDialog(
+    onDismiss: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onOpenUserSettings: () -> Unit,
+    onOpenDeveloperInfo: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Menu,
+                        contentDescription = null,
+                        tint = EmeraldGreen,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = "القائمة الرئيسية والخيارات ☰",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Item 1: App Settings
+                MenuOptionCard(
+                    title = "⚙️ إعدادات التطبيق والراتب",
+                    subtitle = "تعديل الراتب الأساسي، العملة، الصرفة اليومية المعتادة، وتاريخ بدء الشهر",
+                    icon = Icons.Default.Settings,
+                    color = EmeraldGreen,
+                    onClick = onOpenAppSettings
+                )
+
+                // Item 2: User Settings
+                MenuOptionCard(
+                    title = "👤 إعدادات المستخدم والأمان",
+                    subtitle = "اسم العامل، تفعيل القفل برقم سري (PIN)، التنبيهات اليومية، والنسخ الاحتياطي",
+                    icon = Icons.Default.Person,
+                    color = EarnedBlue,
+                    onClick = onOpenUserSettings
+                )
+
+                // Item 3: Developer Info & GitHub Updates
+                MenuOptionCard(
+                    title = "ℹ️ معلومات المطور والتحديثات (GitHub)",
+                    subtitle = "إصدار التطبيق، بيانات المطور، فحص التحديثات المباشرة وشرح طريقة العمل",
+                    icon = Icons.Default.Info,
+                    color = AmberOrange,
+                    onClick = onOpenDeveloperInfo
+                )
+
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("إغلاق القائمة", color = LocalAppColors.current.text)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MenuOptionCard(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    color: Color,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() },
+        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, color.copy(alpha = 0.3f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(color.copy(alpha = 0.15f), shape = CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = color,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalAlignment = Alignment.Start
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text
+                )
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.textSub
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun DeveloperAndUpdateDialog(
+    onDismiss: () -> Unit,
+    onCheckUpdate: () -> Unit
+) {
+    val context = LocalContext.current
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Info,
+                        contentDescription = null,
+                        tint = AmberOrange,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = "معلومات المطور والتحديثات 📲",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Developer & App Summary Card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = "📱 تطبيق: حساب العامل الذكي (Smart Worker Calculator)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = LocalAppColors.current.text
+                        )
+                        Text(
+                            text = "🏷️ رقم الإصدار الحالي: v1.2.0 (مستقر)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = EmeraldGreen,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "👨‍💻 تطوير المهندس: حسام العريفي",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = LocalAppColors.current.textSub
+                        )
+                        Text(
+                            text = "🎯 الهدف: نظام محاسبي وذكاء اصطناعي صوتي شامل لإدارة مستحقات وراتب العمال والموظفين بدقة تامة.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textMuted
+                        )
+                    }
+                }
+
+                // Check Live Update Button
+                Button(
+                    onClick = {
+                        onCheckUpdate()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, tint = Color.White)
+                        Text("فحص التحديثات المباشرة عبر GitHub 🔄", fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                }
+
+                // GitHub Update Instructions Explanation
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, EarnedBlue.copy(alpha = 0.3f))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = "📖 كيف تعمل التحديثات التلقائية عبر GitHub؟",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = EarnedBlue
+                        )
+                        Text(
+                            text = "1️⃣ عند قيام المطور بالتعديل على أكواد البرمجية وإجراء تحسينات في ملفات المشروع على GitHub، يتم رفع ملف إصدار جديد (APK + version.json).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textSub
+                        )
+                        Text(
+                            text = "2️⃣ يتصل التطبيق عند تشغيله برابط ملف التحديث المباشر من GitHub لمقارنة رقم الإصدار في سيرفر GitHub مع رقم إصدار التطبيق بداخل هاتفك.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textSub
+                        )
+                        Text(
+                            text = "3️⃣ إذا كان رقم الإصدار المرفوع في GitHub أحدث من الموجود لديك، يظهر لك تنبيه بارز فوراً في أعلى التطبيق يخبرك بوجود تحديث جديد ومزاياه.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textSub
+                        )
+                        Text(
+                            text = "4️⃣ بمجرد الضغط على زر 'تنزيل التحديث'، يتم تحميل ملف الـ APK وتثبيته مباشرة دون فقدان أي ريال أو بيانات من سجلك المالي!",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textSub
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("إغلاق", color = LocalAppColors.current.text)
+                }
+            }
+        }
+    }
 }
