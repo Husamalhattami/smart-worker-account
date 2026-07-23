@@ -14,6 +14,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+import org.json.JSONArray
+import org.json.JSONObject
+
 data class SalaryMetrics(
     val daysInMonth: Int = 30,
     val dailyRate: Double = 100.0,
@@ -257,7 +260,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         securityPin: String = "",
         biometricEnabled: Boolean = false,
         autoAddDailySpending: Boolean = false,
-        themeMode: String = "DARK"
+        themeMode: String = "DARK",
+        appLanguage: String = "ar"
     ) {
         viewModelScope.launch {
             val current = repository.getSalarySettingsDirect() ?: SalarySettings()
@@ -279,7 +283,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 securityPin = securityPin,
                 biometricEnabled = biometricEnabled,
                 autoAddDailySpending = autoAddDailySpending,
-                themeMode = themeMode
+                themeMode = themeMode,
+                appLanguage = appLanguage
             )
             repository.insertOrUpdateSalarySettings(updated)
             
@@ -575,49 +580,221 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun checkForUpdates() {
+    fun checkForUpdates(isManual: Boolean = false) {
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // Fetch update file from GitHub raw
-                val url = java.net.URL("https://raw.githubusercontent.com/husamalhattami100/salary-companion/main/update.json")
-                val connection = url.openConnection() as java.net.HttpURLConnection
-                connection.requestMethod = "GET"
-                connection.connectTimeout = 5000
-                connection.readTimeout = 5000
-                
-                if (connection.responseCode == 200) {
-                    val text = connection.inputStream.bufferedReader().use { it.readText() }
-                    val versionPattern = "\"versionCode\"\\s*:\\s*(\\d+)".toRegex()
-                    val namePattern = "\"versionName\"\\s*:\\s*\"([^\"]+)\"".toRegex()
-                    val urlPattern = "\"updateUrl\"\\s*:\\s*\"([^\"]+)\"".toRegex()
-                    val changelogPattern = "\"changelog\"\\s*:\\s*\"([^\"]+)\"".toRegex()
-                    
-                    val versionCode = versionPattern.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-                    val versionName = namePattern.find(text)?.groupValues?.get(1) ?: "1.0.0"
-                    val updateUrl = urlPattern.find(text)?.groupValues?.get(1) ?: "https://github.com/husamalhattami100"
-                    val changelog = changelogPattern.find(text)?.groupValues?.get(1) ?: ""
-                    
-                    if (versionCode > 1) { // Current version is 1
-                        _updateInfo.value = UpdateInfo(
-                            hasUpdate = true,
-                            versionName = versionName,
-                            changelog = changelog,
-                            updateUrl = updateUrl
-                        )
-                        _userNotice.tryEmit("📢 يتوفر تحديث جديد $versionName!")
-                    } else {
-                        _updateInfo.value = UpdateInfo(hasUpdate = false)
-                        _userNotice.tryEmit("✅ تطبيقك يعمل بأحدث إصدار v1.2.0")
-                    }
-                } else {
-                    _updateInfo.value = UpdateInfo(hasUpdate = false)
-                    _userNotice.tryEmit("✅ تطبيقك يعمل بأحدث إصدار v1.2.0")
-                }
-            } catch (e: Exception) {
-                Log.e("SalaryViewModel", "Error checking for updates", e)
-                _updateInfo.value = UpdateInfo(hasUpdate = false)
-                _userNotice.tryEmit("✅ تطبيقك يعمل بأحدث إصدار v1.2.0")
+            if (isManual) {
+                _userNotice.tryEmit("🔍 جاري فحص التحديثات المباشرة...")
             }
+
+            val urlsToTry = listOf(
+                "https://raw.githubusercontent.com/Husamalhattami/smart-worker-account/main/update.json",
+                "https://raw.githubusercontent.com/Husamalhattami/smart-worker-account/master/update.json",
+                "https://raw.githubusercontent.com/Husamalhattami/smart-worker-account/main/version.json",
+                "https://raw.githubusercontent.com/Husamalhattami/smart-worker-account/master/version.json"
+            )
+            var success = false
+            var lastResponseCode = -1
+
+            for (urlString in urlsToTry) {
+                try {
+                    val url = java.net.URL(urlString)
+                    val connection = url.openConnection() as java.net.HttpURLConnection
+                    connection.requestMethod = "GET"
+                    connection.connectTimeout = 6000
+                    connection.readTimeout = 6000
+                    connection.useCaches = false
+                    connection.setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate")
+                    connection.setRequestProperty("Pragma", "no-cache")
+                    connection.setRequestProperty("User-Agent", "AndroidSalaryApp/1.3.0")
+
+                    lastResponseCode = connection.responseCode
+                    if (lastResponseCode == 200) {
+                        val text = connection.inputStream.bufferedReader().use { it.readText() }
+                        val json = org.json.JSONObject(text)
+                        
+                        val versionCode = if (json.has("versionCode")) {
+                            json.optInt("versionCode", json.optString("versionCode", "130").toIntOrNull() ?: 130)
+                        } else {
+                            json.optInt("version_code", 130)
+                        }
+                        
+                        val versionName = json.optString("versionName", json.optString("version_name", "1.3.0"))
+                        val changelog = json.optString("changelog", json.optString("notes", ""))
+                        val updateUrl = json.optString("updateUrl", json.optString("download_url", "https://github.com/husamalhattami100"))
+
+                        val hasNewer = isRemoteVersionNewer(versionCode, versionName)
+
+                        if (hasNewer) {
+                            _updateInfo.value = UpdateInfo(
+                                hasUpdate = true,
+                                versionName = versionName,
+                                changelog = changelog,
+                                updateUrl = updateUrl
+                            )
+                            if (isManual) {
+                                _userNotice.tryEmit("📢 يتوفر تحديث جديد v$versionName!")
+                            }
+                        } else {
+                            _updateInfo.value = UpdateInfo(hasUpdate = false)
+                            if (isManual) {
+                                _userNotice.tryEmit("✅ أنت تستخدم أحدث إصدار من التطبيق (v1.3.0)")
+                            }
+                        }
+                        success = true
+                        break
+                    }
+                } catch (e: Exception) {
+                    Log.e("SalaryViewModel", "Error fetching update from $urlString", e)
+                }
+            }
+
+            if (!success) {
+                _updateInfo.value = UpdateInfo(hasUpdate = false)
+                if (isManual) {
+                    if (lastResponseCode > 0) {
+                        _userNotice.tryEmit("⚠️ تعذر العثور على ملف التحديث في السيرفر (كود $lastResponseCode)")
+                    } else {
+                        _userNotice.tryEmit("⚠️ تعذر الاتصال بسيرفر التحديثات. يرجى التأكد من توفر الإنترنت")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun isRemoteVersionNewer(remoteCode: Int, remoteName: String): Boolean {
+        val currentCode = 130
+        val currentName = "1.3.0"
+
+        // If remote code is clearly an integer higher than 130 (e.g. 131, 140, etc.)
+        if (remoteCode > currentCode && remoteCode >= 100) {
+            return true
+        }
+
+        // Compare semantic version names (e.g. "1.3.0" vs "1.4.0")
+        val currentParts = currentName.split(".").mapNotNull { it.trim().toIntOrNull() }
+        val remoteParts = remoteName.split(".").mapNotNull { it.trim().toIntOrNull() }
+
+        if (currentParts.isNotEmpty() && remoteParts.isNotEmpty()) {
+            val maxLen = maxOf(currentParts.size, remoteParts.size)
+            for (i in 0 until maxLen) {
+                val cPart = currentParts.getOrElse(i) { 0 }
+                val rPart = remoteParts.getOrElse(i) { 0 }
+                if (rPart > cPart) return true
+                if (rPart < cPart) return false
+            }
+            return false
+        }
+
+        return false
+    }
+
+    suspend fun exportBackupJson(): String = withContext(Dispatchers.IO) {
+        val s = repository.getSalarySettingsDirect() ?: SalarySettings()
+        val txs = repository.getAllTransactionsDirect()
+
+        val settingsObj = JSONObject().apply {
+            put("id", s.id)
+            put("monthlySalary", s.monthlySalary)
+            put("startWorkDate", s.startWorkDate)
+            put("stopWorkDate", s.stopWorkDate ?: 0L)
+            put("currency", s.currency)
+            put("standardSpendingAmount", s.standardSpendingAmount)
+            put("priorAbsenceCount", s.priorAbsenceCount)
+            put("priorSpendingsAmount", s.priorSpendingsAmount)
+            put("priorDrawsAmount", s.priorDrawsAmount)
+            put("dailyReminderEnabled", s.dailyReminderEnabled)
+            put("dailyReminderHour", s.dailyReminderHour)
+            put("dailyReminderMinute", s.dailyReminderMinute)
+            put("employeeName", s.employeeName)
+            put("voiceEnabled", s.voiceEnabled)
+            put("openingBalance", s.openingBalance)
+            put("securityEnabled", s.securityEnabled)
+            put("securityPin", s.securityPin)
+            put("biometricEnabled", s.biometricEnabled)
+            put("autoAddDailySpending", s.autoAddDailySpending)
+            put("themeMode", s.themeMode)
+            put("appLanguage", s.appLanguage)
+        }
+
+        val txArray = JSONArray()
+        for (tx in txs) {
+            val obj = JSONObject().apply {
+                put("id", tx.id)
+                put("type", tx.type)
+                put("amount", tx.amount)
+                put("timestamp", tx.timestamp)
+                put("voiceNotePath", tx.voiceNotePath ?: "")
+                put("voiceText", tx.voiceText ?: "")
+            }
+            txArray.put(obj)
+        }
+
+        val root = JSONObject().apply {
+            put("version", 1)
+            put("appName", "SmartWorkerAccount")
+            put("exportDate", System.currentTimeMillis())
+            put("settings", settingsObj)
+            put("transactions", txArray)
+        }
+
+        root.toString(2)
+    }
+
+    suspend fun restoreBackupJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val root = JSONObject(jsonString)
+            if (root.has("settings")) {
+                val sObj = root.getJSONObject("settings")
+                val restoredSettings = SalarySettings(
+                    id = 1,
+                    monthlySalary = sObj.optDouble("monthlySalary", 150000.0),
+                    startWorkDate = sObj.optLong("startWorkDate", sObj.optLong("startDate", System.currentTimeMillis())),
+                    stopWorkDate = if (sObj.has("stopWorkDate") && sObj.getLong("stopWorkDate") > 0) sObj.getLong("stopWorkDate") else null,
+                    currency = sObj.optString("currency", "ريال يمني"),
+                    standardSpendingAmount = sObj.optDouble("standardSpendingAmount", sObj.optDouble("standardSpending", 2000.0)),
+                    priorAbsenceCount = sObj.optInt("priorAbsenceCount", sObj.optInt("priorAbsences", 0)),
+                    priorSpendingsAmount = sObj.optDouble("priorSpendingsAmount", sObj.optDouble("priorSpendings", 0.0)),
+                    priorDrawsAmount = sObj.optDouble("priorDrawsAmount", sObj.optDouble("priorDraws", 0.0)),
+                    dailyReminderEnabled = sObj.optBoolean("dailyReminderEnabled", true),
+                    dailyReminderHour = sObj.optInt("dailyReminderHour", 5),
+                    dailyReminderMinute = sObj.optInt("dailyReminderMinute", 0),
+                    employeeName = sObj.optString("employeeName", ""),
+                    voiceEnabled = sObj.optBoolean("voiceEnabled", true),
+                    openingBalance = sObj.optDouble("openingBalance", 0.0),
+                    securityEnabled = sObj.optBoolean("securityEnabled", false),
+                    securityPin = sObj.optString("securityPin", ""),
+                    biometricEnabled = sObj.optBoolean("biometricEnabled", false),
+                    autoAddDailySpending = sObj.optBoolean("autoAddDailySpending", false),
+                    themeMode = sObj.optString("themeMode", "DARK"),
+                    appLanguage = sObj.optString("appLanguage", "ar")
+                )
+                repository.insertOrUpdateSalarySettings(restoredSettings)
+            }
+
+            if (root.has("transactions")) {
+                val txArray = root.getJSONArray("transactions")
+                repository.deleteAllTransactions()
+                for (i in 0 until txArray.length()) {
+                    val obj = txArray.getJSONObject(i)
+                    val vNote = obj.optString("voiceNotePath", obj.optString("audioNotePath", ""))
+                    val vText = obj.optString("voiceText", obj.optString("note", ""))
+                    val tx = Transaction(
+                        id = obj.optInt("id", 0),
+                        type = obj.optString("type", "SPENDING"),
+                        amount = obj.optDouble("amount", 0.0),
+                        timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
+                        voiceNotePath = if (vNote.isBlank()) null else vNote,
+                        voiceText = if (vText.isBlank()) null else vText
+                    )
+                    repository.insertTransaction(tx)
+                }
+            }
+            _userNotice.tryEmit("✅ تم استعادة النسخة الاحتياطية بنجاح!")
+            true
+        } catch (e: Exception) {
+            Log.e("SalaryViewModel", "Error restoring backup JSON", e)
+            _userNotice.tryEmit("❌ فشلت استعادة النسخة الاحتياطية. صيغة الملف غير صحيحة.")
+            false
         }
     }
 

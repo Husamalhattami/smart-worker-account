@@ -24,7 +24,8 @@ data class SalarySettings(
     val securityPin: String = "",
     val biometricEnabled: Boolean = false,
     val autoAddDailySpending: Boolean = false,
-    val themeMode: String = "DARK"
+    val themeMode: String = "DARK",
+    val appLanguage: String = "ar"
 )
 
 @Entity(tableName = "transactions")

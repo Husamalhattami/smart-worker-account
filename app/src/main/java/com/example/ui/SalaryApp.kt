@@ -3,11 +3,13 @@ package com.example.ui
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import java.io.File
 import android.content.pm.PackageManager
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import kotlinx.coroutines.launch
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -34,12 +36,14 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
@@ -47,6 +51,8 @@ import com.example.R
 import com.example.data.SalarySettings
 import com.example.data.Transaction
 import com.example.ui.theme.*
+import com.example.util.AppLanguage
+import com.example.util.LanguageStrings
 import com.example.util.PdfPrintHelper
 import com.example.viewmodel.SalaryMetrics
 import com.example.viewmodel.SalaryViewModel
@@ -74,6 +80,7 @@ val LocalAppColors = staticCompositionLocalOf { AppColors() }
 @Composable
 fun SalaryApp(viewModel: SalaryViewModel) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val settingsState by viewModel.settings.collectAsState()
     val transactionsState by viewModel.transactions.collectAsState()
     val metricsState by viewModel.metrics.collectAsState()
@@ -94,9 +101,10 @@ fun SalaryApp(viewModel: SalaryViewModel) {
 
     var showMainMenuDialog by remember { mutableStateOf(false) }
     var showDeveloperInfoDialog by remember { mutableStateOf(false) }
+    var showBackupDialog by remember { mutableStateOf(false) }
     var settingsInitialTab by remember { mutableStateOf(0) }
     var showSettingsDialog by remember { mutableStateOf(false) }
-    var showUpdateDialog by remember { mutableStateOf(true) }
+    var showUpdateDialog by remember { mutableStateOf(false) }
     var showAddTxDialog by remember { mutableStateOf(false) }
     var editingTransaction by remember { mutableStateOf<Transaction?>(null) }
     var isAppUnlocked by remember { mutableStateOf(false) }
@@ -128,10 +136,49 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         }
     )
 
+    val createDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            coroutineScope.launch {
+                try {
+                    val json = viewModel.exportBackupJson()
+                    context.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                        outputStream.write(json.toByteArray(Charsets.UTF_8))
+                    }
+                    Toast.makeText(context, "✅ تم حفظ النسخة الاحتياطية بنجاح!", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "❌ فشل حفظ ملف النسخة الاحتياطية", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    val getContentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            coroutineScope.launch {
+                try {
+                    val json = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                    if (!json.isNullOrBlank()) {
+                        val success = viewModel.restoreBackupJson(json)
+                        if (success) {
+                            Toast.makeText(context, "✅ تم استعادة جميع البيانات والراتب بنجاح!", Toast.LENGTH_LONG).show()
+                            showSettingsDialog = false
+                        }
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(context, "❌ فشل قراءة ملف النسخة الاحتياطية", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     var hasGreeted by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        viewModel.checkForUpdates()
+        viewModel.checkForUpdates(isManual = false)
         val permissionsToRequest = mutableListOf<String>()
         if (!hasRecordPermission) {
             permissionsToRequest.add(Manifest.permission.RECORD_AUDIO)
@@ -141,6 +188,12 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         }
         if (permissionsToRequest.isNotEmpty()) {
             permissionLauncher.launch(permissionsToRequest.toTypedArray())
+        }
+    }
+
+    LaunchedEffect(updateInfoState.hasUpdate) {
+        if (updateInfoState.hasUpdate) {
+            showUpdateDialog = true
         }
     }
 
@@ -170,7 +223,14 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         border = if (isDark) Color.Gray.copy(alpha = 0.3f) else Color.LightGray.copy(alpha = 0.5f)
     )
 
-    CompositionLocalProvider(LocalAppColors provides appColors) {
+    val langCode = settingsState?.appLanguage ?: "ar"
+    val appLang = AppLanguage.fromCode(langCode)
+    val layoutDirection = if (appLang.isRtl) LayoutDirection.Rtl else LayoutDirection.Ltr
+
+    CompositionLocalProvider(
+        LocalAppColors provides appColors,
+        LocalLayoutDirection provides layoutDirection
+    ) {
     if (settingsState == null) {
         Box(
             modifier = Modifier
@@ -375,6 +435,8 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     PdfPrintHelper.printSalaryReport(context, settings, txList, metrics)
                 }
             )
+
+            Spacer(modifier = Modifier.height(80.dp))
         }
     }
     }
@@ -382,6 +444,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     // --- MAIN MENU DIALOG ---
     if (showMainMenuDialog) {
         MainMenuDialog(
+            appLanguage = settingsState?.appLanguage ?: "ar",
             onDismiss = { showMainMenuDialog = false },
             onOpenAppSettings = {
                 showMainMenuDialog = false
@@ -393,6 +456,14 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 settingsInitialTab = 0
                 showSettingsDialog = true
             },
+            onOpenBackup = {
+                showMainMenuDialog = false
+                showBackupDialog = true
+            },
+            onCheckUpdate = {
+                showMainMenuDialog = false
+                viewModel.checkForUpdates(isManual = true)
+            },
             onOpenDeveloperInfo = {
                 showMainMenuDialog = false
                 showDeveloperInfoDialog = true
@@ -400,13 +471,34 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         )
     }
 
+    // --- BACKUP DIALOG ---
+    if (showBackupDialog) {
+        BackupDialog(
+            appLanguage = settingsState?.appLanguage ?: "ar",
+            onDismiss = { showBackupDialog = false },
+            onExportBackup = {
+                val timeStamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+                try {
+                    createDocumentLauncher.launch("smart_worker_backup_$timeStamp.json")
+                } catch (e: Exception) {
+                    exportAndShareBackup(context, viewModel, coroutineScope)
+                }
+            },
+            onRestoreBackup = {
+                try {
+                    getContentLauncher.launch("*/*")
+                } catch (e: Exception) {
+                    Toast.makeText(context, "⚠️ تعذر فتح متصفح الملفات للاستعادة", Toast.LENGTH_LONG).show()
+                }
+            }
+        )
+    }
+
     // --- DEVELOPER INFO DIALOG ---
     if (showDeveloperInfoDialog) {
-        DeveloperAndUpdateDialog(
-            onDismiss = { showDeveloperInfoDialog = false },
-            onCheckUpdate = {
-                viewModel.checkForUpdates()
-            }
+        DeveloperInfoDialog(
+            appLanguage = settingsState?.appLanguage ?: "ar",
+            onDismiss = { showDeveloperInfoDialog = false }
         )
     }
 
@@ -416,7 +508,22 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             currentSettings = settingsState ?: SalarySettings(),
             initialTab = settingsInitialTab,
             onDismiss = { showSettingsDialog = false },
-            onSave = { salary, startDate, currency, standardSpending, priorAbsences, priorSpendings, priorDraws, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, employeeName, voiceEnabled, openingBalance, securityEnabled, securityPin, biometricEnabled, autoAddDailySpending, themeMode ->
+            onExportBackup = {
+                val timeStamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+                try {
+                    createDocumentLauncher.launch("smart_worker_backup_$timeStamp.json")
+                } catch (e: Exception) {
+                    exportAndShareBackup(context, viewModel, coroutineScope)
+                }
+            },
+            onRestoreBackup = {
+                try {
+                    getContentLauncher.launch("*/*")
+                } catch (e: Exception) {
+                    Toast.makeText(context, "⚠️ تعذر فتح متصفح الملفات للاستعادة", Toast.LENGTH_LONG).show()
+                }
+            },
+            onSave = { salary, startDate, currency, standardSpending, priorAbsences, priorSpendings, priorDraws, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, employeeName, voiceEnabled, openingBalance, securityEnabled, securityPin, biometricEnabled, autoAddDailySpending, themeMode, appLanguage ->
                 viewModel.updateSalarySettings(
                     salary = salary,
                     startDate = startDate,
@@ -435,7 +542,8 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     securityPin = securityPin,
                     biometricEnabled = biometricEnabled,
                     autoAddDailySpending = autoAddDailySpending,
-                    themeMode = themeMode
+                    themeMode = themeMode,
+                    appLanguage = appLanguage
                 )
                 showSettingsDialog = false
             }
@@ -836,49 +944,54 @@ fun StatCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
-            horizontalAlignment = Alignment.End
+                .padding(12.dp),
+            horizontalAlignment = Alignment.Start
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth()
             ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = LocalAppColors.current.textSub,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
                     tint = color,
-                    modifier = Modifier.size(24.dp)
-                )
-                Spacer(modifier = Modifier.weight(1f))
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = LocalAppColors.current.textSub,
-                    textAlign = TextAlign.Right
+                    modifier = Modifier.size(20.dp)
                 )
             }
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Row(
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Start,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                if (unit.isNotEmpty()) {
-                    Text(
-                        text = "$unit ",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LocalAppColors.current.textMuted,
-                        modifier = Modifier.padding(bottom = 2.dp)
-                    )
-                }
                 Text(
                     text = value,
-                    style = MaterialTheme.typography.headlineMedium,
+                    style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     color = color,
-                    textAlign = TextAlign.Right
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                if (unit.isNotEmpty()) {
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = unit,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = LocalAppColors.current.textMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
         }
     }
@@ -1751,7 +1864,9 @@ fun SettingsDialog(
     currentSettings: SalarySettings,
     initialTab: Int = 0,
     onDismiss: () -> Unit,
-    onSave: (Double, Long, String, Double, Int, Double, Double, Boolean, Int, Int, String, Boolean, Double, Boolean, String, Boolean, Boolean, String) -> Unit
+    onExportBackup: (() -> Unit)? = null,
+    onRestoreBackup: (() -> Unit)? = null,
+    onSave: (Double, Long, String, Double, Int, Double, Double, Boolean, Int, Int, String, Boolean, Double, Boolean, String, Boolean, Boolean, String, String) -> Unit
 ) {
     val context = LocalContext.current
     var salaryInput by remember { mutableStateOf(currentSettings.monthlySalary.toInt().toString()) }
@@ -1776,9 +1891,10 @@ fun SettingsDialog(
     var securityPinInput by remember { mutableStateOf(currentSettings.securityPin) }
     var biometricEnabled by remember { mutableStateOf(currentSettings.biometricEnabled) }
 
-    // Auto Daily Spending & Theme Modes State
+    // Auto Daily Spending & Theme & Language Modes State
     var autoAddDailySpending by remember { mutableStateOf(currentSettings.autoAddDailySpending) }
     var themeMode by remember { mutableStateOf(currentSettings.themeMode) }
+    var selectedAppLanguage by remember { mutableStateOf(currentSettings.appLanguage) }
 
     val sdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
     var showDatePicker by remember { mutableStateOf(false) }
@@ -1868,7 +1984,7 @@ fun SettingsDialog(
                         value = employeeNameInput,
                         onValueChange = { employeeNameInput = it },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        placeholder = { Text("مثلاً: محمد خالد العريفي", color = Color.Gray) },
+                        placeholder = { Text("مثلاً: حسام الحطامي", color = Color.Gray) },
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = EmeraldGreen,
@@ -1900,14 +2016,16 @@ fun SettingsDialog(
 
                     // Currency Symbol Field
                     Text(
-                        text = "العملة (مثلاً: ريال يمني):",
+                        text = "العملة الرئيسية للراتب والحسابات 💱:",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
+                        color = LocalAppColors.current.textSub,
+                        fontWeight = FontWeight.Bold
                     )
                     OutlinedTextField(
                         value = currencyInput,
                         onValueChange = { currencyInput = it },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                        placeholder = { Text("أو اكتب رمز العملة يدوياً...", color = Color.Gray) },
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = EmeraldGreen,
@@ -1916,6 +2034,63 @@ fun SettingsDialog(
                             unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
+
+                    Text(
+                        text = "اختر العملة بسرعة (جاهز للنشر على Google Play):",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textMuted
+                    )
+
+                    val popularCurrencies = listOf(
+                        "ريال يمني 🇾🇪",
+                        "ريال سعودي 🇸🇦",
+                        "دولار أمريكي 💵",
+                        "جنيه مصري 🇪🇬",
+                        "درهم إماراتي 🇦🇪",
+                        "دينار كويتي 🇰🇼",
+                        "ريال قطري 🇶🇦",
+                        "ريال عماني 🇴🇲",
+                        "دينار بحريني 🇧🇭",
+                        "يورو 🇪🇺",
+                        "دينار أردني 🇯🇴",
+                        "روبية هندية 🇮🇳",
+                        "درهم مغربي 🇲🇦",
+                        "دينار جزائري 🇩🇿",
+                        "دينار عراقي 🇮🇶",
+                        "جنيه سوداني 🇸🇩"
+                    )
+
+                    @OptIn(ExperimentalLayoutApi::class)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        popularCurrencies.forEach { curr ->
+                            val isSelected = currencyInput == curr || currencyInput.contains(curr.split(" ").first())
+                            Box(
+                                modifier = Modifier
+                                    .background(
+                                        if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.6f),
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (isSelected) Color.Transparent else LocalAppColors.current.border,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable { currencyInput = curr }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = curr,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isSelected) Color.White else LocalAppColors.current.text,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
+                        }
+                    }
 
                     // Standard Daily Spending Field
                     Text(
@@ -2116,6 +2291,54 @@ fun SettingsDialog(
 
                     HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
+                    // App Language Selection
+                    Text(
+                        text = "🌐 لغة التطبيق (App Language):",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = LocalAppColors.current.text,
+                        fontWeight = FontWeight.Bold
+                    )
+                    val availableLanguages = listOf(
+                        "ar" to "العربية",
+                        "en" to "English",
+                        "fr" to "Français",
+                        "ur" to "اردو / हिन्दी"
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        availableLanguages.forEach { (code, label) ->
+                            val isSelected = selectedAppLanguage == code
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .background(
+                                        if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (isSelected) Color.Transparent else LocalAppColors.current.border,
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                                    .clickable { selectedAppLanguage = code }
+                                    .padding(vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = if (isSelected) Color.White else LocalAppColors.current.text,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
                     // Speak Transactions Switch
                     Text(
                         text = "🔊 التوجيهات الصوتية والتحدث المباشر:",
@@ -2276,6 +2499,74 @@ fun SettingsDialog(
 
                     HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
+                    // Backup & Restore Section
+                    val appLang = AppLanguage.fromCode(selectedAppLanguage)
+                    val dialogStrings = LanguageStrings(appLang)
+
+                    Text(
+                        text = dialogStrings.backupRestoreSection,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = LocalAppColors.current.text,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, LocalAppColors.current.border)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp).fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = dialogStrings.backupDescription,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.textSub
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { onExportBackup?.invoke() },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = dialogStrings.createBackupBtn,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                }
+
+                                Button(
+                                    onClick = { onRestoreBackup?.invoke() },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = dialogStrings.restoreBackupBtn,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
                     // Developer Info Card
                     Text(
                         text = "👨‍💻 معلومات مطور التطبيق:",
@@ -2335,7 +2626,7 @@ fun SettingsDialog(
                             val priorSpendings = priorSpendingsInput.toDoubleOrNull() ?: 0.0
                             val priorDraws = priorDrawsInput.toDoubleOrNull() ?: 0.0
                             val currencyVal = if (currencyInput.isBlank()) "ريال يمني" else currencyInput
-                            val employeeNameVal = if (employeeNameInput.isBlank()) "محمد خالد العريفي" else employeeNameInput
+                            val employeeNameVal = if (employeeNameInput.isBlank()) "حسام الحطامي" else employeeNameInput
                             val openingBalance = openingBalanceInput.toDoubleOrNull() ?: 0.0
                             
                             onSave(
@@ -2356,7 +2647,8 @@ fun SettingsDialog(
                                 securityPinInput,
                                 biometricEnabled,
                                 autoAddDailySpending,
-                                themeMode
+                                themeMode,
+                                selectedAppLanguage
                             )
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
@@ -3182,13 +3474,56 @@ private fun shareReport(context: Context, reportText: String, employeeName: Stri
     context.startActivity(Intent.createChooser(intent, "تصدير التقرير عبر:"))
 }
 
+private fun exportAndShareBackup(context: Context, viewModel: SalaryViewModel, coroutineScope: kotlinx.coroutines.CoroutineScope) {
+    coroutineScope.launch {
+        try {
+            val json = viewModel.exportBackupJson()
+            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+            val cacheFile = File(context.cacheDir, "smart_worker_backup_$timeStamp.json")
+            cacheFile.writeText(json, Charsets.UTF_8)
+
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                cacheFile
+            )
+
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/json"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "النسخة الاحتياطية - تطبيق حساب العامل الذكي")
+                putExtra(Intent.EXTRA_TEXT, "ملف النسخة الاحتياطية لتطبيق حساب العامل الذكي ($timeStamp)")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "تصدير أو مشاركة النسخة الاحتياطية:"))
+        } catch (e: Exception) {
+            try {
+                val json = viewModel.exportBackupJson()
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "النسخة الاحتياطية - تطبيق حساب العامل الذكي")
+                    putExtra(Intent.EXTRA_TEXT, json)
+                }
+                context.startActivity(Intent.createChooser(shareIntent, "مشاركة بيانات النسخة الاحتياطية:"))
+            } catch (ex: Exception) {
+                Toast.makeText(context, "❌ حدث خطأ أثناء تصدير النسخة الاحتياطية", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+}
+
 @Composable
 fun MainMenuDialog(
+    appLanguage: String = "ar",
     onDismiss: () -> Unit,
     onOpenAppSettings: () -> Unit,
     onOpenUserSettings: () -> Unit,
+    onOpenBackup: () -> Unit,
+    onCheckUpdate: () -> Unit,
     onOpenDeveloperInfo: () -> Unit
 ) {
+    val appLang = AppLanguage.fromCode(appLanguage)
+    val strings = LanguageStrings(appLang)
     Dialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
@@ -3203,7 +3538,7 @@ fun MainMenuDialog(
                     .fillMaxWidth()
                     .padding(20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -3216,7 +3551,7 @@ fun MainMenuDialog(
                         modifier = Modifier.size(28.dp)
                     )
                     Text(
-                        text = "القائمة الرئيسية والخيارات ☰",
+                        text = "القائمة الرئيسية",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = LocalAppColors.current.text
@@ -3225,10 +3560,10 @@ fun MainMenuDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                // Item 1: App Settings
+                // Item 1: App System Settings
                 MenuOptionCard(
-                    title = "⚙️ إعدادات التطبيق والراتب",
-                    subtitle = "تعديل الراتب الأساسي، العملة، الصرفة اليومية المعتادة، وتاريخ بدء الشهر",
+                    title = "⚙️ ${strings.systemSettingsTitle}",
+                    subtitle = strings.systemSettingsSubtitle,
                     icon = Icons.Default.Settings,
                     color = EmeraldGreen,
                     onClick = onOpenAppSettings
@@ -3236,17 +3571,35 @@ fun MainMenuDialog(
 
                 // Item 2: User Settings
                 MenuOptionCard(
-                    title = "👤 إعدادات المستخدم والأمان",
-                    subtitle = "اسم العامل، تفعيل القفل برقم سري (PIN)، التنبيهات اليومية، والنسخ الاحتياطي",
+                    title = "👤 ${strings.userSettingsTitle}",
+                    subtitle = strings.userSettingsSubtitle,
                     icon = Icons.Default.Person,
                     color = EarnedBlue,
                     onClick = onOpenUserSettings
                 )
 
-                // Item 3: Developer Info & GitHub Updates
+                // Item 3: Backup & Restore
                 MenuOptionCard(
-                    title = "ℹ️ معلومات المطور والتحديثات (GitHub)",
-                    subtitle = "إصدار التطبيق، بيانات المطور، فحص التحديثات المباشرة وشرح طريقة العمل",
+                    title = "💾 ${strings.backupRestoreSection}",
+                    subtitle = "تصدير واستعادة نسخ احتياطية للبيانات",
+                    icon = Icons.Default.Share,
+                    color = Color(0xFF8E24AA),
+                    onClick = onOpenBackup
+                )
+
+                // Item 4: Live Updates
+                MenuOptionCard(
+                    title = "🔄 ${strings.liveUpdatesTitle}",
+                    subtitle = strings.liveUpdatesSubtitle,
+                    icon = Icons.Default.Refresh,
+                    color = Color(0xFF00ACC1),
+                    onClick = onCheckUpdate
+                )
+
+                // Item 5: Developer Info ONLY
+                MenuOptionCard(
+                    title = "ℹ️ ${strings.devInfoTitle}",
+                    subtitle = strings.developerTitle,
                     icon = Icons.Default.Info,
                     color = AmberOrange,
                     onClick = onOpenDeveloperInfo
@@ -3258,7 +3611,110 @@ fun MainMenuDialog(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("إغلاق القائمة", color = LocalAppColors.current.text)
+                    Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun BackupDialog(
+    appLanguage: String = "ar",
+    onDismiss: () -> Unit,
+    onExportBackup: () -> Unit,
+    onRestoreBackup: () -> Unit
+) {
+    val appLang = AppLanguage.fromCode(appLanguage)
+    val strings = LanguageStrings(appLang)
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = null,
+                        tint = Color(0xFF8E24AA),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = strings.backupRestoreSection,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                Text(
+                    text = strings.backupDescription,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.textSub,
+                    textAlign = TextAlign.Center
+                )
+
+                Button(
+                    onClick = {
+                        onDismiss()
+                        onExportBackup()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = strings.createBackupBtn,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+
+                Button(
+                    onClick = {
+                        onDismiss()
+                        onRestoreBackup()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = strings.restoreBackupBtn,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(strings.cancelBtn, color = LocalAppColors.current.text)
                 }
             }
         }
@@ -3324,11 +3780,12 @@ fun MenuOptionCard(
 }
 
 @Composable
-fun DeveloperAndUpdateDialog(
-    onDismiss: () -> Unit,
-    onCheckUpdate: () -> Unit
+fun DeveloperInfoDialog(
+    appLanguage: String = "ar",
+    onDismiss: () -> Unit
 ) {
-    val context = LocalContext.current
+    val appLang = AppLanguage.fromCode(appLanguage)
+    val strings = LanguageStrings(appLang)
     Dialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
@@ -3357,7 +3814,7 @@ fun DeveloperAndUpdateDialog(
                         modifier = Modifier.size(28.dp)
                     )
                     Text(
-                        text = "معلومات المطور والتحديثات 📲",
+                        text = strings.devInfoTitle,
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = LocalAppColors.current.text
@@ -3366,99 +3823,40 @@ fun DeveloperAndUpdateDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                // Developer & App Summary Card
+                // Developer & App Summary Card ONLY
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
                     shape = RoundedCornerShape(16.dp)
                 ) {
                     Column(
-                        modifier = Modifier.padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        horizontalAlignment = Alignment.Start
-                    ) {
-                        Text(
-                            text = "📱 تطبيق: حساب العامل الذكي (Smart Worker Calculator)",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = LocalAppColors.current.text
-                        )
-                        Text(
-                            text = "🏷️ رقم الإصدار الحالي: v1.2.0 (مستقر)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = EmeraldGreen,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "👨‍💻 تطوير المهندس: حسام العريفي",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalAppColors.current.textSub
-                        )
-                        Text(
-                            text = "🎯 الهدف: نظام محاسبي وذكاء اصطناعي صوتي شامل لإدارة مستحقات وراتب العمال والموظفين بدقة تامة.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LocalAppColors.current.textMuted
-                        )
-                    }
-                }
-
-                // Check Live Update Button
-                Button(
-                    onClick = {
-                        onCheckUpdate()
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, tint = Color.White)
-                        Text("فحص التحديثات المباشرة عبر GitHub 🔄", fontWeight = FontWeight.Bold, color = Color.White)
-                    }
-                }
-
-                // GitHub Update Instructions Explanation
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
-                    shape = RoundedCornerShape(16.dp),
-                    border = BorderStroke(1.dp, EarnedBlue.copy(alpha = 0.3f))
-                ) {
-                    Column(
-                        modifier = Modifier.padding(14.dp),
+                        modifier = Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                         horizontalAlignment = Alignment.Start
                     ) {
                         Text(
-                            text = "📖 كيف تعمل التحديثات التلقائية عبر GitHub؟",
+                            text = "📱 ${strings.appTitle}",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
-                            color = EarnedBlue
+                            color = LocalAppColors.current.text
                         )
                         Text(
-                            text = "1️⃣ عند قيام المطور بالتعديل على أكواد البرمجية وإجراء تحسينات في ملفات المشروع على GitHub، يتم رفع ملف إصدار جديد (APK + version.json).",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LocalAppColors.current.textSub
+                            text = strings.currentVersionText,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = EmeraldGreen,
+                            fontWeight = FontWeight.Bold
+                        )
+                        HorizontalDivider(color = LocalAppColors.current.border, thickness = 0.5.dp)
+                        Text(
+                            text = strings.developerTitle,
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = LocalAppColors.current.text
                         )
                         Text(
-                            text = "2️⃣ يتصل التطبيق عند تشغيله برابط ملف التحديث المباشر من GitHub لمقارنة رقم الإصدار في سيرفر GitHub مع رقم إصدار التطبيق بداخل هاتفك.",
+                            text = strings.appObjective,
                             style = MaterialTheme.typography.bodySmall,
-                            color = LocalAppColors.current.textSub
-                        )
-                        Text(
-                            text = "3️⃣ إذا كان رقم الإصدار المرفوع في GitHub أحدث من الموجود لديك، يظهر لك تنبيه بارز فوراً في أعلى التطبيق يخبرك بوجود تحديث جديد ومزاياه.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LocalAppColors.current.textSub
-                        )
-                        Text(
-                            text = "4️⃣ بمجرد الضغط على زر 'تنزيل التحديث'، يتم تحميل ملف الـ APK وتثبيته مباشرة دون فقدان أي ريال أو بيانات من سجلك المالي!",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LocalAppColors.current.textSub
+                            color = LocalAppColors.current.textMuted
                         )
                     }
                 }
@@ -3469,7 +3867,7 @@ fun DeveloperAndUpdateDialog(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("إغلاق", color = LocalAppColors.current.text)
+                    Text(strings.cancelBtn, color = LocalAppColors.current.text)
                 }
             }
         }
