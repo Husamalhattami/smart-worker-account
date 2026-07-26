@@ -9,9 +9,13 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.foundation.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -46,10 +50,20 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import android.app.Activity
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
+import com.example.data.CurrencyItem
 import com.example.data.SalarySettings
 import com.example.data.Transaction
+import com.example.viewmodel.UpdateInfo
 import com.example.ui.theme.*
 import com.example.util.AppLanguage
 import com.example.util.LanguageStrings
@@ -86,6 +100,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     val metricsState by viewModel.metrics.collectAsState()
     val activeUser by viewModel.activeUser.collectAsState()
     val registeredUsers by viewModel.registeredUsers.collectAsState()
+    val currenciesState by viewModel.currenciesState.collectAsStateWithLifecycle()
 
     val isListening by viewModel.isListening.collectAsState()
     val isRecordingVoice by viewModel.isRecordingVoice.collectAsState()
@@ -102,9 +117,10 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     var showMainMenuDialog by remember { mutableStateOf(false) }
     var showDeveloperInfoDialog by remember { mutableStateOf(false) }
     var showBackupDialog by remember { mutableStateOf(false) }
-    var settingsInitialTab by remember { mutableStateOf(0) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showUserSettingsDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
+    var showGuideDialog by remember { mutableStateOf(false) }
     var showAddTxDialog by remember { mutableStateOf(false) }
     var editingTransaction by remember { mutableStateOf<Transaction?>(null) }
     var isAppUnlocked by remember { mutableStateOf(false) }
@@ -123,18 +139,37 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         )
     }
 
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions(),
-        onResult = { permissions ->
-            hasRecordPermission = permissions[Manifest.permission.RECORD_AUDIO] ?: hasRecordPermission
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                hasNotificationPermission = permissions[Manifest.permission.POST_NOTIFICATIONS] ?: hasNotificationPermission
-            }
-            if (permissions[Manifest.permission.RECORD_AUDIO] == false) {
-                Toast.makeText(context, "الرجاء تفعيل صلاحية الميكروفون لاستخدام الإدخال الصوتي", Toast.LENGTH_LONG).show()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasRecordPermission = ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    hasNotificationPermission = ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                }
             }
         }
-    )
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val activity = context as? Activity
+
+    fun requestPermissionsSafely(permissions: Array<String>) {
+        if (activity != null && permissions.isNotEmpty()) {
+            try {
+                ActivityCompat.requestPermissions(activity, permissions, 101)
+            } catch (e: Exception) {
+                Log.e("SalaryApp", "Failed to request permissions safely", e)
+            }
+        }
+    }
 
     val createDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
@@ -154,19 +189,27 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         }
     }
 
-    val getContentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri ->
+    val handleRestoreUri: (android.net.Uri?) -> Unit = { uri ->
         if (uri != null) {
             coroutineScope.launch {
                 try {
+                    try {
+                        context.contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        )
+                    } catch (_: Exception) {}
                     val json = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
                     if (!json.isNullOrBlank()) {
                         val success = viewModel.restoreBackupJson(json)
                         if (success) {
                             Toast.makeText(context, "✅ تم استعادة جميع البيانات والراتب بنجاح!", Toast.LENGTH_LONG).show()
-                            showSettingsDialog = false
+                            showBackupDialog = false
+                        } else {
+                            Toast.makeText(context, "❌ صيغة الملف غير صحيحة كنسخة احتياطية", Toast.LENGTH_LONG).show()
                         }
+                    } else {
+                        Toast.makeText(context, "⚠️ الملف المختار فارغ", Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
                     Toast.makeText(context, "❌ فشل قراءة ملف النسخة الاحتياطية", Toast.LENGTH_LONG).show()
@@ -174,6 +217,16 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             }
         }
     }
+
+    val getContentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+        onResult = handleRestoreUri
+    )
+
+    val openDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = handleRestoreUri
+    )
 
     var hasGreeted by remember { mutableStateOf(false) }
 
@@ -187,7 +240,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (permissionsToRequest.isNotEmpty()) {
-            permissionLauncher.launch(permissionsToRequest.toTypedArray())
+            requestPermissionsSafely(permissionsToRequest.toTypedArray())
         }
     }
 
@@ -275,49 +328,62 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         topBar = {
             TopAppBar(
                 title = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.AccountBalanceWallet,
-                            contentDescription = null,
-                            tint = EmeraldGreen,
-                            modifier = Modifier.size(32.dp)
-                        )
+                    Column(verticalArrangement = Arrangement.Center) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AccountBalanceWallet,
+                                contentDescription = null,
+                                tint = EmeraldGreen,
+                                modifier = Modifier.size(26.dp)
+                            )
+                            Text(
+                                text = "حساب العامل الذكي",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+                        val empName = settingsState?.employeeName?.trim()
+                        val greetingText = if (!empName.isNullOrEmpty()) "مرحباً بك $empName" else "مرحباً بك"
                         Text(
-                            text = "حساب العامل الذكي",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = LocalAppColors.current.text
+                            text = greetingText,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = EmeraldGreen
                         )
                     }
                 },
                 actions = {
-                    // Refresh data / Reset
+                    // Audio Status Report Button
                     IconButton(
                         onClick = { viewModel.announceFinancialStatus() },
                         modifier = Modifier
+                            .size(38.dp)
                             .background(EmeraldGreen.copy(alpha = 0.15f), shape = CircleShape)
-                            .padding(4.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.VolumeUp,
-                            contentDescription = "استمع لكامل التقرير المالي المسموع",
-                            tint = EmeraldGreen
+                            contentDescription = "استمع للتقرير الصوتي",
+                            tint = EmeraldGreen,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    // Menu Curtain Drawer Trigger Button
                     IconButton(
                         onClick = { showMainMenuDialog = true },
                         modifier = Modifier
+                            .size(38.dp)
                             .background(LocalAppColors.current.text.copy(alpha = 0.08f), shape = CircleShape)
-                            .padding(4.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Menu,
-                            contentDescription = "القائمة الرئيسية والخيارات",
-                            tint = LocalAppColors.current.text
+                            contentDescription = "القائمة الرئيسية",
+                            tint = LocalAppColors.current.text,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 },
@@ -381,7 +447,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                             viewModel.startVoiceRecordingForCommand()
                         }
                     } else {
-                        permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                        requestPermissionsSafely(arrayOf(Manifest.permission.RECORD_AUDIO))
                     }
                 }
             )
@@ -425,7 +491,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             ReportActionSection(
                 onShareClick = {
                     val rText = viewModel.getReportText()
-                    val empName = settingsState?.employeeName ?: "محمد خالد العريفي"
+                    val empName = settingsState?.employeeName ?: "حسام الحطامي"
                     shareReport(context, rText, empName)
                 },
                 onPrintClick = {
@@ -448,13 +514,11 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             onDismiss = { showMainMenuDialog = false },
             onOpenAppSettings = {
                 showMainMenuDialog = false
-                settingsInitialTab = 1
                 showSettingsDialog = true
             },
             onOpenUserSettings = {
                 showMainMenuDialog = false
-                settingsInitialTab = 0
-                showSettingsDialog = true
+                showUserSettingsDialog = true
             },
             onOpenBackup = {
                 showMainMenuDialog = false
@@ -462,7 +526,12 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             },
             onCheckUpdate = {
                 showMainMenuDialog = false
+                showUpdateDialog = true
                 viewModel.checkForUpdates(isManual = true)
+            },
+            onOpenGuide = {
+                showMainMenuDialog = false
+                showGuideDialog = true
             },
             onOpenDeveloperInfo = {
                 showMainMenuDialog = false
@@ -487,10 +556,45 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             onRestoreBackup = {
                 try {
                     getContentLauncher.launch("*/*")
-                } catch (e: Exception) {
-                    Toast.makeText(context, "⚠️ تعذر فتح متصفح الملفات للاستعادة", Toast.LENGTH_LONG).show()
+                } catch (e1: Exception) {
+                    try {
+                        openDocumentLauncher.launch(arrayOf("*/*"))
+                    } catch (e2: Exception) {
+                        Toast.makeText(context, "⚠️ تعذر فتح متصفح الملفات، يمكنك استخدام خيار اللصق اليدوي للنص", Toast.LENGTH_LONG).show()
+                    }
+                }
+            },
+            onRestoreFromText = { text ->
+                coroutineScope.launch {
+                    try {
+                        val success = viewModel.restoreBackupJson(text)
+                        if (success) {
+                            Toast.makeText(context, "✅ تم استعادة جميع البيانات والراتب بنجاح!", Toast.LENGTH_LONG).show()
+                            showBackupDialog = false
+                        } else {
+                            Toast.makeText(context, "❌ صيغة الملف أو النص غير صحيحة كنسخة احتياطية", Toast.LENGTH_LONG).show()
+                        }
+                    } catch (e: Exception) {
+                        Toast.makeText(context, "❌ حدث خطأ أثناء استعادة النسخة من النص", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
+        )
+    }
+
+    // --- APP GUIDE DIALOG ---
+    if (showGuideDialog) {
+        AppGuideDialog(
+            onDismiss = { showGuideDialog = false }
+        )
+    }
+
+    // --- APP UPDATE DIALOG ---
+    if (showUpdateDialog) {
+        AppUpdateDialog(
+            updateInfoState = updateInfoState,
+            onCheckUpdate = { viewModel.checkForUpdates(isManual = true) },
+            onDismiss = { showUpdateDialog = false }
         )
     }
 
@@ -502,28 +606,20 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         )
     }
 
-    // --- SETTINGS DIALOG ---
-    if (showSettingsDialog) {
-        SettingsDialog(
+    // --- USER SETTINGS DIALOG ---
+    if (showUserSettingsDialog) {
+        UserSettingsDialog(
             currentSettings = settingsState ?: SalarySettings(),
-            initialTab = settingsInitialTab,
-            onDismiss = { showSettingsDialog = false },
-            onExportBackup = {
-                val timeStamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
-                try {
-                    createDocumentLauncher.launch("smart_worker_backup_$timeStamp.json")
-                } catch (e: Exception) {
-                    exportAndShareBackup(context, viewModel, coroutineScope)
-                }
+            currencies = currenciesState,
+            onAddCustomCurrency = { name, symbol, flag ->
+                viewModel.addCustomCurrency(name, symbol, flag)
             },
-            onRestoreBackup = {
-                try {
-                    getContentLauncher.launch("*/*")
-                } catch (e: Exception) {
-                    Toast.makeText(context, "⚠️ تعذر فتح متصفح الملفات للاستعادة", Toast.LENGTH_LONG).show()
-                }
+            onDeleteCurrency = { item ->
+                viewModel.deleteCurrency(item)
             },
-            onSave = { salary, startDate, currency, standardSpending, priorAbsences, priorSpendings, priorDraws, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, employeeName, voiceEnabled, openingBalance, securityEnabled, securityPin, biometricEnabled, autoAddDailySpending, themeMode, appLanguage ->
+            onDismiss = { showUserSettingsDialog = false },
+            onSave = { employeeName, salary, currency, standardSpending, startDate, autoAddDailySpending, isSpendingDeductedFromSalary, openingBalance, priorAbsences, priorSpendings, priorDraws ->
+                val curr = settingsState ?: SalarySettings()
                 viewModel.updateSalarySettings(
                     salary = salary,
                     startDate = startDate,
@@ -532,16 +628,51 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     priorAbsences = priorAbsences,
                     priorSpendings = priorSpendings,
                     priorDraws = priorDraws,
+                    dailyReminderEnabled = curr.dailyReminderEnabled,
+                    dailyReminderHour = curr.dailyReminderHour,
+                    dailyReminderMinute = curr.dailyReminderMinute,
+                    employeeName = employeeName,
+                    voiceEnabled = curr.voiceEnabled,
+                    openingBalance = openingBalance,
+                    securityEnabled = curr.securityEnabled,
+                    securityPin = curr.securityPin,
+                    biometricEnabled = curr.biometricEnabled,
+                    autoAddDailySpending = autoAddDailySpending,
+                    isSpendingDeductedFromSalary = isSpendingDeductedFromSalary,
+                    themeMode = curr.themeMode,
+                    appLanguage = curr.appLanguage
+                )
+                showUserSettingsDialog = false
+            }
+        )
+    }
+
+    // --- APP SETTINGS DIALOG ---
+    if (showSettingsDialog) {
+        SettingsDialog(
+            currentSettings = settingsState ?: SalarySettings(),
+            onDismiss = { showSettingsDialog = false },
+            onSave = { voiceEnabled, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, securityEnabled, securityPin, biometricEnabled, themeMode, appLanguage ->
+                val curr = settingsState ?: SalarySettings()
+                viewModel.updateSalarySettings(
+                    salary = curr.monthlySalary,
+                    startDate = curr.startWorkDate,
+                    currency = curr.currency,
+                    standardSpending = curr.standardSpendingAmount,
+                    priorAbsences = curr.priorAbsenceCount,
+                    priorSpendings = curr.priorSpendingsAmount,
+                    priorDraws = curr.priorDrawsAmount,
                     dailyReminderEnabled = dailyReminderEnabled,
                     dailyReminderHour = dailyReminderHour,
                     dailyReminderMinute = dailyReminderMinute,
-                    employeeName = employeeName,
+                    employeeName = curr.employeeName,
                     voiceEnabled = voiceEnabled,
-                    openingBalance = openingBalance,
+                    openingBalance = curr.openingBalance,
                     securityEnabled = securityEnabled,
                     securityPin = securityPin,
                     biometricEnabled = biometricEnabled,
-                    autoAddDailySpending = autoAddDailySpending,
+                    autoAddDailySpending = curr.autoAddDailySpending,
+                    isSpendingDeductedFromSalary = curr.isSpendingDeductedFromSalary,
                     themeMode = themeMode,
                     appLanguage = appLanguage
                 )
@@ -550,75 +681,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         )
     }
 
-    // --- UPDATE NOTIFICATION DIALOG ---
-    if (updateInfoState.hasUpdate && showUpdateDialog) {
-        AlertDialog(
-            onDismissRequest = { showUpdateDialog = false },
-            title = {
-                Text(
-                    text = "📢 يتوفر تحديث جديد للتطبيق!",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = EmeraldGreen,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalAlignment = Alignment.End
-                ) {
-                    Text(
-                        text = "الإصدار الجديد: ${updateInfoState.versionName}",
-                        fontWeight = FontWeight.Bold,
-                        color = LocalAppColors.current.text
-                    )
-                    if (updateInfoState.changelog.isNotBlank()) {
-                        Text(
-                            text = "ما الجديد في هذا الإصدار:",
-                            fontWeight = FontWeight.SemiBold,
-                            color = LocalAppColors.current.textSub
-                        )
-                        Text(
-                            text = updateInfoState.changelog,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalAppColors.current.textMuted
-                        )
-                    }
-                    Text(
-                        text = "يرجى تحميل النسخة الجديدة للحصول على آخر الميزات والتحسينات المحدثة.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        try {
-                            val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(updateInfoState.updateUrl))
-                            context.startActivity(intent)
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "تعذر فتح الرابط", Toast.LENGTH_SHORT).show()
-                        }
-                        showUpdateDialog = false
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen)
-                ) {
-                    Text("تحميل التحديث", color = Color.White)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showUpdateDialog = false }) {
-                    Text("لاحقاً", color = Color.Gray)
-                }
-            },
-            containerColor = LocalAppColors.current.surface,
-            shape = RoundedCornerShape(16.dp)
-        )
-    }
+    // Update dialog handled above by AppUpdateDialog
 
     // --- ADD TRANSACTION DIALOG ---
     if (showAddTxDialog) {
@@ -657,27 +720,39 @@ fun WelcomeSection(settings: SalarySettings) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
-        shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, LocalAppColors.current.border),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            horizontalAlignment = Alignment.End
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            val employeeName = if (settings.employeeName.isBlank()) "محمد خالد العريفي" else settings.employeeName
-            Text(
-                text = "مرحباً يا $employeeName 👋",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = LocalAppColors.current.text,
-                textAlign = TextAlign.Right
-            )
-            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.CalendarToday,
+                    contentDescription = null,
+                    tint = EmeraldGreen,
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    text = "اليوم:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.textMuted,
+                    fontWeight = FontWeight.Bold
+                )
+            }
             Text(
                 text = dateString,
                 style = MaterialTheme.typography.bodyMedium,
-                color = LocalAppColors.current.textSub,
-                textAlign = TextAlign.Right
+                fontWeight = FontWeight.SemiBold,
+                color = LocalAppColors.current.text
             )
         }
     }
@@ -1077,7 +1152,7 @@ fun QuickActionsSection(
     
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Text(
             text = "إضافة سريعة بلمسة واحدة 👇",
@@ -1095,17 +1170,17 @@ fun QuickActionsSection(
                 QuickActionCard(
                     title = "صرفة اليوم المعتادة",
                     amountText = "${standardSpending.toInt()} $cur",
-                    color = CrimsonRed,
-                    icon = Icons.Default.Payments,
+                    accentColor = CrimsonRed,
+                    icon = Icons.Default.ReceiptLong,
                     onClick = { onSpendingClick(standardSpending) },
                     modifier = Modifier.fillMaxWidth()
                 )
             }
             Box(modifier = Modifier.weight(1f)) {
                 QuickActionCard(
-                    title = "غياب يوم كامل",
-                    amountText = "١٢ ساعة",
-                    color = Color.Gray,
+                    title = "تسجيل غياب يوم كامل",
+                    amountText = "١٢ ساعة غياب",
+                    accentColor = Color(0xFF6B7280),
                     icon = Icons.Default.EventBusy,
                     onClick = onAbsenceClick,
                     modifier = Modifier.fillMaxWidth()
@@ -1119,45 +1194,68 @@ fun QuickActionsSection(
 fun QuickActionCard(
     title: String,
     amountText: String,
-    color: Color,
+    accentColor: Color,
     icon: ImageVector,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
         onClick = onClick,
-        modifier = modifier
-            .height(135.dp)
-            .padding(4.dp),
-        colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.15f)),
-        border = BorderStroke(2.dp, color)
+        modifier = modifier.height(115.dp),
+        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.35f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(8.dp),
+                .padding(10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = title,
-                tint = color,
-                modifier = Modifier.size(36.dp)
-            )
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodyMedium,
-                color = LocalAppColors.current.text,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
-            )
-            Text(
-                text = amountText,
-                style = MaterialTheme.typography.titleLarge,
-                color = color,
-                fontWeight = FontWeight.Bold
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .background(accentColor.copy(alpha = 0.15f), shape = CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = title,
+                        tint = accentColor,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(accentColor.copy(alpha = 0.12f), shape = RoundedCornerShape(8.dp))
+                    .padding(vertical = 6.dp, horizontal = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = amountText,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = accentColor,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+            }
         }
     }
 }
@@ -1240,15 +1338,15 @@ fun TransactionItem(
     }
 
     val icon = when (transaction.type) {
-        "SPENDING" -> Icons.Default.Payments
-        "DRAW" -> Icons.Default.Payments
+        "SPENDING" -> Icons.Default.ReceiptLong
+        "DRAW" -> Icons.Default.AccountBalanceWallet
         "ABSENCE" -> Icons.Default.EventBusy
         else -> Icons.Default.CheckCircle
     }
 
     val typeLabel = when (transaction.type) {
-        "SPENDING" -> "صرفة مصروف"
-        "DRAW" -> "سحبة سلفة"
+        "SPENDING" -> "صرفة"
+        "DRAW" -> "سحبيّة"
         "ABSENCE" -> "تسجيل غياب"
         else -> "عملية"
     }
@@ -1862,21 +1960,20 @@ fun AddTransactionDialog(
 @Composable
 fun SettingsDialog(
     currentSettings: SalarySettings,
-    initialTab: Int = 0,
     onDismiss: () -> Unit,
-    onExportBackup: (() -> Unit)? = null,
-    onRestoreBackup: (() -> Unit)? = null,
-    onSave: (Double, Long, String, Double, Int, Double, Double, Boolean, Int, Int, String, Boolean, Double, Boolean, String, Boolean, Boolean, String, String) -> Unit
+    onSave: (
+        voiceEnabled: Boolean,
+        dailyReminderEnabled: Boolean,
+        dailyReminderHour: Int,
+        dailyReminderMinute: Int,
+        securityEnabled: Boolean,
+        securityPin: String,
+        biometricEnabled: Boolean,
+        themeMode: String,
+        appLanguage: String
+    ) -> Unit
 ) {
     val context = LocalContext.current
-    var salaryInput by remember { mutableStateOf(currentSettings.monthlySalary.toInt().toString()) }
-    var currencyInput by remember { mutableStateOf(currentSettings.currency) }
-    var standardSpendingInput by remember { mutableStateOf(currentSettings.standardSpendingAmount.toInt().toString()) }
-    var priorAbsencesInput by remember { mutableStateOf(currentSettings.priorAbsenceCount.toString()) }
-    var priorSpendingsInput by remember { mutableStateOf(currentSettings.priorSpendingsAmount.toInt().toString()) }
-    var priorDrawsInput by remember { mutableStateOf(currentSettings.priorDrawsAmount.toInt().toString()) }
-    var employeeNameInput by remember { mutableStateOf(currentSettings.employeeName) }
-    var openingBalanceInput by remember { mutableStateOf(currentSettings.openingBalance.toInt().toString()) }
 
     // Voice State
     var voiceEnabled by remember { mutableStateOf(currentSettings.voiceEnabled) }
@@ -1891,14 +1988,9 @@ fun SettingsDialog(
     var securityPinInput by remember { mutableStateOf(currentSettings.securityPin) }
     var biometricEnabled by remember { mutableStateOf(currentSettings.biometricEnabled) }
 
-    // Auto Daily Spending & Theme & Language Modes State
-    var autoAddDailySpending by remember { mutableStateOf(currentSettings.autoAddDailySpending) }
+    // Theme & Language Modes State
     var themeMode by remember { mutableStateOf(currentSettings.themeMode) }
     var selectedAppLanguage by remember { mutableStateOf(currentSettings.appLanguage) }
-
-    val sdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
-    var showDatePicker by remember { mutableStateOf(false) }
-    var selectedDateInMillis by remember { mutableStateOf(currentSettings.startWorkDate) }
 
     val timePickerDialog = remember {
         android.app.TimePickerDialog(
@@ -1909,7 +2001,7 @@ fun SettingsDialog(
             },
             dailyReminderHour,
             dailyReminderMinute,
-            false // use AM/PM style format
+            false
         )
     }
 
@@ -1940,665 +2032,254 @@ fun SettingsDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                var selectedTab by remember { mutableStateOf(initialTab) } // 0 = User Info, 1 = App Settings
-                
+                // 1. Theme Mode Selection
+                Text(
+                    text = "🎨 مظهر التطبيق (الوضع الليلي / النهاري):",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold
+                )
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Button(
-                        onClick = { selectedTab = 1 },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (selectedTab == 1) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
-                            contentColor = if (selectedTab == 1) Color.White else LocalAppColors.current.text
-                        ),
-                        modifier = Modifier.weight(1f).border(1.dp, if (selectedTab == 1) Color.Transparent else LocalAppColors.current.border, RoundedCornerShape(12.dp)),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("إعدادات البرنامج", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
-                    }
-                    Button(
-                        onClick = { selectedTab = 0 },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (selectedTab == 0) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
-                            contentColor = if (selectedTab == 0) Color.White else LocalAppColors.current.text
-                        ),
-                        modifier = Modifier.weight(1f).border(1.dp, if (selectedTab == 0) Color.Transparent else LocalAppColors.current.border, RoundedCornerShape(12.dp)),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("معلومات المستخدم", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+                    val themes = listOf(
+                        "SYSTEM" to "تلقائي ⚙️",
+                        "LIGHT" to "نهاري ☀️",
+                        "DARK" to "ليلي 🌙"
+                    )
+                    themes.forEach { (mode, label) ->
+                        val isSelected = themeMode == mode
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .background(
+                                    if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .border(
+                                    1.dp,
+                                    if (isSelected) Color.Transparent else LocalAppColors.current.border,
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .clickable { themeMode = mode }
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (isSelected) Color.White else LocalAppColors.current.text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
                     }
                 }
-                
+
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                if (selectedTab == 0) {
-                    // --- TAB 0: USER PROFILE & FINANCIALS ---
-                    // Employee Name Field
-                    Text(
-                        text = "اسم الموظف الكريم:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = employeeNameInput,
-                        onValueChange = { employeeNameInput = it },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        placeholder = { Text("مثلاً: حسام الحطامي", color = Color.Gray) },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    // Salary Field
-                    Text(
-                        text = "الراتب الشهري الأساسي:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = salaryInput,
-                        onValueChange = { salaryInput = it },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    // Currency Symbol Field
-                    Text(
-                        text = "العملة الرئيسية للراتب والحسابات 💱:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub,
-                        fontWeight = FontWeight.Bold
-                    )
-                    OutlinedTextField(
-                        value = currencyInput,
-                        onValueChange = { currencyInput = it },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        placeholder = { Text("أو اكتب رمز العملة يدوياً...", color = Color.Gray) },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    Text(
-                        text = "اختر العملة بسرعة (جاهز للنشر على Google Play):",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LocalAppColors.current.textMuted
-                    )
-
-                    val popularCurrencies = listOf(
-                        "ريال يمني 🇾🇪",
-                        "ريال سعودي 🇸🇦",
-                        "دولار أمريكي 💵",
-                        "جنيه مصري 🇪🇬",
-                        "درهم إماراتي 🇦🇪",
-                        "دينار كويتي 🇰🇼",
-                        "ريال قطري 🇶🇦",
-                        "ريال عماني 🇴🇲",
-                        "دينار بحريني 🇧🇭",
-                        "يورو 🇪🇺",
-                        "دينار أردني 🇯🇴",
-                        "روبية هندية 🇮🇳",
-                        "درهم مغربي 🇲🇦",
-                        "دينار جزائري 🇩🇿",
-                        "دينار عراقي 🇮🇶",
-                        "جنيه سوداني 🇸🇩"
-                    )
-
-                    @OptIn(ExperimentalLayoutApi::class)
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        popularCurrencies.forEach { curr ->
-                            val isSelected = currencyInput == curr || currencyInput.contains(curr.split(" ").first())
-                            Box(
-                                modifier = Modifier
-                                    .background(
-                                        if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.6f),
-                                        shape = RoundedCornerShape(8.dp)
-                                    )
-                                    .border(
-                                        1.dp,
-                                        if (isSelected) Color.Transparent else LocalAppColors.current.border,
-                                        shape = RoundedCornerShape(8.dp)
-                                    )
-                                    .clickable { currencyInput = curr }
-                                    .padding(horizontal = 10.dp, vertical = 6.dp)
-                            ) {
-                                Text(
-                                    text = curr,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if (isSelected) Color.White else LocalAppColors.current.text,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
-                        }
-                    }
-
-                    // Standard Daily Spending Field
-                    Text(
-                        text = "قيمة الصرفة اليومية المعتادة:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = standardSpendingInput,
-                        onValueChange = { standardSpendingInput = it },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    // Start Work Date Field
-                    Text(
-                        text = "تاريخ بدء العمل الفعلي:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    Button(
-                        onClick = { showDatePicker = true },
-                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.text.copy(alpha = 0.1f)),
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Text(
-                            text = sdf.format(Date(selectedDateInMillis)),
-                            color = LocalAppColors.current.text,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // Auto Add Daily Spendings Toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Switch(
-                            checked = autoAddDailySpending,
-                            onCheckedChange = { autoAddDailySpending = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = EmeraldGreen
-                            )
-                        )
-                        Text(
-                            text = "تمكين إضافة الصرفة تلقائياً:",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalAppColors.current.textSub
-                        )
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    Text(
-                        text = "📜 بيانات سابقة (لمطابقة الكشف القديم):",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    // Opening Balance / Previous Balance
-                    Text(
-                        text = "رصيد سابق / حساب مستحق لك (رصيد افتتاحي):",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = openingBalanceInput,
-                        onValueChange = { openingBalanceInput = it },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        placeholder = { Text("مثلاً: 50000 أو 0 إذا لا يوجد", color = Color.Gray) },
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    // Prior Absence count
-                    Text(
-                        text = "عدد أيام الغياب السابقة (أيام):",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = priorAbsencesInput,
-                        onValueChange = { priorAbsencesInput = it },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    // Prior Spendings amount
-                    Text(
-                        text = "مجموع صرفيات سابقة مخصومة:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = priorSpendingsInput,
-                        onValueChange = { priorSpendingsInput = it },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    // Prior Draws amount
-                    Text(
-                        text = "مجموع سحبيات سلف سابقة مخصومة:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = LocalAppColors.current.textSub
-                    )
-                    OutlinedTextField(
-                        value = priorDrawsInput,
-                        onValueChange = { priorDrawsInput = it },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-                } else {
-                    // --- TAB 1: SYSTEM SETTINGS & DEVELOPER INFO ---
-                    // Theme Mode Selection
-                    Text(
-                        text = "🎨 مظهر التطبيق (الوضع الليلي / النهاري):",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        val themes = listOf(
-                            "SYSTEM" to "تلقائي ⚙️",
-                            "LIGHT" to "نهاري ☀️",
-                            "DARK" to "ليلي 🌙"
-                        )
-                        themes.forEach { (mode, label) ->
-                            val isSelected = themeMode == mode
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .background(
-                                        if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(12.dp)
-                                    )
-                                    .border(
-                                        1.dp,
-                                        if (isSelected) Color.Transparent else LocalAppColors.current.border,
-                                        shape = RoundedCornerShape(12.dp)
-                                    )
-                                    .clickable { themeMode = mode }
-                                    .padding(vertical = 10.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = label,
-                                    color = if (isSelected) Color.White else LocalAppColors.current.text,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // App Language Selection
-                    Text(
-                        text = "🌐 لغة التطبيق (App Language):",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    val availableLanguages = listOf(
-                        "ar" to "العربية",
-                        "en" to "English",
-                        "fr" to "Français",
-                        "ur" to "اردو / हिन्दी"
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        availableLanguages.forEach { (code, label) ->
-                            val isSelected = selectedAppLanguage == code
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .background(
-                                        if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(10.dp)
-                                    )
-                                    .border(
-                                        1.dp,
-                                        if (isSelected) Color.Transparent else LocalAppColors.current.border,
-                                        shape = RoundedCornerShape(10.dp)
-                                    )
-                                    .clickable { selectedAppLanguage = code }
-                                    .padding(vertical = 10.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = label,
-                                    color = if (isSelected) Color.White else LocalAppColors.current.text,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                    textAlign = TextAlign.Center
-                                )
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // Speak Transactions Switch
-                    Text(
-                        text = "🔊 التوجيهات الصوتية والتحدث المباشر:",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Switch(
-                            checked = voiceEnabled,
-                            onCheckedChange = { voiceEnabled = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = EmeraldGreen
-                            )
-                        )
-                        Text(
-                            text = "نطق المعاملات صوتياً عند الإضافة والتحكم:",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalAppColors.current.textSub
-                        )
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // Daily Reminder Settings
-                    Text(
-                        text = "⏰ وقت التنبيه لتذكير الصرفة أو السحبية أو الغياب:",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Switch(
-                            checked = dailyReminderEnabled,
-                            onCheckedChange = { dailyReminderEnabled = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = EmeraldGreen
-                            )
-                        )
-                        Text(
-                            text = "تفعيل التنبيه والتذكير اليومي بالتطبيق:",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalAppColors.current.textSub
-                        )
-                    }
-                    if (dailyReminderEnabled) {
-                        Row(
+                // 2. App Language Selection
+                Text(
+                    text = "🌐 لغة التطبيق (App Language):",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold
+                )
+                val availableLanguages = listOf(
+                    "ar" to "العربية",
+                    "en" to "English",
+                    "fr" to "Français",
+                    "ur" to "اردو / हिन्दी"
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    availableLanguages.forEach { (code, label) ->
+                        val isSelected = selectedAppLanguage == code
+                        Box(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .background(LocalAppColors.current.surface.copy(alpha = 0.5f), shape = RoundedCornerShape(12.dp))
-                                .border(1.dp, LocalAppColors.current.border, shape = RoundedCornerShape(12.dp))
-                                .clickable { timePickerDialog.show() }
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                                .weight(1f)
+                                .background(
+                                    if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .border(
+                                    1.dp,
+                                    if (isSelected) Color.Transparent else LocalAppColors.current.border,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable { selectedAppLanguage = code }
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (isSelected) Color.White else LocalAppColors.current.text,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // 3. Voice Guidance
+                Text(
+                    text = "🔊 التوجيهات الصوتية والتحدث المباشر:",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = voiceEnabled,
+                        onCheckedChange = { voiceEnabled = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = EmeraldGreen
+                        )
+                    )
+                    Text(
+                        text = "نطق المعاملات صوتياً عند الإضافة والتحكم:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalAppColors.current.textSub
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // 4. Daily Reminder Settings
+                Text(
+                    text = "⏰ وقت التنبيه لتذكير الصرفة أو السحبية أو الغياب:",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = dailyReminderEnabled,
+                        onCheckedChange = { dailyReminderEnabled = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = EmeraldGreen
+                        )
+                    )
+                    Text(
+                        text = "تفعيل التنبيه والتذكير اليومي بالتطبيق:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalAppColors.current.textSub
+                    )
+                }
+                if (dailyReminderEnabled) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(LocalAppColors.current.surface.copy(alpha = 0.5f), shape = RoundedCornerShape(12.dp))
+                            .border(1.dp, LocalAppColors.current.border, shape = RoundedCornerShape(12.dp))
+                            .clickable { timePickerDialog.show() }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AccessTime,
+                            contentDescription = "تحديد وقت التنبيه اليومي",
+                            tint = EmeraldGreen
+                        )
+                        val formattedTime = String.format(
+                            Locale("ar"), "%02d:%02d %s",
+                            if (dailyReminderHour % 12 == 0) 12 else dailyReminderHour % 12,
+                            dailyReminderMinute,
+                            if (dailyReminderHour >= 12) "م" else "ص"
+                        )
+                        Text(
+                            text = formattedTime,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = LocalAppColors.current.text,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // 5. App Security Settings
+                Text(
+                    text = "🔒 حماية وأمان التطبيق:",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = securityEnabled,
+                        onCheckedChange = { securityEnabled = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = EmeraldGreen
+                        )
+                    )
+                    Text(
+                        text = "تفعيل قفل التطبيق (PIN):",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalAppColors.current.textSub
+                    )
+                }
+                if (securityEnabled) {
+                    OutlinedTextField(
+                        value = securityPinInput,
+                        onValueChange = { input ->
+                            if (input.length <= 4 && input.all { char -> char.isDigit() }) {
+                                securityPinInput = input
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        placeholder = { Text("مثلاً: 1234", color = Color.Gray) },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = EmeraldGreen,
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
+                        )
+                    )
+                    val biometricManager = BiometricManager.from(context)
+                    val isBiometricAvailable = biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
+                    if (isBiometricAvailable) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.AccessTime,
-                                contentDescription = "تحديد وقت التنبيه اليومي",
-                                tint = EmeraldGreen
-                            )
-                            val formattedTime = String.format(Locale("ar"), "%02d:%02d %s", 
-                                if (dailyReminderHour % 12 == 0) 12 else dailyReminderHour % 12,
-                                dailyReminderMinute,
-                                if (dailyReminderHour >= 12) "م" else "ص"
+                            Switch(
+                                checked = biometricEnabled,
+                                onCheckedChange = { biometricEnabled = it },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = EmeraldGreen
+                                )
                             )
                             Text(
-                                text = formattedTime,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = LocalAppColors.current.text,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // App Security Settings
-                    Text(
-                        text = "🔒 حماية وأمان التطبيق:",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Switch(
-                            checked = securityEnabled,
-                            onCheckedChange = { securityEnabled = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = EmeraldGreen
-                            )
-                        )
-                        Text(
-                            text = "تفعيل قفل التطبيق (PIN):",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = LocalAppColors.current.textSub
-                        )
-                    }
-                    if (securityEnabled) {
-                        OutlinedTextField(
-                            value = securityPinInput,
-                            onValueChange = { input ->
-                                if (input.length <= 4 && input.all { char -> char.isDigit() }) {
-                                    securityPinInput = input
-                                }
-                            },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                            placeholder = { Text("مثلاً: 1234", color = Color.Gray) },
-                            textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = EmeraldGreen,
-                                unfocusedBorderColor = LocalAppColors.current.border,
-                                focusedTextColor = LocalAppColors.current.text,
-                                unfocusedTextColor = LocalAppColors.current.text
-                            )
-                        )
-                        val biometricManager = BiometricManager.from(context)
-                        val isBiometricAvailable = biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
-                        if (isBiometricAvailable) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Switch(
-                                    checked = biometricEnabled,
-                                    onCheckedChange = { biometricEnabled = it },
-                                    colors = SwitchDefaults.colors(
-                                        checkedThumbColor = Color.White,
-                                        checkedTrackColor = EmeraldGreen
-                                    )
-                                )
-                                Text(
-                                    text = "تفعيل بصمة الإصبع للفتح السريع:",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = LocalAppColors.current.textSub
-                                )
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // Backup & Restore Section
-                    val appLang = AppLanguage.fromCode(selectedAppLanguage)
-                    val dialogStrings = LanguageStrings(appLang)
-
-                    Text(
-                        text = dialogStrings.backupRestoreSection,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface.copy(alpha = 0.5f)),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, LocalAppColors.current.border)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp).fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Text(
-                                text = dialogStrings.backupDescription,
-                                style = MaterialTheme.typography.bodySmall,
+                                text = "تفعيل بصمة الإصبع للفتح السريع:",
+                                style = MaterialTheme.typography.bodyMedium,
                                 color = LocalAppColors.current.textSub
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Button(
-                                    onClick = { onExportBackup?.invoke() },
-                                    modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = dialogStrings.createBackupBtn,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    )
-                                }
-
-                                Button(
-                                    onClick = { onRestoreBackup?.invoke() },
-                                    modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = dialogStrings.restoreBackupBtn,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
-
-                    // Developer Info Card
-                    Text(
-                        text = "👨‍💻 معلومات مطور التطبيق:",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface.copy(alpha = 0.5f)),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp).fillMaxWidth(),
-                            horizontalAlignment = Alignment.End,
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text(
-                                text = "الاسم: حسام محمد الحطامي",
-                                fontWeight = FontWeight.Bold,
-                                color = LocalAppColors.current.text,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = "البريد الإلكتروني: husamalhattami100@gmail.com",
-                                color = LocalAppColors.current.textSub,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text(
-                                text = "رقم الجوال: 778383570",
-                                color = LocalAppColors.current.textSub,
-                                style = MaterialTheme.typography.bodySmall
                             )
                         }
                     }
@@ -2620,33 +2301,14 @@ fun SettingsDialog(
 
                     Button(
                         onClick = {
-                            val salary = salaryInput.toDoubleOrNull() ?: 150000.0
-                            val standardSpending = standardSpendingInput.toDoubleOrNull() ?: 2000.0
-                            val priorAbsences = priorAbsencesInput.toIntOrNull() ?: 0
-                            val priorSpendings = priorSpendingsInput.toDoubleOrNull() ?: 0.0
-                            val priorDraws = priorDrawsInput.toDoubleOrNull() ?: 0.0
-                            val currencyVal = if (currencyInput.isBlank()) "ريال يمني" else currencyInput
-                            val employeeNameVal = if (employeeNameInput.isBlank()) "حسام الحطامي" else employeeNameInput
-                            val openingBalance = openingBalanceInput.toDoubleOrNull() ?: 0.0
-                            
                             onSave(
-                                salary,
-                                selectedDateInMillis,
-                                currencyVal,
-                                standardSpending,
-                                priorAbsences,
-                                priorSpendings,
-                                priorDraws,
+                                voiceEnabled,
                                 dailyReminderEnabled,
                                 dailyReminderHour,
                                 dailyReminderMinute,
-                                employeeNameVal,
-                                voiceEnabled,
-                                openingBalance,
                                 securityEnabled,
                                 securityPinInput,
                                 biometricEnabled,
-                                autoAddDailySpending,
                                 themeMode,
                                 selectedAppLanguage
                             )
@@ -2654,7 +2316,455 @@ fun SettingsDialog(
                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("حفظ الحساب", color = Color.White)
+                        Text("حفظ التغييرات", color = Color.White)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun UserSettingsDialog(
+    currentSettings: SalarySettings,
+    currencies: List<CurrencyItem> = emptyList(),
+    onAddCustomCurrency: (String, String, String) -> Unit = { _, _, _ -> },
+    onDeleteCurrency: ((CurrencyItem) -> Unit)? = null,
+    onDismiss: () -> Unit,
+    onSave: (
+        employeeName: String,
+        salary: Double,
+        currency: String,
+        standardSpending: Double,
+        startDate: Long,
+        autoAddDailySpending: Boolean,
+        isSpendingDeductedFromSalary: Boolean,
+        openingBalance: Double,
+        priorAbsences: Int,
+        priorSpendings: Double,
+        priorDraws: Double
+    ) -> Unit
+) {
+    var employeeNameInput by remember { mutableStateOf(currentSettings.employeeName) }
+    var salaryInput by remember { mutableStateOf(if (currentSettings.monthlySalary == 0.0) "" else currentSettings.monthlySalary.toInt().toString()) }
+    var currencyInput by remember { mutableStateOf(currentSettings.currency) }
+    var showCurrencyPicker by remember { mutableStateOf(false) }
+    var standardSpendingInput by remember { mutableStateOf(currentSettings.standardSpendingAmount.toInt().toString()) }
+    var autoAddDailySpending by remember { mutableStateOf(currentSettings.autoAddDailySpending) }
+    var isSpendingDeductedFromSalary by remember { mutableStateOf(currentSettings.isSpendingDeductedFromSalary) }
+    var openingBalanceInput by remember { mutableStateOf(currentSettings.openingBalance.toInt().toString()) }
+    var priorAbsencesInput by remember { mutableStateOf(currentSettings.priorAbsenceCount.toString()) }
+    var priorSpendingsInput by remember { mutableStateOf(currentSettings.priorSpendingsAmount.toInt().toString()) }
+    var priorDrawsInput by remember { mutableStateOf(currentSettings.priorDrawsAmount.toInt().toString()) }
+
+    val sdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+    var showDatePicker by remember { mutableStateOf(false) }
+    var selectedDateInMillis by remember { mutableStateOf(currentSettings.startWorkDate) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = "👤 معلومات المستخدم والراتب",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Employee Name
+                Text(
+                    text = "اسم المستخدم:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = employeeNameInput,
+                    onValueChange = { employeeNameInput = it },
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    placeholder = { Text("مثلاً: حسام الحطامي", color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Salary Field
+                Text(
+                    text = "الراتب الشهري الأساسي:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = salaryInput,
+                    onValueChange = { salaryInput = it },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    placeholder = { Text("مثلاً: 150000", color = Color.Gray) },
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Toggle: Is allowance/spending deducted from salary or net salary?
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, LocalAppColors.current.border)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Switch(
+                            checked = isSpendingDeductedFromSalary,
+                            onCheckedChange = { isSpendingDeductedFromSalary = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = EmeraldGreen
+                            )
+                        )
+                        Column(
+                            horizontalAlignment = Alignment.End,
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = 8.dp)
+                        ) {
+                            Text(
+                                text = "هل الصرفة من حال الراتب؟",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                            Text(
+                                text = if (isSpendingDeductedFromSalary) "مفعل: الصرفة مخصومة وتحسب من الراتب" else "غير مفعل: الراتب صافي بدون خصم الصرفة",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSpendingDeductedFromSalary) EmeraldGreen else LocalAppColors.current.textSub
+                            )
+                        }
+                    }
+                }
+
+                // Currency Symbol Field
+                Text(
+                    text = "اختر العملة الرئيسية للراتب والحسابات 💱:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showCurrencyPicker = true },
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, LocalAppColors.current.border)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = { showCurrencyPicker = true },
+                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen.copy(alpha = 0.15f)),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = "اختيار من القائمة 💱",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = EmeraldGreen,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            val activeCurrencyObj = currencies.find {
+                                it.name.trim() == currencyInput.trim() || it.symbol.trim() == currencyInput.trim()
+                            }
+                            if (activeCurrencyObj != null && activeCurrencyObj.flag.isNotBlank()) {
+                                Text(text = activeCurrencyObj.flag, style = MaterialTheme.typography.titleMedium)
+                            }
+                            Text(
+                                text = if (currencyInput.isBlank()) "ريال يمني" else currencyInput,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+                    }
+                }
+
+                // Quick Currency Chips loaded from Room DB
+                val displayCurrencies = if (currencies.isNotEmpty()) currencies else listOf(
+                    CurrencyItem("YER", "ريال يمني", "ر.ي", "🇾🇪"),
+                    CurrencyItem("SAR", "ريال سعودي", "ر.س", "🇸🇦"),
+                    CurrencyItem("USD", "دولار أمريكي", "$", "💵"),
+                    CurrencyItem("EGP", "جنيه مصري", "ج.م", "🇪🇬"),
+                    CurrencyItem("AED", "درهم إماراتي", "د.إ", "🇦🇪")
+                )
+
+                @OptIn(ExperimentalLayoutApi::class)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    displayCurrencies.take(12).forEach { currItem ->
+                        val isSelected = currencyInput.trim() == currItem.name.trim() || currencyInput.trim() == currItem.symbol.trim()
+                        Box(
+                            modifier = Modifier
+                                .background(
+                                    if (isSelected) EmeraldGreen else LocalAppColors.current.surface.copy(alpha = 0.6f),
+                                    shape = RoundedCornerShape(8.dp)
+                                )
+                                .border(
+                                    1.dp,
+                                    if (isSelected) Color.Transparent else LocalAppColors.current.border,
+                                    shape = RoundedCornerShape(8.dp)
+                                )
+                                .clickable { currencyInput = currItem.name }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = "${currItem.flag} ${currItem.name}".trim(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSelected) Color.White else LocalAppColors.current.text,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+
+                // Standard Daily Spending Field
+                Text(
+                    text = "قيمة الصرفة اليومية المعتادة:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = standardSpendingInput,
+                    onValueChange = { standardSpendingInput = it },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Start Work Date Field
+                Text(
+                    text = "تاريخ بدء العمل الفعلي:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                Button(
+                    onClick = { showDatePicker = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.text.copy(alpha = 0.1f)),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = sdf.format(Date(selectedDateInMillis)),
+                        color = LocalAppColors.current.text,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Auto Add Daily Spendings Toggle
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = autoAddDailySpending,
+                        onCheckedChange = { autoAddDailySpending = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = EmeraldGreen
+                        )
+                    )
+                    Text(
+                        text = "تمكين إضافة الصرفة تلقائياً:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalAppColors.current.textSub
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                Text(
+                    text = "📜 بيانات سابقة (لمطابقة الكشف القديم):",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold
+                )
+
+                // Opening Balance / Previous Balance
+                Text(
+                    text = "رصيد سابق / حساب مستحق لك (رصيد افتتاحي):",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = openingBalanceInput,
+                    onValueChange = { openingBalanceInput = it },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    placeholder = { Text("مثلاً: 50000 أو 0 إذا لا يوجد", color = Color.Gray) },
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Prior Absence count
+                Text(
+                    text = "عدد أيام الغياب السابقة (أيام):",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = priorAbsencesInput,
+                    onValueChange = { priorAbsencesInput = it },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Prior Spendings amount
+                Text(
+                    text = "مجموع صرفيات سابقة مخصومة:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = priorSpendingsInput,
+                    onValueChange = { priorSpendingsInput = it },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Prior Draws amount
+                Text(
+                    text = "مجموع سحبيات سلف سابقة مخصومة:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub
+                )
+                OutlinedTextField(
+                    value = priorDrawsInput,
+                    onValueChange = { priorDrawsInput = it },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Gray),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("إلغاء", color = Color.White)
+                    }
+
+                    Button(
+                        onClick = {
+                            val salary = salaryInput.toDoubleOrNull() ?: 0.0
+                            val standardSpending = standardSpendingInput.toDoubleOrNull() ?: 2000.0
+                            val priorAbsences = priorAbsencesInput.toIntOrNull() ?: 0
+                            val priorSpendings = priorSpendingsInput.toDoubleOrNull() ?: 0.0
+                            val priorDraws = priorDrawsInput.toDoubleOrNull() ?: 0.0
+                            val currencyVal = if (currencyInput.isBlank()) "ريال يمني" else currencyInput.trim()
+                            val employeeNameVal = if (employeeNameInput.isBlank()) "حسام الحطامي" else employeeNameInput.trim()
+                            val openingBalance = openingBalanceInput.toDoubleOrNull() ?: 0.0
+
+                            onSave(
+                                employeeNameVal,
+                                salary,
+                                currencyVal,
+                                standardSpending,
+                                selectedDateInMillis,
+                                autoAddDailySpending,
+                                isSpendingDeductedFromSalary,
+                                openingBalance,
+                                priorAbsences,
+                                priorSpendings,
+                                priorDraws
+                            )
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("حفظ البيانات", color = Color.White)
                     }
                 }
             }
@@ -2670,6 +2780,356 @@ fun SettingsDialog(
                 showDatePicker = false
             }
         )
+    }
+
+    if (showCurrencyPicker) {
+        CurrencySelectionDialog(
+            currencies = currencies,
+            selectedCurrency = currencyInput,
+            onSelectCurrency = { selected -> currencyInput = selected },
+            onAddCustomCurrency = onAddCustomCurrency,
+            onDeleteCurrency = onDeleteCurrency,
+            onDismiss = { showCurrencyPicker = false }
+        )
+    }
+}
+
+@Composable
+fun CurrencySelectionDialog(
+    currencies: List<CurrencyItem>,
+    selectedCurrency: String,
+    onSelectCurrency: (String) -> Unit,
+    onAddCustomCurrency: (name: String, symbol: String, flag: String) -> Unit,
+    onDeleteCurrency: ((CurrencyItem) -> Unit)? = null,
+    onDismiss: () -> Unit
+) {
+    var searchQuery by remember { mutableStateOf("") }
+    var showAddDialog by remember { mutableStateOf(false) }
+
+    val filteredCurrencies = remember(currencies, searchQuery) {
+        if (searchQuery.isBlank()) {
+            currencies
+        } else {
+            currencies.filter {
+                it.name.contains(searchQuery, ignoreCase = true) ||
+                it.symbol.contains(searchQuery, ignoreCase = true) ||
+                it.id.contains(searchQuery, ignoreCase = true)
+            }
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onDismiss) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "إغلاق",
+                            tint = LocalAppColors.current.textSub
+                        )
+                    }
+                    Text(
+                        text = "💱 قائمة العملات المتاحة (Room)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Search Field
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("بحث في العملات...", color = Color.Gray) },
+                    leadingIcon = {
+                        Icon(imageVector = Icons.Default.Search, contentDescription = null, tint = EmeraldGreen)
+                    },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(imageVector = Icons.Default.Close, contentDescription = null)
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                // Add Custom Currency Button
+                Button(
+                    onClick = { showAddDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen.copy(alpha = 0.15f)),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.4f))
+                ) {
+                    Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = EmeraldGreen)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "➕ إضافة عملة جديدة لقاعدة البيانات",
+                        color = EmeraldGreen,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                // Currencies list from Room DB
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 320.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (filteredCurrencies.isEmpty()) {
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(24.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "لا توجد نتائج مطابقة لـ \"$searchQuery\"",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = LocalAppColors.current.textSub
+                                )
+                            }
+                        }
+                    } else {
+                        items(filteredCurrencies, key = { it.id }) { currencyItem ->
+                            val isSelected = selectedCurrency.trim() == currencyItem.name.trim() ||
+                                             selectedCurrency.trim() == currencyItem.symbol.trim()
+
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        onSelectCurrency(currencyItem.name)
+                                        onDismiss()
+                                    },
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isSelected) EmeraldGreen.copy(alpha = 0.15f) else LocalAppColors.current.bg
+                                ),
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    if (isSelected) 2.dp else 1.dp,
+                                    if (isSelected) EmeraldGreen else LocalAppColors.current.border
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        if (isSelected) {
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = null,
+                                                tint = EmeraldGreen,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                        }
+                                        if (currencyItem.isCustom && onDeleteCurrency != null) {
+                                            IconButton(
+                                                onClick = { onDeleteCurrency(currencyItem) },
+                                                modifier = Modifier.size(28.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Delete,
+                                                    contentDescription = "حذف العملة",
+                                                    tint = Color.Red.copy(alpha = 0.7f),
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                text = currencyItem.name,
+                                                style = MaterialTheme.typography.bodyLarge,
+                                                fontWeight = FontWeight.Bold,
+                                                color = LocalAppColors.current.text
+                                            )
+                                            Text(
+                                                text = "الرمز: ${currencyItem.symbol}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = LocalAppColors.current.textSub
+                                            )
+                                        }
+                                        if (currencyItem.flag.isNotBlank()) {
+                                            Text(
+                                                text = currencyItem.flag,
+                                                style = MaterialTheme.typography.titleMedium
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showAddDialog) {
+        AddCustomCurrencyDialog(
+            onAdd = { name, symbol, flag ->
+                onAddCustomCurrency(name, symbol, flag)
+                onSelectCurrency(name)
+                showAddDialog = false
+                onDismiss()
+            },
+            onDismiss = { showAddDialog = false }
+        )
+    }
+}
+
+@Composable
+fun AddCustomCurrencyDialog(
+    onAdd: (name: String, symbol: String, flag: String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var nameInput by remember { mutableStateOf("") }
+    var symbolInput by remember { mutableStateOf("") }
+    var flagInput by remember { mutableStateOf("💱") }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(20.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "➕ إضافة عملة جديدة إلى Room",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                Text("اسم العملة (مثلاً: ليرة تركية):", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                OutlinedTextField(
+                    value = nameInput,
+                    onValueChange = { nameInput = it },
+                    placeholder = { Text("اسم العملة", color = Color.Gray) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                Text("رمز العملة (مثلاً: TL أو ₺):", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                OutlinedTextField(
+                    value = symbolInput,
+                    onValueChange = { symbolInput = it },
+                    placeholder = { Text("رمز العملة", color = Color.Gray) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                Text("الرمز التعبيري / العلم (اختياري):", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                OutlinedTextField(
+                    value = flagInput,
+                    onValueChange = { flagInput = it },
+                    placeholder = { Text("🇹🇷", color = Color.Gray) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = EmeraldGreen,
+                        unfocusedBorderColor = LocalAppColors.current.border,
+                        focusedTextColor = LocalAppColors.current.text,
+                        unfocusedTextColor = LocalAppColors.current.text
+                    )
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("إلغاء", color = Color.Gray)
+                    }
+
+                    Button(
+                        onClick = {
+                            if (nameInput.isNotBlank()) {
+                                onAdd(nameInput, symbolInput, flagInput)
+                            }
+                        },
+                        enabled = nameInput.isNotBlank(),
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("حفظ العملة", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3148,7 +3608,7 @@ fun WelcomeLoginScreen(
 ) {
     val context = LocalContext.current
     var nameInput by remember { mutableStateOf("") }
-    var salaryInput by remember { mutableStateOf("150000") }
+    var salaryInput by remember { mutableStateOf("") }
     var currencyInput by remember { mutableStateOf("ريال يمني") }
     var standardSpendingInput by remember { mutableStateOf("2000") }
     var openingBalanceInput by remember { mutableStateOf("0") }
@@ -3237,16 +3697,16 @@ fun WelcomeLoginScreen(
                     horizontalAlignment = Alignment.End,
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Full Name
+                    // User Name
                     Text(
-                        text = "الاسم الكريم:",
+                        text = "اسم المستخدم:",
                         style = MaterialTheme.typography.bodyMedium,
                         color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = nameInput,
                         onValueChange = { nameInput = it },
-                        placeholder = { Text("مثلاً: محمد خالد العريفي", color = LocalAppColors.current.textMuted) },
+                        placeholder = { Text("مثلاً: حسام الحطامي", color = LocalAppColors.current.textMuted) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().testTag("onboarding_name_input"),
@@ -3267,6 +3727,7 @@ fun WelcomeLoginScreen(
                     OutlinedTextField(
                         value = salaryInput,
                         onValueChange = { salaryInput = it },
+                        placeholder = { Text("مثلاً: 150000", color = LocalAppColors.current.textMuted) },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
@@ -3281,13 +3742,14 @@ fun WelcomeLoginScreen(
                     
                     // Currency
                     Text(
-                        text = "العملة (مثلاً: ريال يمني):",
+                        text = "اختر العملة الرئيسية:",
                         style = MaterialTheme.typography.bodyMedium,
                         color = LocalAppColors.current.textSub
                     )
                     OutlinedTextField(
                         value = currencyInput,
                         onValueChange = { currencyInput = it },
+                        placeholder = { Text("مثلاً: ريال يمني", color = LocalAppColors.current.textMuted) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
@@ -3298,6 +3760,43 @@ fun WelcomeLoginScreen(
                             unfocusedTextColor = LocalAppColors.current.text
                         )
                     )
+
+                    // Popular Currencies Choice Chips
+                    val popularCurrenciesList = listOf(
+                        "ريال يمني 🇾🇪",
+                        "ريال سعودي 🇸🇦",
+                        "دولار أمريكي 💵",
+                        "درهم إماراتي 🇦🇪",
+                        "جنيه مصري 🇪🇬",
+                        "دينار كويتي 🇰🇼",
+                        "ريال قطري 🇶🇦",
+                        "ريال عماني 🇴🇲",
+                        "دينار بحريني 🇧🇭",
+                        "يورو 🇪🇺",
+                        "دينار أردني 🇯🇴",
+                        "دينار عراقي 🇮🇶"
+                    )
+
+                    @OptIn(ExperimentalLayoutApi::class)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        popularCurrenciesList.forEach { currItem ->
+                            val cleanCurr = currItem.split(" ")[0]
+                            val isSelected = currencyInput.trim() == currItem.trim() || currencyInput.trim() == cleanCurr
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { currencyInput = cleanCurr },
+                                label = { Text(currItem, style = MaterialTheme.typography.bodySmall) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = EmeraldGreen,
+                                    selectedLabelColor = Color.White
+                                )
+                            )
+                        }
+                    }
 
                     // Opening Balance / Previous Balance
                     Text(
@@ -3414,11 +3913,13 @@ fun WelcomeLoginScreen(
             Button(
                 onClick = {
                     if (nameInput.trim().isBlank()) {
-                        Toast.makeText(context, "الرجاء إدخال الاسم للبدء", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, "الرجاء إدخال اسم المستخدم للبدء", Toast.LENGTH_LONG).show()
+                    } else if (salaryInput.trim().isBlank() || salaryInput.toDoubleOrNull() == null) {
+                        Toast.makeText(context, "الرجاء إدخال الراتب الشهري الأساسي", Toast.LENGTH_LONG).show()
                     } else {
-                        val salary = salaryInput.toDoubleOrNull() ?: 150000.0
+                        val salary = salaryInput.toDoubleOrNull() ?: 0.0
                         val standardSpending = standardSpendingInput.toDoubleOrNull() ?: 2000.0
-                        val currency = if (currencyInput.isBlank()) "ريال يمني" else currencyInput
+                        val currency = if (currencyInput.isBlank()) "ريال يمني" else currencyInput.trim()
                         val openingBalance = openingBalanceInput.toDoubleOrNull() ?: 0.0
                         
                         onRegister(
@@ -3520,98 +4021,187 @@ fun MainMenuDialog(
     onOpenUserSettings: () -> Unit,
     onOpenBackup: () -> Unit,
     onCheckUpdate: () -> Unit,
+    onOpenGuide: () -> Unit,
     onOpenDeveloperInfo: () -> Unit
 ) {
     val appLang = AppLanguage.fromCode(appLanguage)
     val strings = LanguageStrings(appLang)
-    Dialog(onDismissRequest = onDismiss) {
-        Card(
+
+    var isVisible by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+
+    fun dismissWithAnimation() {
+        isVisible = false
+        coroutineScope.launch {
+            delay(280)
+            onDismiss()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        isVisible = true
+    }
+
+    Dialog(
+        onDismissRequest = { dismissWithAnimation() },
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true
+        )
+    ) {
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(8.dp),
-            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
-            shape = RoundedCornerShape(24.dp),
-            border = BorderStroke(1.dp, LocalAppColors.current.border)
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = if (isVisible) 0.5f else 0.0f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) { dismissWithAnimation() }
         ) {
-            Column(
+            AnimatedVisibility(
+                visible = isVisible,
+                enter = slideInHorizontally(
+                    animationSpec = tween(durationMillis = 350, easing = FastOutSlowInEasing),
+                    initialOffsetX = { -it }
+                ) + fadeIn(animationSpec = tween(350)),
+                exit = slideOutHorizontally(
+                    animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing),
+                    targetOffsetX = { -it }
+                ) + fadeOut(animationSpec = tween(280)),
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .align(Alignment.CenterStart)
+                    .fillMaxHeight()
+                    .widthIn(max = 330.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                Surface(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .fillMaxWidth()
+                        .clickable(enabled = false) {},
+                    color = LocalAppColors.current.surface,
+                    shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp),
+                    tonalElevation = 8.dp,
+                    shadowElevation = 16.dp
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Menu,
-                        contentDescription = null,
-                        tint = EmeraldGreen,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Text(
-                        text = "القائمة الرئيسية",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = LocalAppColors.current.text
-                    )
-                }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
+                            .padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        Spacer(modifier = Modifier.height(12.dp))
 
-                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+                        // Drawer Header
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(42.dp)
+                                        .background(EmeraldGreen.copy(alpha = 0.15f), shape = CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.AccountBalanceWallet,
+                                        contentDescription = null,
+                                        tint = EmeraldGreen,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                                Column {
+                                    Text(
+                                        text = "القائمة الرئيسية",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = LocalAppColors.current.text
+                                    )
+                                    Text(
+                                        text = "حساب العامل الذكي",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = LocalAppColors.current.textMuted
+                                    )
+                                }
+                            }
 
-                // Item 1: App System Settings
-                MenuOptionCard(
-                    title = "⚙️ ${strings.systemSettingsTitle}",
-                    subtitle = strings.systemSettingsSubtitle,
-                    icon = Icons.Default.Settings,
-                    color = EmeraldGreen,
-                    onClick = onOpenAppSettings
-                )
+                            IconButton(
+                                onClick = { dismissWithAnimation() },
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .background(LocalAppColors.current.text.copy(alpha = 0.08f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "إغلاق",
+                                    tint = LocalAppColors.current.text,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
 
-                // Item 2: User Settings
-                MenuOptionCard(
-                    title = "👤 ${strings.userSettingsTitle}",
-                    subtitle = strings.userSettingsSubtitle,
-                    icon = Icons.Default.Person,
-                    color = EarnedBlue,
-                    onClick = onOpenUserSettings
-                )
+                        HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                // Item 3: Backup & Restore
-                MenuOptionCard(
-                    title = "💾 ${strings.backupRestoreSection}",
-                    subtitle = "تصدير واستعادة نسخ احتياطية للبيانات",
-                    icon = Icons.Default.Share,
-                    color = Color(0xFF8E24AA),
-                    onClick = onOpenBackup
-                )
+                        // Menu Options
+                        MenuOptionCard(
+                            title = "⚙️ إعدادات التطبيق",
+                            icon = Icons.Default.Settings,
+                            color = EmeraldGreen,
+                            onClick = { dismissWithAnimation(); onOpenAppSettings() }
+                        )
 
-                // Item 4: Live Updates
-                MenuOptionCard(
-                    title = "🔄 ${strings.liveUpdatesTitle}",
-                    subtitle = strings.liveUpdatesSubtitle,
-                    icon = Icons.Default.Refresh,
-                    color = Color(0xFF00ACC1),
-                    onClick = onCheckUpdate
-                )
+                        MenuOptionCard(
+                            title = "👤 إعدادات المستخدم",
+                            icon = Icons.Default.Person,
+                            color = EarnedBlue,
+                            onClick = { dismissWithAnimation(); onOpenUserSettings() }
+                        )
 
-                // Item 5: Developer Info ONLY
-                MenuOptionCard(
-                    title = "ℹ️ ${strings.devInfoTitle}",
-                    subtitle = strings.developerTitle,
-                    icon = Icons.Default.Info,
-                    color = AmberOrange,
-                    onClick = onOpenDeveloperInfo
-                )
+                        MenuOptionCard(
+                            title = "💾 النسخ الاحتياطي والاستعادة",
+                            icon = Icons.Default.Share,
+                            color = Color(0xFF8E24AA),
+                            onClick = { dismissWithAnimation(); onOpenBackup() }
+                        )
 
-                Button(
-                    onClick = onDismiss,
-                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                        MenuOptionCard(
+                            title = "🔄 تحديثات التطبيق",
+                            icon = Icons.Default.Refresh,
+                            color = Color(0xFF00ACC1),
+                            onClick = { dismissWithAnimation(); onCheckUpdate() }
+                        )
+
+                        MenuOptionCard(
+                            title = "📖 لمحة ودليل الاستخدام",
+                            icon = Icons.Default.Book,
+                            color = Color(0xFFFF9800),
+                            onClick = { dismissWithAnimation(); onOpenGuide() }
+                        )
+
+                        MenuOptionCard(
+                            title = "ℹ️ معلومات المطور",
+                            icon = Icons.Default.Info,
+                            color = AmberOrange,
+                            onClick = { dismissWithAnimation(); onOpenDeveloperInfo() }
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Button(
+                            onClick = { dismissWithAnimation() },
+                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(strings.cancelBtn, color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
             }
         }
@@ -3623,10 +4213,14 @@ fun BackupDialog(
     appLanguage: String = "ar",
     onDismiss: () -> Unit,
     onExportBackup: () -> Unit,
-    onRestoreBackup: () -> Unit
+    onRestoreBackup: () -> Unit,
+    onRestoreFromText: (String) -> Unit
 ) {
     val appLang = AppLanguage.fromCode(appLanguage)
     val strings = LanguageStrings(appLang)
+    var showPasteMode by remember { mutableStateOf(false) }
+    var pastedText by remember { mutableStateOf("") }
+
     Dialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
@@ -3648,13 +4242,13 @@ fun BackupDialog(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Share,
+                        imageVector = if (showPasteMode) Icons.Default.Edit else Icons.Default.Share,
                         contentDescription = null,
                         tint = Color(0xFF8E24AA),
                         modifier = Modifier.size(28.dp)
                     )
                     Text(
-                        text = strings.backupRestoreSection,
+                        text = if (showPasteMode) strings.pasteBackupTitle else strings.backupRestoreSection,
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = LocalAppColors.current.text
@@ -3663,58 +4257,129 @@ fun BackupDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                Text(
-                    text = strings.backupDescription,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = LocalAppColors.current.textSub,
-                    textAlign = TextAlign.Center
-                )
-
-                Button(
-                    onClick = {
-                        onDismiss()
-                        onExportBackup()
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
-                    Spacer(modifier = Modifier.width(8.dp))
+                if (showPasteMode) {
                     Text(
-                        text = strings.createBackupBtn,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        text = strings.pasteBackupHint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textSub,
+                        textAlign = TextAlign.Center
                     )
-                }
 
-                Button(
-                    onClick = {
-                        onDismiss()
-                        onRestoreBackup()
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
-                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = pastedText,
+                        onValueChange = { pastedText = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp),
+                        placeholder = { Text(strings.pasteBackupHint, color = LocalAppColors.current.textSub, style = MaterialTheme.typography.bodySmall) },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = EarnedBlue,
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
+                        )
+                    )
+
+                    Button(
+                        onClick = {
+                            if (pastedText.isNotBlank()) {
+                                onDismiss()
+                                onRestoreFromText(pastedText)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = strings.confirmRestoreBtn,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
+
+                    Button(
+                        onClick = { showPasteMode = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                    }
+                } else {
                     Text(
-                        text = strings.restoreBackupBtn,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        text = strings.backupDescription,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textSub,
+                        textAlign = TextAlign.Center
                     )
-                }
 
-                Button(
-                    onClick = onDismiss,
-                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                    Button(
+                        onClick = {
+                            onDismiss()
+                            onExportBackup()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = strings.createBackupBtn,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
+
+                    Button(
+                        onClick = {
+                            onDismiss()
+                            onRestoreBackup()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = strings.restoreBackupBtn,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { showPasteMode = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF8E24AA)),
+                        border = BorderStroke(1.5.dp, Color(0xFF8E24AA)),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color(0xFF8E24AA))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = strings.restoreByPasteBtn,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Button(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                    }
                 }
             }
         }
@@ -3724,7 +4389,7 @@ fun BackupDialog(
 @Composable
 fun MenuOptionCard(
     title: String,
-    subtitle: String,
+    subtitle: String? = null,
     icon: ImageVector,
     color: Color,
     onClick: () -> Unit
@@ -3740,13 +4405,13 @@ fun MenuOptionCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
+                .padding(horizontal = 14.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .size(44.dp)
+                    .size(42.dp)
                     .background(color.copy(alpha = 0.15f), shape = CircleShape),
                 contentAlignment = Alignment.Center
             ) {
@@ -3754,7 +4419,7 @@ fun MenuOptionCard(
                     imageVector = icon,
                     contentDescription = null,
                     tint = color,
-                    modifier = Modifier.size(24.dp)
+                    modifier = Modifier.size(22.dp)
                 )
             }
 
@@ -3769,11 +4434,281 @@ fun MenuOptionCard(
                     fontWeight = FontWeight.Bold,
                     color = LocalAppColors.current.text
                 )
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = LocalAppColors.current.textSub
-                )
+                if (!subtitle.isNullOrBlank()) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textSub
+                    )
+                }
+            }
+
+            Icon(
+                imageVector = Icons.Default.KeyboardArrowLeft,
+                contentDescription = null,
+                tint = LocalAppColors.current.textMuted,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun AppGuideDialog(
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Book,
+                        contentDescription = null,
+                        tint = Color(0xFFFF9800),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = "لمحة ودليل استخدام التطبيق",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Overview card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, LocalAppColors.current.border)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = "💡 لمحة عن التطبيق:",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = EmeraldGreen
+                        )
+                        Text(
+                            text = "تطبيق (حساب العامل الذكي) هو حاسبتك الذكية المتكاملة لإدارة راتبك وسحبياتك (السلف) والصرفيات والغيابات بدقة وحماية كاملة، دون الحاجة للدفاتر الورقية.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = LocalAppColors.current.text
+                        )
+                    }
+                }
+
+                // Guide steps card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, LocalAppColors.current.border)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = "🛠️ دليل الاستخدام والتفعيل:",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = EarnedBlue
+                        )
+
+                        val steps = listOf(
+                            "1️⃣ ضبط الحساب" to "من (إعدادات المستخدم) أدخل اسمك، راتبك، عملتك، تاريخ بدء العمل، وحدد هل الصرفة مخصومة من الراتب أم لا.",
+                            "2️⃣ تسجيل العمليات" to "اضغط على زر (+) في الشاشة الرئيسية لإضافة صرفية يومية، سحبية (سلفة)، أو غياب بالأرقام أو بالأمر الصوتي.",
+                            "3️⃣ الحساب والخصم الآلي" to "يقوم التطبيق باحتساب المستحق اليومي، الخصومات، والصفاية المتبقية لك فوراً بنظام حسابي دقيق.",
+                            "4️⃣ التقارير وتصدير الكشف" to "من شاشة الكشف يمكنك معاينة أو طباعة كشف حساب PDF أو مشاركته نصياً عبر واتساب.",
+                            "5️⃣ الأمان والنسخ الاحتياطي" to "احمِ بياناتك برمز PIN أو البصمة، وأجرِ نسخاً احتياطياً لبياناتك بانتظام لاستعادتها في أي وقت."
+                        )
+
+                        steps.forEach { (title, desc) ->
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                                horizontalAlignment = Alignment.Start
+                            ) {
+                                Text(
+                                    text = title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = LocalAppColors.current.text
+                                )
+                                Text(
+                                    text = desc,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = LocalAppColors.current.textSub
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AppUpdateDialog(
+    updateInfoState: UpdateInfo,
+    onCheckUpdate: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        tint = Color(0xFF00ACC1),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = "تحديثات التطبيق",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                if (updateInfoState.hasUpdate) {
+                    Text(
+                        text = "📢 يتوفر تحديث جديد للتطبيق!",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = EmeraldGreen
+                    )
+                    Text(
+                        text = "الإصدار المتاح: ${updateInfoState.versionName}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalAppColors.current.text,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (updateInfoState.changelog.isNotBlank()) {
+                        Text(
+                            text = updateInfoState.changelog,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textSub,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            try {
+                                val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(updateInfoState.updateUrl))
+                                context.startActivity(intent)
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "تعذر فتح رابط التحميل", Toast.LENGTH_SHORT).show()
+                            }
+                            onDismiss()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("تحميل التحديث الجديد", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(LocalAppColors.current.bg, RoundedCornerShape(16.dp))
+                            .padding(16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "✅ أنت تستخدم أحدث إصدار من التطبيق",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = EmeraldGreen,
+                                textAlign = TextAlign.Center
+                            )
+                            Text(
+                                text = "لا توجد تحديثات جديدة متاحة حالياً.\nإصدارك الحالي: v1.0.0",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.textSub,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = onCheckUpdate,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("البحث عن تحديثات الآن", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }
@@ -3784,8 +4719,6 @@ fun DeveloperInfoDialog(
     appLanguage: String = "ar",
     onDismiss: () -> Unit
 ) {
-    val appLang = AppLanguage.fromCode(appLanguage)
-    val strings = LanguageStrings(appLang)
     Dialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
@@ -3814,7 +4747,7 @@ fun DeveloperInfoDialog(
                         modifier = Modifier.size(28.dp)
                     )
                     Text(
-                        text = strings.devInfoTitle,
+                        text = "معلومات المطور",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = LocalAppColors.current.text
@@ -3823,40 +4756,95 @@ fun DeveloperInfoDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
-                // Developer & App Summary Card ONLY
+                // Developer Details Card
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
-                    shape = RoundedCornerShape(16.dp)
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, LocalAppColors.current.border)
                 ) {
                     Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier
+                            .padding(16.dp)
+                            .fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
                         horizontalAlignment = Alignment.Start
                     ) {
                         Text(
-                            text = "📱 ${strings.appTitle}",
+                            text = "📱 تطبيق حساب العامل الذكي v1.0",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
-                            color = LocalAppColors.current.text
+                            color = EmeraldGreen
                         )
-                        Text(
-                            text = strings.currentVersionText,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = EmeraldGreen,
-                            fontWeight = FontWeight.Bold
-                        )
+
                         HorizontalDivider(color = LocalAppColors.current.border, thickness = 0.5.dp)
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Person, contentDescription = null, tint = EarnedBlue)
+                            Text(
+                                text = "الاسم: حسام الحطامي",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Email, contentDescription = null, tint = EmeraldGreen)
+                            Text(
+                                text = "husamalhattami100@gmail.com",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Phone, contentDescription = null, tint = AmberOrange)
+                            Text(
+                                text = "+967778383570",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = LocalAppColors.current.text,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
+                // Centered Callout Message
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = EmeraldGreen.copy(alpha = 0.1f)),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.3f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .padding(16.dp)
+                            .fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
                         Text(
-                            text = strings.developerTitle,
-                            style = MaterialTheme.typography.bodyLarge,
+                            text = "💬 يسعدنا تواصلكم معنا!",
+                            style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
-                            color = LocalAppColors.current.text
+                            color = EmeraldGreen,
+                            textAlign = TextAlign.Center
                         )
                         Text(
-                            text = strings.appObjective,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LocalAppColors.current.textMuted
+                            text = "شاركونا آراءكم واقتراحاتكم وتعديلاتكم والمشاكل التي تواجهكم لتطوير التطبيق نحو الأفضل دائماً.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = LocalAppColors.current.text,
+                            textAlign = TextAlign.Center
                         )
                     }
                 }
@@ -3867,7 +4855,7 @@ fun DeveloperInfoDialog(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                    Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
                 }
             }
         }

@@ -78,7 +78,8 @@ data class GeminiResponse(
 @JsonClass(generateAdapter = true)
 data class VoiceParseResult(
     val type: String, // SPENDING, DRAW, ABSENCE
-    val amount: Double
+    val amount: Double,
+    val note: String? = null
 )
 
 interface GeminiService {
@@ -114,20 +115,22 @@ object GeminiClient {
             Your job is to read an Arabic voice transcription and return a JSON object with:
             - "type": "SPENDING" (صرفة/مصروف يومي), "DRAW" (سحبية/سلفة من الراتب), or "ABSENCE" (غياب/لم يشتغل/غائب)
             - "amount": The numeric amount parsed (default to 0.0 if not mentioned, e.g. for ABSENCE).
-            
+            - "note": The extracted reason, description, or purpose explaining why money was taken/spent or why absent.
+
             Examples:
-            "صرفت خمسين ريال" -> {"type": "SPENDING", "amount": 50.0}
-            "سحبت مية" -> {"type": "DRAW", "amount": 100.0}
-            "اليوم غايب" -> {"type": "ABSENCE", "amount": 0.0}
-            "سجل غياب" -> {"type": "ABSENCE", "amount": 0.0}
-            "سلفة خمسمئة ريال" -> {"type": "DRAW", "amount": 500.0}
+            "صرفت خمسين ريال لشراء علاج" -> {"type": "SPENDING", "amount": 50.0, "note": "شراء علاج"}
+            "أخذت مبلغ 500 ريال وسلفت واحد" -> {"type": "DRAW", "amount": 500.0, "note": "سلفة لواحد"}
+            "سحبت مية حق الغداء" -> {"type": "DRAW", "amount": 100.0, "note": "حق الغداء"}
+            "اليوم غايب بسبب المرض" -> {"type": "ABSENCE", "amount": 0.0, "note": "بسبب المرض"}
+            "سجل غياب" -> {"type": "ABSENCE", "amount": 0.0, "note": null}
         """.trimIndent()
 
         val schema = ResponseSchema(
             type = "OBJECT",
             properties = mapOf(
                 "type" to PropertySchema(type = "STRING", enum = listOf("SPENDING", "DRAW", "ABSENCE")),
-                "amount" to PropertySchema(type = "NUMBER")
+                "amount" to PropertySchema(type = "NUMBER"),
+                "note" to PropertySchema(type = "STRING", description = "Reason or note for transaction")
             ),
             required = listOf("type", "amount")
         )
@@ -169,8 +172,14 @@ object LocalArabicParser {
         
         // Find amount
         val amount = extractNumber(normalizedText)
+
+        // Try extracting note
+        var cleanNote = text
+            .replace(Regex("""(?i)\b(\d+|(الف|الاف|آلاف|مية|مائة|خمسمية|ريال|دولار|مبلغ|سحبت|صرفت|اخذت|سلفة|سحبية|غياب|سجل))\b"""), "")
+            .trim()
+        if (cleanNote.length < 3) cleanNote = text
         
-        return VoiceParseResult(type, amount)
+        return VoiceParseResult(type, amount, cleanNote.ifBlank { null })
     }
 
     private fun normalizeArabic(text: String): String {

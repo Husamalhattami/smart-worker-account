@@ -14,8 +14,13 @@ class ArabicTtsHelper(context: Context) : TextToSpeech.OnInitListener {
             // Explicitly try initializing Google TTS engine for standard Arabic support
             tts = TextToSpeech(context.applicationContext, this, "com.google.android.tts")
         } catch (e: Exception) {
-            Log.e("ArabicTtsHelper", "Failed to initialize Google TTS engine, using default.", e)
-            tts = TextToSpeech(context.applicationContext, this)
+            Log.e("ArabicTtsHelper", "Failed to initialize Google TTS engine, trying default.", e)
+            try {
+                tts = TextToSpeech(context.applicationContext, this)
+            } catch (e2: Exception) {
+                Log.e("ArabicTtsHelper", "Failed to initialize default TTS engine as well.", e2)
+                tts = null
+            }
         }
     }
 

@@ -24,6 +24,7 @@ data class SalarySettings(
     val securityPin: String = "",
     val biometricEnabled: Boolean = false,
     val autoAddDailySpending: Boolean = false,
+    val isSpendingDeductedFromSalary: Boolean = true,
     val themeMode: String = "DARK",
     val appLanguage: String = "ar"
 )
@@ -36,4 +37,13 @@ data class Transaction(
     val timestamp: Long = System.currentTimeMillis(),
     val voiceNotePath: String? = null,
     val voiceText: String? = null
+)
+
+@Entity(tableName = "currencies")
+data class CurrencyItem(
+    @PrimaryKey val id: String,
+    val name: String,
+    val symbol: String,
+    val flag: String = "",
+    val isCustom: Boolean = false
 )

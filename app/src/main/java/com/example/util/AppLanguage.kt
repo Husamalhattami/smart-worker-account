@@ -152,10 +152,10 @@ class LanguageStrings(val lang: AppLanguage) {
     }
 
     val systemTab: String = when (lang) {
-        AppLanguage.ARABIC -> "إعدادات النظام"
-        AppLanguage.ENGLISH -> "System Settings"
-        AppLanguage.FRENCH -> "Paramètres Système"
-        AppLanguage.URDU -> "سسٹم سیٹنگز"
+        AppLanguage.ARABIC -> "إعدادات التطبيق"
+        AppLanguage.ENGLISH -> "App Settings"
+        AppLanguage.FRENCH -> "Paramètres de l'application"
+        AppLanguage.URDU -> "ایپ سیٹنگز"
     }
 
     val employeeNameLabel: String = when (lang) {
@@ -222,10 +222,10 @@ class LanguageStrings(val lang: AppLanguage) {
     }
 
     val systemSettingsTitle: String = when (lang) {
-        AppLanguage.ARABIC -> "إعدادات النظام"
-        AppLanguage.ENGLISH -> "System Settings"
-        AppLanguage.FRENCH -> "Paramètres Système"
-        AppLanguage.URDU -> "سسٹم سیٹنگز"
+        AppLanguage.ARABIC -> "إعدادات التطبيق"
+        AppLanguage.ENGLISH -> "App Settings"
+        AppLanguage.FRENCH -> "Paramètres de l'application"
+        AppLanguage.URDU -> "ایپ سیٹنگز"
     }
 
     val systemSettingsSubtitle: String = when (lang) {
@@ -289,6 +289,34 @@ class LanguageStrings(val lang: AppLanguage) {
         AppLanguage.ENGLISH -> "Restore Backup (Import)"
         AppLanguage.FRENCH -> "Restaurer une sauvegarde (Importer)"
         AppLanguage.URDU -> "بیک اپ بحال کریں (امپورٹ)"
+    }
+
+    val restoreByPasteBtn: String = when (lang) {
+        AppLanguage.ARABIC -> "استعادة بلصق نص النسخة 📋"
+        AppLanguage.ENGLISH -> "Restore by Pasting Text 📋"
+        AppLanguage.FRENCH -> "Restaurer en collant le texte 📋"
+        AppLanguage.URDU -> "بیک اپ متن پیسٹ کر کے بحال کریں 📋"
+    }
+
+    val pasteBackupTitle: String = when (lang) {
+        AppLanguage.ARABIC -> "لصق نص النسخة الاحتياطية"
+        AppLanguage.ENGLISH -> "Paste Backup Text"
+        AppLanguage.FRENCH -> "Coller le texte de sauvegarde"
+        AppLanguage.URDU -> "بیک اپ متن پیسٹ کریں"
+    }
+
+    val pasteBackupHint: String = when (lang) {
+        AppLanguage.ARABIC -> "قم بلصق محتوى الكود أو النص الذي تم حفظه عند التصدير هنا..."
+        AppLanguage.ENGLISH -> "Paste the exported backup JSON text or code here..."
+        AppLanguage.FRENCH -> "Collez le texte JSON exporté ici..."
+        AppLanguage.URDU -> "یہاں ایکسپورٹ کیا گیا بیک اپ متن پیسٹ کریں..."
+    }
+
+    val confirmRestoreBtn: String = when (lang) {
+        AppLanguage.ARABIC -> "تأكيد الاستعادة والتشغيل 🔄"
+        AppLanguage.ENGLISH -> "Confirm & Restore 🔄"
+        AppLanguage.FRENCH -> "Confirmer et Restaurer 🔄"
+        AppLanguage.URDU -> "تصدیق اور بحال کریں 🔄"
     }
 
     val backupDescription: String = when (lang) {

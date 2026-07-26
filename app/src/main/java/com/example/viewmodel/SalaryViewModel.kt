@@ -9,6 +9,8 @@ import com.example.util.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
@@ -45,7 +47,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     val registeredUsers = MutableStateFlow<List<String>>(emptyList())
 
     private val db = AppDatabase.getDatabase(application)
-    private val repository = SalaryRepository(db.salaryDao(), db.transactionDao())
+    private val repository = SalaryRepository(db.salaryDao(), db.transactionDao(), db.currencyDao())
     private val ttsHelper: ArabicTtsHelper = ArabicTtsHelper(application)
     private val recorderHelper: VoiceRecorderHelper = VoiceRecorderHelper(application)
     private var isCheckingAutoSpendings = false
@@ -55,6 +57,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     val transactions: StateFlow<List<Transaction>> = repository.allTransactions
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val currenciesState: StateFlow<List<CurrencyItem>> = repository.allCurrencies
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val metrics: StateFlow<SalaryMetrics>
 
@@ -84,9 +89,10 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     private var temporaryAudioPath: String? = null
 
     init {
-        // Ensure default settings exist in the database if empty, so the Flow emits instead of getting stuck
+        // Ensure default settings and currencies exist in the database if empty
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                repository.seedDefaultCurrenciesIfEmpty()
                 val current = repository.getSalarySettingsDirect()
                 if (current == null) {
                     repository.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = ""))
@@ -121,26 +127,31 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // Initialize Speech recognizer
-        speechRecognizerHelper = SpeechRecognizerHelper(
-            context = application,
-            onResult = { result ->
-                _speechInputText.value = result
-                _isRecordingVoice.value = false // Stop pulsing/recording state
-                parseAndAddVoiceTransaction(result)
-            },
-            onError = { err ->
-                _errorMessage.value = err
-                _isRecordingVoice.value = false // Stop pulsing/recording state
-                speakOutText(err)
-            },
-            onListeningStateChange = { listening ->
-                _isListening.value = listening
-                if (!listening) {
+        // Initialize Speech recognizer safely
+        try {
+            speechRecognizerHelper = SpeechRecognizerHelper(
+                context = application,
+                onResult = { result ->
+                    _speechInputText.value = result
                     _isRecordingVoice.value = false // Stop pulsing/recording state
+                    parseAndAddVoiceTransaction(result)
+                },
+                onError = { err ->
+                    _errorMessage.value = err
+                    _isRecordingVoice.value = false // Stop pulsing/recording state
+                    speakOutText(err)
+                },
+                onListeningStateChange = { listening ->
+                    _isListening.value = listening
+                    if (!listening) {
+                        _isRecordingVoice.value = false // Stop pulsing/recording state
+                    }
                 }
-            }
-        )
+            )
+        } catch (e: Exception) {
+            Log.e("SalaryViewModel", "Failed to initialize SpeechRecognizerHelper", e)
+            speechRecognizerHelper = null
+        }
     }
 
     fun loginUser(name: String) {
@@ -225,7 +236,14 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         
         // Earned salary is base rate * elapsed days, minus absence deduction
         val earnedSalary = maxOf(0.0, (elapsedDays.toDouble() * dailyRate) - (totalAbsenceHours * hourlyRate))
-        val netBalance = earnedSalary + settings.openingBalance - totalSpendings - totalDraws
+        
+        // If spending is deducted from salary, subtract total spendings from net balance.
+        // If spending is outside salary (net salary rate), do NOT subtract spendings from net balance owed.
+        val netBalance = if (settings.isSpendingDeductedFromSalary) {
+            earnedSalary + settings.openingBalance - totalSpendings - totalDraws
+        } else {
+            earnedSalary + settings.openingBalance - totalDraws
+        }
 
         return SalaryMetrics(
             daysInMonth = 30, // Base is 30
@@ -260,6 +278,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         securityPin: String = "",
         biometricEnabled: Boolean = false,
         autoAddDailySpending: Boolean = false,
+        isSpendingDeductedFromSalary: Boolean = true,
         themeMode: String = "DARK",
         appLanguage: String = "ar"
     ) {
@@ -283,6 +302,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 securityPin = securityPin,
                 biometricEnabled = biometricEnabled,
                 autoAddDailySpending = autoAddDailySpending,
+                isSpendingDeductedFromSalary = isSpendingDeductedFromSalary,
                 themeMode = themeMode,
                 appLanguage = appLanguage
             )
@@ -363,7 +383,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     type = parsedResult.type,
                     amount = parsedResult.amount,
                     audioPath = audioPathToSave,
-                    text = inputText
+                    text = parsedResult.note?.ifBlank { null } ?: inputText
                 )
             } else {
                 _errorMessage.value = "عذراً، لم أستطع فهم المبلغ أو العملية"
@@ -478,7 +498,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val avgSpendingPerDay = if (actualWorkedDays > 0) m.totalSpendings / actualWorkedDays else 0.0
         val avgDrawsPerDay = if (actualWorkedDays > 0) m.totalDraws / actualWorkedDays else 0.0
         val dailySalaryRate = m.dailyRate
-        val employeeName = if (s.employeeName.isBlank()) "محمد خالد العريفي" else s.employeeName
+        val employeeName = if (s.employeeName.isBlank()) "حسام الحطامي" else s.employeeName
         
         val openingBalanceLine = if (s.openingBalance != 0.0) "\n            💰 رصيد افتتاحي (حساب سابق): ${s.openingBalance.toInt()} $cur" else ""
         
@@ -512,70 +532,70 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         """.trimIndent()
     }
 
+    private val autoAddMutex = Mutex()
+
     private fun autoAddDailySpendingsIfEnabled(settings: SalarySettings) {
-        if (isCheckingAutoSpendings) return
-        isCheckingAutoSpendings = true
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val txList = repository.getAllTransactionsDirect()
-                
-                val calStart = Calendar.getInstance().apply {
-                    timeInMillis = settings.startWorkDate
-                    set(Calendar.HOUR_OF_DAY, 0)
-                    set(Calendar.MINUTE, 0)
-                    set(Calendar.SECOND, 0)
-                    set(Calendar.MILLISECOND, 0)
-                }
-                
-                val calToday = Calendar.getInstance().apply {
-                    set(Calendar.HOUR_OF_DAY, 0)
-                    set(Calendar.MINUTE, 0)
-                    set(Calendar.SECOND, 0)
-                    set(Calendar.MILLISECOND, 0)
-                }
-                
-                val existingSpendingDays = txList.filter { it.type == "SPENDING" }.map { tx ->
-                    Calendar.getInstance().apply {
-                        timeInMillis = tx.timestamp
+            autoAddMutex.withLock {
+                try {
+                    val txList = repository.getAllTransactionsDirect()
+                    
+                    val calStart = Calendar.getInstance().apply {
+                        timeInMillis = settings.startWorkDate
                         set(Calendar.HOUR_OF_DAY, 0)
                         set(Calendar.MINUTE, 0)
                         set(Calendar.SECOND, 0)
                         set(Calendar.MILLISECOND, 0)
-                    }.timeInMillis
-                }.toSet()
+                    }
+                    
+                    val calToday = Calendar.getInstance().apply {
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    
+                    val existingSpendingDays = txList.filter { it.type == "SPENDING" }.map { tx ->
+                        Calendar.getInstance().apply {
+                            timeInMillis = tx.timestamp
+                            set(Calendar.HOUR_OF_DAY, 0)
+                            set(Calendar.MINUTE, 0)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }.timeInMillis
+                    }.toSet()
 
-                val listToInsert = mutableListOf<Transaction>()
-                val daysLimit = 100 // Prevent adding infinite records
-                var daysAdded = 0
-                
-                while (!calStart.after(calToday) && daysAdded < daysLimit) {
-                    val dayMidnight = calStart.timeInMillis
-                    if (!existingSpendingDays.contains(dayMidnight)) {
-                        listToInsert.add(
-                            Transaction(
-                                type = "SPENDING",
-                                amount = settings.standardSpendingAmount,
-                                timestamp = dayMidnight + 12 * 60 * 60 * 1000, // noon
-                                voiceText = "صرفة يومية تلقائية 🤖"
+                    val listToInsert = mutableListOf<Transaction>()
+                    val daysLimit = 100 // Prevent adding infinite records
+                    var daysAdded = 0
+                    
+                    while (!calStart.after(calToday) && daysAdded < daysLimit) {
+                        val dayMidnight = calStart.timeInMillis
+                        if (!existingSpendingDays.contains(dayMidnight)) {
+                            listToInsert.add(
+                                Transaction(
+                                    type = "SPENDING",
+                                    amount = settings.standardSpendingAmount,
+                                    timestamp = dayMidnight + 12 * 60 * 60 * 1000, // noon
+                                    voiceText = "صرفة يومية تلقائية 🤖"
+                                )
                             )
-                        )
+                        }
+                        calStart.add(Calendar.DAY_OF_YEAR, 1)
+                        daysAdded++
                     }
-                    calStart.add(Calendar.DAY_OF_YEAR, 1)
-                    daysAdded++
-                }
 
-                if (listToInsert.isNotEmpty()) {
-                    for (tx in listToInsert) {
-                        repository.insertTransaction(tx)
+                    if (listToInsert.isNotEmpty()) {
+                        for (tx in listToInsert) {
+                            repository.insertTransaction(tx)
+                        }
+                        if (settings.voiceEnabled) {
+                            speakOutText("تمت إضافة الصرفيات التلقائية المتأخرة")
+                        }
                     }
-                    if (settings.voiceEnabled) {
-                        speakOutText("تمت إضافة الصرفيات التلقائية المتأخرة")
-                    }
+                } catch (e: Exception) {
+                    Log.e("SalaryViewModel", "Error auto-adding spendings", e)
                 }
-            } catch (e: Exception) {
-                Log.e("SalaryViewModel", "Error auto-adding spendings", e)
-            } finally {
-                isCheckingAutoSpendings = false
             }
         }
     }
@@ -712,6 +732,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             put("securityPin", s.securityPin)
             put("biometricEnabled", s.biometricEnabled)
             put("autoAddDailySpending", s.autoAddDailySpending)
+            put("isSpendingDeductedFromSalary", s.isSpendingDeductedFromSalary)
             put("themeMode", s.themeMode)
             put("appLanguage", s.appLanguage)
         }
@@ -765,6 +786,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     securityPin = sObj.optString("securityPin", ""),
                     biometricEnabled = sObj.optBoolean("biometricEnabled", false),
                     autoAddDailySpending = sObj.optBoolean("autoAddDailySpending", false),
+                    isSpendingDeductedFromSalary = sObj.optBoolean("isSpendingDeductedFromSalary", true),
                     themeMode = sObj.optString("themeMode", "DARK"),
                     appLanguage = sObj.optString("appLanguage", "ar")
                 )
@@ -795,6 +817,33 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             Log.e("SalaryViewModel", "Error restoring backup JSON", e)
             _userNotice.tryEmit("❌ فشلت استعادة النسخة الاحتياطية. صيغة الملف غير صحيحة.")
             false
+        }
+    }
+
+    fun addCustomCurrency(name: String, symbol: String, flag: String = "💱") {
+        viewModelScope.launch {
+            val trimmedName = name.trim()
+            val trimmedSymbol = symbol.trim().ifEmpty { trimmedName }
+            if (trimmedName.isNotEmpty()) {
+                val id = "CUSTOM_${System.currentTimeMillis()}"
+                repository.insertCurrency(
+                    CurrencyItem(
+                        id = id,
+                        name = trimmedName,
+                        symbol = trimmedSymbol,
+                        flag = flag.trim().ifEmpty { "💱" },
+                        isCustom = true
+                    )
+                )
+                _userNotice.tryEmit("✅ تم إضافة العملة الجديدة: $trimmedName")
+            }
+        }
+    }
+
+    fun deleteCurrency(currencyItem: CurrencyItem) {
+        viewModelScope.launch {
+            repository.deleteCurrency(currencyItem)
+            _userNotice.tryEmit("🗑️ تم حذف العملة")
         }
     }
 

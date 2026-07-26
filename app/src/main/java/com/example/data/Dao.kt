@@ -35,3 +35,24 @@ interface TransactionDao {
     @Query("DELETE FROM transactions")
     suspend fun deleteAllTransactions()
 }
+
+@Dao
+interface CurrencyDao {
+    @Query("SELECT * FROM currencies ORDER BY name ASC")
+    fun getAllCurrencies(): Flow<List<CurrencyItem>>
+
+    @Query("SELECT * FROM currencies ORDER BY name ASC")
+    suspend fun getAllCurrenciesDirect(): List<CurrencyItem>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertCurrencies(currencies: List<CurrencyItem>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertCurrency(currency: CurrencyItem)
+
+    @Delete
+    suspend fun deleteCurrency(currency: CurrencyItem)
+
+    @Query("SELECT COUNT(*) FROM currencies")
+    suspend fun getCurrencyCount(): Int
+}

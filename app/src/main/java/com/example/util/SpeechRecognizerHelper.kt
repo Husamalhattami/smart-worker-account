@@ -18,16 +18,22 @@ class SpeechRecognizerHelper(
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
+    private var lastPartialText: String = ""
     private val recognizerIntent: Intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ar-SA") // Use Arabic SA
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ar-SA")
         putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, "ar-SA")
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
     }
 
     fun startListening() {
         mainHandler.post {
             try {
+                lastPartialText = ""
                 if (speechRecognizer == null) {
                     speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context.applicationContext).apply {
                         setRecognitionListener(object : RecognitionListener {
@@ -61,17 +67,21 @@ class SpeechRecognizerHelper(
                                 Log.e("SpeechRecognizerHelper", "Error code: $error - $message")
                                 mainHandler.post {
                                     onListeningStateChange(false)
-                                    onError(message)
+                                    if (lastPartialText.isNotBlank() && (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
+                                        onResult(lastPartialText)
+                                    } else {
+                                        onError(message)
+                                    }
                                 }
                             }
 
                             override fun onResults(results: Bundle?) {
                                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                if (!matches.isNullOrEmpty()) {
-                                    val resultText = matches[0]
+                                val finalResult = if (!matches.isNullOrEmpty()) matches[0] else lastPartialText
+                                if (finalResult.isNotBlank()) {
                                     mainHandler.post {
                                         onListeningStateChange(false)
-                                        onResult(resultText)
+                                        onResult(finalResult)
                                     }
                                 } else {
                                     mainHandler.post {
@@ -81,7 +91,12 @@ class SpeechRecognizerHelper(
                                 }
                             }
 
-                            override fun onPartialResults(partialResults: Bundle?) {}
+                            override fun onPartialResults(partialResults: Bundle?) {
+                                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                if (!matches.isNullOrEmpty() && matches[0].isNotBlank()) {
+                                    lastPartialText = matches[0]
+                                }
+                            }
 
                             override fun onEvent(eventType: Int, params: Bundle?) {}
                         })

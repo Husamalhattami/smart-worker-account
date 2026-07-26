@@ -221,7 +221,7 @@ object PdfPrintHelper {
                     </div>
 
                     <div class="employee-card">
-                        <div class="employee-name">الموظف: ${if (settings.employeeName.isBlank()) "محمد خالد العريفي" else settings.employeeName}</div>
+                        <div class="employee-name">الموظف: ${if (settings.employeeName.isBlank()) "حسام الحطامي" else settings.employeeName}</div>
                         <div class="meta-grid">
                             <div class="meta-item">
                                 <span class="meta-label">تاريخ بدء العمل:</span>
@@ -337,8 +337,8 @@ object PdfPrintHelper {
                         else -> ""
                     }
                     val typeLabel = when (tx.type) {
-                        "SPENDING" -> "صرفة مصروف"
-                        "DRAW" -> "سحبة سلفة"
+                        "SPENDING" -> "صرفة"
+                        "DRAW" -> "سحبيّة"
                         "ABSENCE" -> "تسجيل غياب"
                         else -> "عملية"
                     }
@@ -382,7 +382,7 @@ object PdfPrintHelper {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     // Create PrintManager instance
                     val printManager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                    val employeeCleanName = if (settings.employeeName.isBlank()) "محمد_خالد_العريفي" else settings.employeeName.replace(" ", "_")
+                    val employeeCleanName = if (settings.employeeName.isBlank()) "حسام_الحطامي" else settings.employeeName.replace(" ", "_")
                     val jobName = "كشف_حساب_$employeeCleanName"
 
                     // Get print adapter
