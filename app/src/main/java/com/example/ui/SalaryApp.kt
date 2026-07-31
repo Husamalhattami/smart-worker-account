@@ -3,7 +3,11 @@ package com.example.ui
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.ContentValues
+import android.os.Environment
+import android.provider.MediaStore
 import java.io.File
+import java.io.InputStream
 import android.content.pm.PackageManager
 import android.os.Build
 import android.widget.Toast
@@ -60,12 +64,18 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
+import com.example.data.AppDatabase
 import com.example.data.CurrencyItem
 import com.example.data.SalarySettings
 import com.example.data.Transaction
+import android.content.ContextWrapper
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import com.example.viewmodel.UpdateInfo
 import com.example.ui.theme.*
 import com.example.util.AppLanguage
+import com.example.util.AdMobManager
+import com.example.util.AdMobBanner
 import com.example.util.LanguageStrings
 import com.example.util.PdfPrintHelper
 import com.example.viewmodel.SalaryMetrics
@@ -117,6 +127,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     var showMainMenuDialog by remember { mutableStateOf(false) }
     var showDeveloperInfoDialog by remember { mutableStateOf(false) }
     var showBackupDialog by remember { mutableStateOf(false) }
+    var fileOpNotification by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showUserSettingsDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
@@ -172,18 +183,119 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     }
 
     val createDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/json")
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
     ) { uri ->
         if (uri != null) {
-            coroutineScope.launch {
+            coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 try {
-                    val json = viewModel.exportBackupJson()
-                    context.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                        outputStream.write(json.toByteArray(Charsets.UTF_8))
+                    AppDatabase.checkpointDatabase(context)
+                    val dbFile = context.getDatabasePath("salary_friend_database")
+                    if (dbFile.exists()) {
+                        context.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                            FileInputStream(dbFile).use { inputStream ->
+                                inputStream.copyTo(outputStream)
+                            }
+                        }
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            val msg = "✅ تم حفظ ملف قاعدة البيانات (.db) بنجاح!"
+                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            fileOpNotification = Pair(true, msg)
+                        }
+                    } else {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            val msg = "❌ لم يتم العثور على ملف قاعدة البيانات"
+                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            fileOpNotification = Pair(false, msg)
+                        }
                     }
-                    Toast.makeText(context, "✅ تم حفظ النسخة الاحتياطية بنجاح!", Toast.LENGTH_LONG).show()
                 } catch (e: Exception) {
-                    Toast.makeText(context, "❌ فشل حفظ ملف النسخة الاحتياطية", Toast.LENGTH_LONG).show()
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        val msg = "❌ فشل حفظ ملف قاعدة البيانات (.db)"
+                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                        fileOpNotification = Pair(false, msg)
+                    }
+                }
+            }
+        } else {
+            val msg = "⚠️ تم إلغاء عملية التصدير وحفظ النسخة الاحتياطية"
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            fileOpNotification = Pair(false, msg)
+        }
+    }
+
+    val performRestoreFromStream: (() -> InputStream?, String) -> Unit = { streamProvider, sourceName ->
+        coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val inputStream = streamProvider()
+                if (inputStream == null) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        val msg = "❌ تعذر قراءة الملف: $sourceName"
+                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                        fileOpNotification = Pair(false, msg)
+                    }
+                    return@launch
+                }
+
+                val header = ByteArray(16)
+                val bytesRead = inputStream.read(header)
+                inputStream.close()
+
+                val expectedHeader = "SQLite format 3".toByteArray(Charsets.US_ASCII)
+                val isValidSqlite = bytesRead >= 15 && header.take(15).toByteArray().contentEquals(expectedHeader)
+
+                if (!isValidSqlite) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        val msg = "❌ الملف المختار ليس ملف قاعدة بيانات (.db) صحيح"
+                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                        fileOpNotification = Pair(false, msg)
+                    }
+                    return@launch
+                }
+
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "⏳ جاري استعادة قاعدة البيانات وإعادة تشغيل التطبيق...", Toast.LENGTH_SHORT).show()
+                }
+
+                AppDatabase.closeDatabase()
+
+                val dbFile = context.getDatabasePath("salary_friend_database")
+                val walFile = File(dbFile.path + "-wal")
+                val shmFile = File(dbFile.path + "-shm")
+                val journalFile = File(dbFile.path + "-journal")
+
+                if (walFile.exists()) walFile.delete()
+                if (shmFile.exists()) shmFile.delete()
+                if (journalFile.exists()) journalFile.delete()
+
+                streamProvider()?.use { input ->
+                    FileOutputStream(dbFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    showBackupDialog = false
+                    val msg = "✅ تم استعادة قاعدة البيانات ($sourceName) بنجاح! يتم الآن تحديث التطبيق."
+                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                    fileOpNotification = Pair(true, msg)
+
+                    kotlinx.coroutines.delay(1800)
+                    val activity = context.findActivity()
+                    val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    if (intent != null) {
+                        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                        context.startActivity(intent)
+                        activity?.finish()
+                    } else {
+                        activity?.recreate()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("RestoreBackup", "Error restoring db", e)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    val msg = "❌ حدث خطأ أثناء استعادة ملف قاعدة البيانات: ${e.localizedMessage}"
+                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                    fileOpNotification = Pair(false, msg)
                 }
             }
         }
@@ -191,42 +303,43 @@ fun SalaryApp(viewModel: SalaryViewModel) {
 
     val handleRestoreUri: (android.net.Uri?) -> Unit = { uri ->
         if (uri != null) {
-            coroutineScope.launch {
-                try {
-                    try {
-                        context.contentResolver.takePersistableUriPermission(
-                            uri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION
-                        )
-                    } catch (_: Exception) {}
-                    val json = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                    if (!json.isNullOrBlank()) {
-                        val success = viewModel.restoreBackupJson(json)
-                        if (success) {
-                            Toast.makeText(context, "✅ تم استعادة جميع البيانات والراتب بنجاح!", Toast.LENGTH_LONG).show()
-                            showBackupDialog = false
-                        } else {
-                            Toast.makeText(context, "❌ صيغة الملف غير صحيحة كنسخة احتياطية", Toast.LENGTH_LONG).show()
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) {}
+            var fileName = "ملف خارجي (.db)"
+            try {
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (idx != -1) {
+                            val name = cursor.getString(idx)
+                            if (!name.isNullOrBlank()) fileName = name
                         }
-                    } else {
-                        Toast.makeText(context, "⚠️ الملف المختار فارغ", Toast.LENGTH_LONG).show()
                     }
-                } catch (e: Exception) {
-                    Toast.makeText(context, "❌ فشل قراءة ملف النسخة الاحتياطية", Toast.LENGTH_LONG).show()
                 }
-            }
+            } catch (_: Exception) {}
+            performRestoreFromStream({ context.contentResolver.openInputStream(uri) }, fileName)
+        } else {
+            val msg = "⚠️ تم إلغاء اختيار ملف استعادة قاعدة البيانات"
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            fileOpNotification = Pair(false, msg)
         }
     }
 
-    val getContentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent(),
-        onResult = handleRestoreUri
-    )
-
-    val openDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-        onResult = handleRestoreUri
-    )
+    val universalFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val uri = result.data?.data ?: result.data?.clipData?.getItemAt(0)?.uri
+            if (uri != null) {
+                handleRestoreUri(uri)
+            } else {
+                val msg = "⚠️ تم إلغاء اختيار ملف استعادة قاعدة البيانات"
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                fileOpNotification = Pair(false, msg)
+            }
+        }
+    }
 
     var hasGreeted by remember { mutableStateOf(false) }
 
@@ -357,54 +470,53 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     }
                 },
                 actions = {
-                    // Audio Status Report Button
+                    // Menu Drawer Trigger Button
                     IconButton(
-                        onClick = { viewModel.announceFinancialStatus() },
-                        modifier = Modifier
-                            .size(38.dp)
-                            .background(EmeraldGreen.copy(alpha = 0.15f), shape = CircleShape)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.VolumeUp,
-                            contentDescription = "استمع للتقرير الصوتي",
-                            tint = EmeraldGreen,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(6.dp))
-                    // Menu Curtain Drawer Trigger Button
-                    IconButton(
-                        onClick = { showMainMenuDialog = true },
-                        modifier = Modifier
-                            .size(38.dp)
-                            .background(LocalAppColors.current.text.copy(alpha = 0.08f), shape = CircleShape)
+                        onClick = { showMainMenuDialog = true }
                     ) {
                         Icon(
                             imageVector = Icons.Default.Menu,
                             contentDescription = "القائمة الرئيسية",
                             tint = LocalAppColors.current.text,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(26.dp)
                         )
                     }
+                    Spacer(modifier = Modifier.width(4.dp))
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = LocalAppColors.current.bg
                 )
             )
         },
+        floatingActionButtonPosition = FabPosition.End,
         floatingActionButton = {
             FloatingActionButton(
                 onClick = { showAddTxDialog = true },
                 containerColor = EmeraldGreen,
                 contentColor = Color.White,
                 shape = CircleShape,
-                modifier = Modifier.padding(16.dp)
+                modifier = Modifier.padding(bottom = 12.dp, end = 12.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.Add,
                     contentDescription = "إضافة عملية مخصصة",
                     modifier = Modifier.size(28.dp)
                 )
+            }
+        },
+        bottomBar = {
+            Surface(
+                color = LocalAppColors.current.bg,
+                tonalElevation = 6.dp,
+                shadowElevation = 8.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                ) {
+                    AdMobBanner()
+                }
             }
         },
         containerColor = LocalAppColors.current.bg
@@ -473,8 +585,16 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             // --- ONE-TAP QUICK PRESET ACTIONS (No Typing, No talking) ---
             QuickActionsSection(
                 settings = settingsState ?: SalarySettings(),
-                onSpendingClick = { amount -> viewModel.addTransaction("SPENDING", amount, null, "صرفة") },
-                onAbsenceClick = { viewModel.addTransaction("ABSENCE", 12.0, null, "غياب يوم كامل") }
+                onSpendingClick = { amount ->
+                    AdMobManager.showInterstitial(activity) {
+                        viewModel.addTransaction("SPENDING", amount, null, "صرفة")
+                    }
+                },
+                onAbsenceClick = {
+                    AdMobManager.showInterstitial(activity) {
+                        viewModel.addTransaction("ABSENCE", 12.0, null, "غياب يوم كامل")
+                    }
+                }
             )
 
             // --- RECENT TRANSACTIONS FEED (Timeline) ---
@@ -495,10 +615,12 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     shareReport(context, rText, empName)
                 },
                 onPrintClick = {
-                    val settings = settingsState ?: SalarySettings()
-                    val txList = transactionsState
-                    val metrics = metricsState
-                    PdfPrintHelper.printSalaryReport(context, settings, txList, metrics)
+                    AdMobManager.showInterstitial(activity) {
+                        val settings = settingsState ?: SalarySettings()
+                        val txList = transactionsState
+                        val metrics = metricsState
+                        PdfPrintHelper.printSalaryReport(context, settings, txList, metrics)
+                    }
                 }
             )
 
@@ -514,15 +636,21 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             onDismiss = { showMainMenuDialog = false },
             onOpenAppSettings = {
                 showMainMenuDialog = false
-                showSettingsDialog = true
+                AdMobManager.showInterstitial(activity) {
+                    showSettingsDialog = true
+                }
             },
             onOpenUserSettings = {
                 showMainMenuDialog = false
-                showUserSettingsDialog = true
+                AdMobManager.showInterstitial(activity) {
+                    showUserSettingsDialog = true
+                }
             },
             onOpenBackup = {
                 showMainMenuDialog = false
-                showBackupDialog = true
+                AdMobManager.showInterstitial(activity) {
+                    showBackupDialog = true
+                }
             },
             onCheckUpdate = {
                 showMainMenuDialog = false
@@ -531,11 +659,15 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             },
             onOpenGuide = {
                 showMainMenuDialog = false
-                showGuideDialog = true
+                AdMobManager.showInterstitial(activity) {
+                    showGuideDialog = true
+                }
             },
             onOpenDeveloperInfo = {
                 showMainMenuDialog = false
-                showDeveloperInfoDialog = true
+                AdMobManager.showInterstitial(activity) {
+                    showDeveloperInfoDialog = true
+                }
             }
         )
     }
@@ -545,40 +677,73 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         BackupDialog(
             appLanguage = settingsState?.appLanguage ?: "ar",
             onDismiss = { showBackupDialog = false },
-            onExportBackup = {
-                val timeStamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
-                try {
-                    createDocumentLauncher.launch("smart_worker_backup_$timeStamp.json")
-                } catch (e: Exception) {
-                    exportAndShareBackup(context, viewModel, coroutineScope)
-                }
-            },
-            onRestoreBackup = {
-                try {
-                    getContentLauncher.launch("*/*")
-                } catch (e1: Exception) {
-                    try {
-                        openDocumentLauncher.launch(arrayOf("*/*"))
-                    } catch (e2: Exception) {
-                        Toast.makeText(context, "⚠️ تعذر فتح متصفح الملفات، يمكنك استخدام خيار اللصق اليدوي للنص", Toast.LENGTH_LONG).show()
+            onSaveToPhone = {
+                coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val (success, msg) = saveBackupToSmartWorkerFolder(context, viewModel)
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                        fileOpNotification = Pair(success, msg)
                     }
                 }
             },
-            onRestoreFromText = { text ->
-                coroutineScope.launch {
-                    try {
-                        val success = viewModel.restoreBackupJson(text)
-                        if (success) {
-                            Toast.makeText(context, "✅ تم استعادة جميع البيانات والراتب بنجاح!", Toast.LENGTH_LONG).show()
-                            showBackupDialog = false
-                        } else {
-                            Toast.makeText(context, "❌ صيغة الملف أو النص غير صحيحة كنسخة احتياطية", Toast.LENGTH_LONG).show()
-                        }
-                    } catch (e: Exception) {
-                        Toast.makeText(context, "❌ حدث خطأ أثناء استعادة النسخة من النص", Toast.LENGTH_LONG).show()
-                    }
+            onShareBackup = {
+                exportAndShareBackup(context, viewModel, coroutineScope) { success, msg ->
+                    fileOpNotification = Pair(success, msg)
+                }
+            },
+            onRestoreFromFile = { file ->
+                performRestoreFromStream({ FileInputStream(file) }, file.name)
+            },
+            onBrowseExternalFile = {
+                launchUniversalFilePicker(context, universalFilePickerLauncher) { errMsg ->
+                    Toast.makeText(context, errMsg, Toast.LENGTH_LONG).show()
+                    fileOpNotification = Pair(false, errMsg)
                 }
             }
+        )
+    }
+
+    // --- FILE OPERATION STATUS DIALOG ---
+    if (fileOpNotification != null) {
+        val (isSuccess, msg) = fileOpNotification!!
+        AlertDialog(
+            onDismissRequest = { fileOpNotification = null },
+            icon = {
+                Icon(
+                    imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Info,
+                    contentDescription = null,
+                    tint = if (isSuccess) EmeraldGreen else Color.Red,
+                    modifier = Modifier.size(36.dp)
+                )
+            },
+            title = {
+                Text(
+                    text = if (isSuccess) "نجاح العملية" else "تنبيه حالة العملية",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text
+                )
+            },
+            text = {
+                Text(
+                    text = msg,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { fileOpNotification = null },
+                    colors = ButtonDefaults.buttonColors(containerColor = if (isSuccess) EmeraldGreen else EarnedBlue),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("حسناً", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            containerColor = LocalAppColors.current.surface,
+            shape = RoundedCornerShape(20.dp)
         )
     }
 
@@ -619,29 +784,31 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             },
             onDismiss = { showUserSettingsDialog = false },
             onSave = { employeeName, salary, currency, standardSpending, startDate, autoAddDailySpending, isSpendingDeductedFromSalary, openingBalance, priorAbsences, priorSpendings, priorDraws ->
-                val curr = settingsState ?: SalarySettings()
-                viewModel.updateSalarySettings(
-                    salary = salary,
-                    startDate = startDate,
-                    currency = currency,
-                    standardSpending = standardSpending,
-                    priorAbsences = priorAbsences,
-                    priorSpendings = priorSpendings,
-                    priorDraws = priorDraws,
-                    dailyReminderEnabled = curr.dailyReminderEnabled,
-                    dailyReminderHour = curr.dailyReminderHour,
-                    dailyReminderMinute = curr.dailyReminderMinute,
-                    employeeName = employeeName,
-                    voiceEnabled = curr.voiceEnabled,
-                    openingBalance = openingBalance,
-                    securityEnabled = curr.securityEnabled,
-                    securityPin = curr.securityPin,
-                    biometricEnabled = curr.biometricEnabled,
-                    autoAddDailySpending = autoAddDailySpending,
-                    isSpendingDeductedFromSalary = isSpendingDeductedFromSalary,
-                    themeMode = curr.themeMode,
-                    appLanguage = curr.appLanguage
-                )
+                AdMobManager.showInterstitial(activity) {
+                    val curr = settingsState ?: SalarySettings()
+                    viewModel.updateSalarySettings(
+                        salary = salary,
+                        startDate = startDate,
+                        currency = currency,
+                        standardSpending = standardSpending,
+                        priorAbsences = priorAbsences,
+                        priorSpendings = priorSpendings,
+                        priorDraws = priorDraws,
+                        dailyReminderEnabled = curr.dailyReminderEnabled,
+                        dailyReminderHour = curr.dailyReminderHour,
+                        dailyReminderMinute = curr.dailyReminderMinute,
+                        employeeName = employeeName,
+                        voiceEnabled = curr.voiceEnabled,
+                        openingBalance = openingBalance,
+                        securityEnabled = curr.securityEnabled,
+                        securityPin = curr.securityPin,
+                        biometricEnabled = curr.biometricEnabled,
+                        autoAddDailySpending = autoAddDailySpending,
+                        isSpendingDeductedFromSalary = isSpendingDeductedFromSalary,
+                        themeMode = curr.themeMode,
+                        appLanguage = curr.appLanguage
+                    )
+                }
                 showUserSettingsDialog = false
             }
         )
@@ -653,29 +820,31 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             currentSettings = settingsState ?: SalarySettings(),
             onDismiss = { showSettingsDialog = false },
             onSave = { voiceEnabled, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, securityEnabled, securityPin, biometricEnabled, themeMode, appLanguage ->
-                val curr = settingsState ?: SalarySettings()
-                viewModel.updateSalarySettings(
-                    salary = curr.monthlySalary,
-                    startDate = curr.startWorkDate,
-                    currency = curr.currency,
-                    standardSpending = curr.standardSpendingAmount,
-                    priorAbsences = curr.priorAbsenceCount,
-                    priorSpendings = curr.priorSpendingsAmount,
-                    priorDraws = curr.priorDrawsAmount,
-                    dailyReminderEnabled = dailyReminderEnabled,
-                    dailyReminderHour = dailyReminderHour,
-                    dailyReminderMinute = dailyReminderMinute,
-                    employeeName = curr.employeeName,
-                    voiceEnabled = voiceEnabled,
-                    openingBalance = curr.openingBalance,
-                    securityEnabled = securityEnabled,
-                    securityPin = securityPin,
-                    biometricEnabled = biometricEnabled,
-                    autoAddDailySpending = curr.autoAddDailySpending,
-                    isSpendingDeductedFromSalary = curr.isSpendingDeductedFromSalary,
-                    themeMode = themeMode,
-                    appLanguage = appLanguage
-                )
+                AdMobManager.showInterstitial(activity) {
+                    val curr = settingsState ?: SalarySettings()
+                    viewModel.updateSalarySettings(
+                        salary = curr.monthlySalary,
+                        startDate = curr.startWorkDate,
+                        currency = curr.currency,
+                        standardSpending = curr.standardSpendingAmount,
+                        priorAbsences = curr.priorAbsenceCount,
+                        priorSpendings = curr.priorSpendingsAmount,
+                        priorDraws = curr.priorDrawsAmount,
+                        dailyReminderEnabled = dailyReminderEnabled,
+                        dailyReminderHour = dailyReminderHour,
+                        dailyReminderMinute = dailyReminderMinute,
+                        employeeName = curr.employeeName,
+                        voiceEnabled = voiceEnabled,
+                        openingBalance = curr.openingBalance,
+                        securityEnabled = securityEnabled,
+                        securityPin = securityPin,
+                        biometricEnabled = biometricEnabled,
+                        autoAddDailySpending = curr.autoAddDailySpending,
+                        isSpendingDeductedFromSalary = curr.isSpendingDeductedFromSalary,
+                        themeMode = themeMode,
+                        appLanguage = appLanguage
+                    )
+                }
                 showSettingsDialog = false
             }
         )
@@ -689,7 +858,9 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             settings = settingsState ?: SalarySettings(),
             onDismiss = { showAddTxDialog = false },
             onSave = { type, amount, note, timestamp ->
-                viewModel.addTransaction(type, amount, null, note, timestamp)
+                AdMobManager.showInterstitial(activity) {
+                    viewModel.addTransaction(type, amount, null, note, timestamp)
+                }
                 showAddTxDialog = false
             }
         )
@@ -702,7 +873,9 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             currency = settingsState?.currency ?: "ريال يمني",
             onDismiss = { editingTransaction = null },
             onSave = { updatedTx ->
-                viewModel.updateTransaction(updatedTx)
+                AdMobManager.showInterstitial(activity) {
+                    viewModel.updateTransaction(updatedTx)
+                }
             },
             onDelete = { txToDelete ->
                 viewModel.deleteTransaction(txToDelete)
@@ -3975,13 +4148,206 @@ private fun shareReport(context: Context, reportText: String, employeeName: Stri
     context.startActivity(Intent.createChooser(intent, "تصدير التقرير عبر:"))
 }
 
-private fun exportAndShareBackup(context: Context, viewModel: SalaryViewModel, coroutineScope: kotlinx.coroutines.CoroutineScope) {
-    coroutineScope.launch {
+private fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+private fun getSmartWorkerBackupFileName(viewModel: SalaryViewModel): String {
+    val rawAccountName = viewModel.activeUser.value?.takeIf { it.isNotBlank() }
+        ?: viewModel.settings.value?.employeeName?.takeIf { it.isNotBlank() }
+        ?: "حساب_العامل"
+    val cleanAccountName = rawAccountName.trim().replace(" ", "_").replace(Regex("[^a-zA-Z0-9_\u0600-\u06FF]"), "")
+    val timeStamp = SimpleDateFormat("yyyy-MM-dd_HH-mm", Locale.US).format(Date())
+    return "SmartWorker_${cleanAccountName}_$timeStamp.db"
+}
+
+private fun hasStoragePermission(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+}
+
+private fun requestStoragePermission(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         try {
-            val json = viewModel.exportBackupJson()
-            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
-            val cacheFile = File(context.cacheDir, "smart_worker_backup_$timeStamp.json")
-            cacheFile.writeText(json, Charsets.UTF_8)
+            val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                data = android.net.Uri.parse("package:${context.packageName}")
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            try {
+                val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                context.startActivity(intent)
+            } catch (_: Exception) {
+                Toast.makeText(context, "يرجى تفعيل صلاحية إدارة الملفات من إعدادات الهاتف", Toast.LENGTH_LONG).show()
+            }
+        }
+    } else {
+        val activity = context.findActivity()
+        if (activity != null) {
+            androidx.core.app.ActivityCompat.requestPermissions(
+                activity,
+                arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE, android.Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                1001
+            )
+        } else {
+            Toast.makeText(context, "يرجى منح صلاحية الوصول للملفات من إعدادات التطبيق", Toast.LENGTH_LONG).show()
+        }
+    }
+}
+
+private fun saveBackupToSmartWorkerFolder(context: Context, viewModel: SalaryViewModel): Pair<Boolean, String> {
+    try {
+        AppDatabase.checkpointDatabase(context)
+        val dbFile = context.getDatabasePath("salary_friend_database")
+        if (!dbFile.exists()) {
+            return Pair(false, "❌ لم يتم العثور على ملف قاعدة البيانات")
+        }
+        val backupFileName = getSmartWorkerBackupFileName(viewModel)
+        var saved = false
+
+        try {
+            val docsDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "SmartWorker")
+            if (!docsDir.exists()) docsDir.mkdirs()
+            val targetDocsFile = File(docsDir, backupFileName)
+            FileInputStream(dbFile).use { input ->
+                FileOutputStream(targetDocsFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            saved = targetDocsFile.exists()
+        } catch (e: Exception) {
+            Log.e("BackupSave", "Direct file save failed", e)
+        }
+
+        if (!saved && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val resolver = context.contentResolver
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, backupFileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/SmartWorker")
+                }
+                val uri = resolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { out ->
+                        FileInputStream(dbFile).use { `in` -> `in`.copyTo(out) }
+                    }
+                    saved = true
+                }
+            } catch (_: Exception) {}
+        }
+
+        if (saved) {
+            return Pair(
+                true,
+                "✅ تم حفظ النسخة الاحتياطية بنجاح في مجلد (SmartWorker) داخل المستندات باسم:\n\n$backupFileName\n\n💡 ملاحظة: تم إنشاء ملف واحد فقط في المستندات لتجنب التكرار."
+            )
+        } else {
+            return Pair(false, "❌ تعذر حفظ النسخة في ذاكرة الهاتف. يرجى التحقق من أذونات التخزين (اضغط على زر تفعيل أذونات الملفات) أو استخدم زر المشاركة.")
+        }
+    } catch (e: Exception) {
+        Log.e("BackupSave", "Error in saveBackupToSmartWorkerFolder", e)
+        return Pair(false, "❌ حدث خطأ أثناء حفظ النسخة الاحتياطية: ${e.localizedMessage}")
+    }
+}
+
+private fun listSavedBackupFiles(): List<File> {
+    val files = mutableMapOf<String, File>()
+    try {
+        val dirs = listOf(
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "SmartWorker"),
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "SmartWorker")
+        )
+        for (dir in dirs) {
+            if (dir.exists() && dir.isDirectory) {
+                dir.listFiles { file -> file.isFile && file.name.endsWith(".db", ignoreCase = true) }?.forEach {
+                    if (!files.containsKey(it.name) || (it.lastModified() > (files[it.name]?.lastModified() ?: 0L))) {
+                        files[it.name] = it
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) {
+        Log.e("BackupList", "Error listing backup files", e)
+    }
+    return files.values.sortedByDescending { it.lastModified() }
+}
+
+private fun launchUniversalFilePicker(context: Context, launcher: androidx.activity.result.ActivityResultLauncher<Intent>, onFail: (String) -> Unit) {
+    val intentsToTry = listOf(
+        Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("*/*", "application/octet-stream", "application/x-sqlite3", "application/vnd.sqlite3", "application/sql", "application/database"))
+        },
+        Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        },
+        Intent("com.sec.android.app.myfiles.PICK_DATA").apply {
+            putExtra("CONTENT_TYPE", "*/*")
+            addCategory(Intent.CATEGORY_DEFAULT)
+        },
+        Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            type = "*/*"
+        },
+        Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "*/*"
+        }
+    )
+
+    for (intent in intentsToTry) {
+        try {
+            launcher.launch(intent)
+            return
+        } catch (e: Exception) {
+            Log.w("BackupPicker", "Intent launch failed: ${intent.action}", e)
+        }
+    }
+
+    try {
+        val chooser = Intent.createChooser(Intent(Intent.ACTION_GET_CONTENT).apply { type = "*/*" }, "اختر ملف النسخة الاحتياطية")
+        launcher.launch(chooser)
+        return
+    } catch (e: Exception) {
+        Log.e("BackupPicker", "Chooser failed", e)
+    }
+
+    onFail("⚠️ تعذر فتح متصفح ملفات النظام في هاتفك. لا تقلق! يرجى استخدام (مستكشف الملفات الداخلي) بالضغط على الزر الأزرق في النافذة لتصفح جميع مجلدات هاتفك مباشرة واختيار نسختك بسهولة.")
+}
+
+private fun exportAndShareBackup(
+    context: Context,
+    viewModel: SalaryViewModel,
+    coroutineScope: kotlinx.coroutines.CoroutineScope,
+    onResult: (Boolean, String) -> Unit = { _, _ -> }
+) {
+    coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+            AppDatabase.checkpointDatabase(context)
+            val dbFile = context.getDatabasePath("salary_friend_database")
+            if (!dbFile.exists()) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    val msg = "❌ لم يتم العثور على ملف قاعدة البيانات"
+                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                    onResult(false, msg)
+                }
+                return@launch
+            }
+
+            val backupFileName = getSmartWorkerBackupFileName(viewModel)
+            val cacheFile = File(context.cacheDir, backupFileName)
+            
+            FileInputStream(dbFile).use { input ->
+                FileOutputStream(cacheFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
 
             val uri = androidx.core.content.FileProvider.getUriForFile(
                 context,
@@ -3990,24 +4356,24 @@ private fun exportAndShareBackup(context: Context, viewModel: SalaryViewModel, c
             )
 
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "application/json"
+                type = "application/octet-stream"
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_SUBJECT, "النسخة الاحتياطية - تطبيق حساب العامل الذكي")
-                putExtra(Intent.EXTRA_TEXT, "ملف النسخة الاحتياطية لتطبيق حساب العامل الذكي ($timeStamp)")
+                putExtra(Intent.EXTRA_SUBJECT, "النسخة الاحتياطية لقاعدة البيانات (.db) - تطبيق حساب العامل الذكي")
+                putExtra(Intent.EXTRA_TEXT, "ملف النسخة الاحتياطية لقاعدة البيانات ($backupFileName). يمكنك استعادته مباشرة من داخل التطبيق.")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            context.startActivity(Intent.createChooser(shareIntent, "تصدير أو مشاركة النسخة الاحتياطية:"))
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                val msg = "✅ تم تجهيز ملف قاعدة البيانات (.db) للتصدير والمشاركة بنجاح!"
+                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                onResult(true, msg)
+                context.startActivity(Intent.createChooser(shareIntent, "تصدير أو مشاركة ملف قاعدة البيانات (.db):"))
+            }
         } catch (e: Exception) {
-            try {
-                val json = viewModel.exportBackupJson()
-                val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_SUBJECT, "النسخة الاحتياطية - تطبيق حساب العامل الذكي")
-                    putExtra(Intent.EXTRA_TEXT, json)
-                }
-                context.startActivity(Intent.createChooser(shareIntent, "مشاركة بيانات النسخة الاحتياطية:"))
-            } catch (ex: Exception) {
-                Toast.makeText(context, "❌ حدث خطأ أثناء تصدير النسخة الاحتياطية", Toast.LENGTH_LONG).show()
+            Log.e("Backup", "Error exporting db", e)
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                val msg = "❌ حدث خطأ أثناء تصدير ملف قاعدة البيانات"
+                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                onResult(false, msg)
             }
         }
     }
@@ -4053,70 +4419,81 @@ fun MainMenuDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = if (isVisible) 0.5f else 0.0f))
+                .background(Color.Black.copy(alpha = if (isVisible) 0.55f else 0.0f))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
-                ) { dismissWithAnimation() }
+                ) { dismissWithAnimation() },
+            contentAlignment = Alignment.BottomCenter
         ) {
             AnimatedVisibility(
                 visible = isVisible,
-                enter = slideInHorizontally(
+                enter = slideInVertically(
                     animationSpec = tween(durationMillis = 350, easing = FastOutSlowInEasing),
-                    initialOffsetX = { -it }
+                    initialOffsetY = { it }
                 ) + fadeIn(animationSpec = tween(350)),
-                exit = slideOutHorizontally(
+                exit = slideOutVertically(
                     animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing),
-                    targetOffsetX = { -it }
+                    targetOffsetY = { it }
                 ) + fadeOut(animationSpec = tween(280)),
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .fillMaxHeight()
-                    .widthIn(max = 330.dp)
+                    .fillMaxWidth()
+                    .widthIn(max = 600.dp)
             ) {
                 Surface(
                     modifier = Modifier
-                        .fillMaxHeight()
                         .fillMaxWidth()
                         .clickable(enabled = false) {},
                     color = LocalAppColors.current.surface,
-                    shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp),
+                    shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
                     tonalElevation = 8.dp,
-                    shadowElevation = 16.dp
+                    shadowElevation = 24.dp
                 ) {
                     Column(
                         modifier = Modifier
-                            .fillMaxSize()
+                            .fillMaxWidth()
                             .verticalScroll(rememberScrollState())
-                            .padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        Spacer(modifier = Modifier.height(12.dp))
+                        // Drag Handle Pill
+                        Box(
+                            modifier = Modifier
+                                .width(44.dp)
+                                .height(5.dp)
+                                .background(LocalAppColors.current.border.copy(alpha = 0.8f), CircleShape)
+                        )
 
-                        // Drawer Header
+                        // Sheet Header
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .size(42.dp)
-                                        .background(EmeraldGreen.copy(alpha = 0.15f), shape = CircleShape),
+                                        .size(46.dp)
+                                        .background(
+                                            Brush.linearGradient(
+                                                colors = listOf(EmeraldGreen.copy(alpha = 0.2f), EarnedBlue.copy(alpha = 0.2f))
+                                            ),
+                                            shape = RoundedCornerShape(14.dp)
+                                        ),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.AccountBalanceWallet,
                                         contentDescription = null,
                                         tint = EmeraldGreen,
-                                        modifier = Modifier.size(24.dp)
+                                        modifier = Modifier.size(26.dp)
                                     )
                                 }
-                                Column {
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     Text(
                                         text = "القائمة الرئيسية",
                                         style = MaterialTheme.typography.titleMedium,
@@ -4124,7 +4501,7 @@ fun MainMenuDialog(
                                         color = LocalAppColors.current.text
                                     )
                                     Text(
-                                        text = "حساب العامل الذكي",
+                                        text = "إدارة إعدادات وتفضيلات الحساب",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = LocalAppColors.current.textMuted
                                     )
@@ -4133,74 +4510,90 @@ fun MainMenuDialog(
 
                             IconButton(
                                 onClick = { dismissWithAnimation() },
-                                modifier = Modifier
-                                    .size(34.dp)
-                                    .background(LocalAppColors.current.text.copy(alpha = 0.08f), CircleShape)
+                                modifier = Modifier.size(36.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Close,
                                     contentDescription = "إغلاق",
-                                    tint = LocalAppColors.current.text,
-                                    modifier = Modifier.size(18.dp)
+                                    tint = LocalAppColors.current.textSub,
+                                    modifier = Modifier.size(22.dp)
                                 )
                             }
                         }
 
-                        HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+                        HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.6f), thickness = 1.dp)
 
-                        // Menu Options
-                        MenuOptionCard(
-                            title = "⚙️ إعدادات التطبيق",
-                            icon = Icons.Default.Settings,
-                            color = EmeraldGreen,
-                            onClick = { dismissWithAnimation(); onOpenAppSettings() }
-                        )
+                        // Section 1: Settings & Customization
+                        MenuSectionGroup(title = "إعدادات التطبيق والحساب") {
+                            MenuOptionCard(
+                                title = "إعدادات التطبيق",
+                                subtitle = "الأمان، العملة، والإشعارات التلقائية",
+                                icon = Icons.Default.Settings,
+                                color = EmeraldGreen,
+                                onClick = { dismissWithAnimation(); onOpenAppSettings() }
+                            )
+                            HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
+                            MenuOptionCard(
+                                title = "إعدادات المستخدم",
+                                subtitle = "بيانات العامل، الراتب الشهري، وساعات العمل",
+                                icon = Icons.Default.Person,
+                                color = EarnedBlue,
+                                onClick = { dismissWithAnimation(); onOpenUserSettings() }
+                            )
+                        }
 
-                        MenuOptionCard(
-                            title = "👤 إعدادات المستخدم",
-                            icon = Icons.Default.Person,
-                            color = EarnedBlue,
-                            onClick = { dismissWithAnimation(); onOpenUserSettings() }
-                        )
+                        // Section 2: Data & Updates
+                        MenuSectionGroup(title = "البيانات والتحديثات") {
+                            MenuOptionCard(
+                                title = "النسخ الاحتياطي والاستعادة",
+                                subtitle = "حفظ واسترجاع ملف قاعدة البيانات بأمان",
+                                icon = Icons.Default.Share,
+                                color = Color(0xFF8E24AA),
+                                onClick = { dismissWithAnimation(); onOpenBackup() }
+                            )
+                            HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
+                            MenuOptionCard(
+                                title = "تحديثات التطبيق",
+                                subtitle = "التحقق من أحدث الإصدارات والمميزات الجديدة",
+                                icon = Icons.Default.Refresh,
+                                color = Color(0xFF00ACC1),
+                                onClick = { dismissWithAnimation(); onCheckUpdate() }
+                            )
+                        }
 
-                        MenuOptionCard(
-                            title = "💾 النسخ الاحتياطي والاستعادة",
-                            icon = Icons.Default.Share,
-                            color = Color(0xFF8E24AA),
-                            onClick = { dismissWithAnimation(); onOpenBackup() }
-                        )
+                        // Section 3: Help & About
+                        MenuSectionGroup(title = "المساعدة والمعلومات") {
+                            MenuOptionCard(
+                                title = "لمحة ودليل الاستخدام",
+                                subtitle = "شرح طريقة عمل الحسابات والتقارير المالية",
+                                icon = Icons.Default.Book,
+                                color = Color(0xFFFF9800),
+                                onClick = { dismissWithAnimation(); onOpenGuide() }
+                            )
+                            HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
+                            MenuOptionCard(
+                                title = "معلومات المطور",
+                                subtitle = "تواصل مع مبرمج ومطور التطبيق للدعم والمقترحات",
+                                icon = Icons.Default.Info,
+                                color = AmberOrange,
+                                onClick = { dismissWithAnimation(); onOpenDeveloperInfo() }
+                            )
+                        }
 
-                        MenuOptionCard(
-                            title = "🔄 تحديثات التطبيق",
-                            icon = Icons.Default.Refresh,
-                            color = Color(0xFF00ACC1),
-                            onClick = { dismissWithAnimation(); onCheckUpdate() }
-                        )
-
-                        MenuOptionCard(
-                            title = "📖 لمحة ودليل الاستخدام",
-                            icon = Icons.Default.Book,
-                            color = Color(0xFFFF9800),
-                            onClick = { dismissWithAnimation(); onOpenGuide() }
-                        )
-
-                        MenuOptionCard(
-                            title = "ℹ️ معلومات المطور",
-                            icon = Icons.Default.Info,
-                            color = AmberOrange,
-                            onClick = { dismissWithAnimation(); onOpenDeveloperInfo() }
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
 
                         Button(
                             onClick = { dismissWithAnimation() },
-                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
+                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border.copy(alpha = 0.6f)),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
                         ) {
-                            Text(strings.cancelBtn, color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                            Text(strings.cancelBtn, color = LocalAppColors.current.text, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
                         }
+
+                        Spacer(modifier = Modifier.height(8.dp))
                     }
                 }
             }
@@ -4212,125 +4605,390 @@ fun MainMenuDialog(
 fun BackupDialog(
     appLanguage: String = "ar",
     onDismiss: () -> Unit,
-    onExportBackup: () -> Unit,
-    onRestoreBackup: () -> Unit,
-    onRestoreFromText: (String) -> Unit
+    onSaveToPhone: () -> Unit,
+    onShareBackup: () -> Unit,
+    onRestoreFromFile: (File) -> Unit,
+    onBrowseExternalFile: () -> Unit
 ) {
     val appLang = AppLanguage.fromCode(appLanguage)
     val strings = LanguageStrings(appLang)
-    var showPasteMode by remember { mutableStateOf(false) }
-    var pastedText by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    var confirmRestoreFile by remember { mutableStateOf<File?>(null) }
+    var hasPermission by remember { mutableStateOf(hasStoragePermission(context)) }
+    var showInternalExplorer by remember { mutableStateOf(false) }
+    var currentBrowseDir by remember { mutableStateOf(Environment.getExternalStorageDirectory()) }
+    var currentDirFolders by remember { mutableStateOf<List<File>>(emptyList()) }
+    var currentDirFiles by remember { mutableStateOf<List<File>>(emptyList()) }
+
+    LaunchedEffect(currentBrowseDir, showInternalExplorer, hasPermission) {
+        if (showInternalExplorer) {
+            try {
+                val all = currentBrowseDir.listFiles() ?: emptyArray()
+                currentDirFolders = all.filter { it.isDirectory && !it.name.startsWith(".") }.sortedBy { it.name.lowercase() }
+                currentDirFiles = all.filter { 
+                    it.isFile && !it.name.startsWith(".") && (it.name.endsWith(".db", ignoreCase = true) || it.name.endsWith(".sqlite", ignoreCase = true) || it.name.endsWith(".db3", ignoreCase = true) || it.name.endsWith(".sqlite3", ignoreCase = true))
+                }.sortedByDescending { it.lastModified() }
+            } catch (e: Exception) {
+                currentDirFolders = emptyList()
+                currentDirFiles = emptyList()
+            }
+        }
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(8.dp),
+                .padding(4.dp)
+                .heightIn(max = 660.dp),
             colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
             shape = RoundedCornerShape(24.dp),
             border = BorderStroke(1.dp, LocalAppColors.current.border)
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+            if (showInternalExplorer) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                        .height(600.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Icon(
-                        imageVector = if (showPasteMode) Icons.Default.Edit else Icons.Default.Share,
-                        contentDescription = null,
-                        tint = Color(0xFF8E24AA),
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Text(
-                        text = if (showPasteMode) strings.pasteBackupTitle else strings.backupRestoreSection,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = LocalAppColors.current.text
-                    )
-                }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            IconButton(onClick = { showInternalExplorer = false }) {
+                                Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "رجوع", tint = LocalAppColors.current.text)
+                            }
+                            Text("📂 مستكشف ملفات الهاتف", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = LocalAppColors.current.text)
+                        }
+                        if (!hasPermission) {
+                            TextButton(onClick = { requestStoragePermission(context); hasPermission = hasStoragePermission(context) }) {
+                                Text("🔑 تفعيل الأذونات", color = AmberOrange, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
 
-                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+                    if (!hasPermission) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = AmberOrange.copy(alpha = 0.15f)),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, AmberOrange),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("⚠️ لتصفح مجلداتك (مثل WhatsApp والمستندات) بحرية، يرجى تفعيل الصلاحية:", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.text, textAlign = TextAlign.Center)
+                                Button(
+                                    onClick = { requestStoragePermission(context); hasPermission = hasStoragePermission(context) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AmberOrange),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text("🔑 منح صلاحية إدارة الملفات", color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
+                    }
 
-                if (showPasteMode) {
-                    Text(
-                        text = strings.pasteBackupHint,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LocalAppColors.current.textSub,
-                        textAlign = TextAlign.Center
-                    )
-
-                    OutlinedTextField(
-                        value = pastedText,
-                        onValueChange = { pastedText = it },
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(150.dp),
-                        placeholder = { Text(strings.pasteBackupHint, color = LocalAppColors.current.textSub, style = MaterialTheme.typography.bodySmall) },
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EarnedBlue,
-                            unfocusedBorderColor = LocalAppColors.current.border,
-                            focusedTextColor = LocalAppColors.current.text,
-                            unfocusedTextColor = LocalAppColors.current.text
-                        )
-                    )
-
-                    Button(
-                        onClick = {
-                            if (pastedText.isNotBlank()) {
-                                onDismiss()
-                                onRestoreFromText(pastedText)
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
-                        shape = RoundedCornerShape(12.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = strings.confirmRestoreBtn,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
+                        Button(
+                            onClick = { currentBrowseDir = Environment.getExternalStorageDirectory() },
+                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border.copy(alpha = 0.5f)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("🏠 الذاكرة الرئيسية", color = LocalAppColors.current.text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                        }
+                        Button(
+                            onClick = {
+                                val d = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "")
+                                if (d.exists()) currentBrowseDir = d else Toast.makeText(context, "المجلد غير موجود", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border.copy(alpha = 0.5f)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("📁 المستندات", color = LocalAppColors.current.text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                        }
+                        Button(
+                            onClick = {
+                                val d = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "")
+                                if (d.exists()) currentBrowseDir = d else Toast.makeText(context, "المجلد غير موجود", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border.copy(alpha = 0.5f)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("📥 التنزيلات", color = LocalAppColors.current.text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                        }
+                        Button(
+                            onClick = {
+                                val wa1 = File(Environment.getExternalStorageDirectory(), "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents")
+                                val wa2 = File(Environment.getExternalStorageDirectory(), "WhatsApp/Media/WhatsApp Documents")
+                                val wa3 = File(Environment.getExternalStorageDirectory(), "Android/media/com.whatsapp/WhatsApp/Media")
+                                val waTarget = when {
+                                    wa1.exists() -> wa1
+                                    wa2.exists() -> wa2
+                                    wa3.exists() -> wa3
+                                    else -> File(Environment.getExternalStorageDirectory(), "Android/media/com.whatsapp")
+                                }
+                                if (waTarget.exists()) currentBrowseDir = waTarget else Toast.makeText(context, "مجلد واتساب غير موجود في هذا المسار", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366).copy(alpha = 0.2f)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("💬 واتساب (WhatsApp)", color = Color(0xFF1B5E20), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
 
-                    Button(
-                        onClick = { showPasteMode = false },
-                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
-                        shape = RoundedCornerShape(12.dp),
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                        shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "📍 ${currentBrowseDir.absolutePath.replace("/storage/emulated/0", "الذاكرة الداخلية")}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.text,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (currentBrowseDir != Environment.getExternalStorageDirectory() && currentBrowseDir.parentFile != null) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Button(
+                                    onClick = { currentBrowseDir = currentBrowseDir.parentFile!! },
+                                    colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text("⬆️ للأعلى", color = Color.White, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
                     }
-                } else {
+
+                    if (currentDirFolders.isEmpty() && currentDirFiles.isEmpty()) {
+                        Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                            Text(
+                                text = if (!hasPermission) "⚠️ لا يمكن عرض المحتوى بسبب عدم تفعيل أذونات الوصول للملفات. اضغط على زر (منح صلاحية إدارة الملفات) بالأعلى." else "📭 لا توجد مجلدات أو ملفات نسخ احتياطية (.db) في هذا المسار",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = LocalAppColors.current.textSub,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(20.dp)
+                            )
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            items(currentDirFolders.size) { idx ->
+                                val folder = currentDirFolders[idx]
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(0.5.dp, LocalAppColors.current.border),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { currentBrowseDir = folder }
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Text("📁", style = MaterialTheme.typography.titleMedium)
+                                        Text(
+                                            text = folder.name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = LocalAppColors.current.text,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+
+                            items(currentDirFiles.size) { idx ->
+                                val file = currentDirFiles[idx]
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = EmeraldGreen.copy(alpha = 0.1f)),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, EmeraldGreen),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { confirmRestoreFile = file }
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("💾", style = MaterialTheme.typography.titleMedium)
+                                            Column {
+                                                Text(
+                                                    text = file.name,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = EmeraldGreen,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                val dateStr = SimpleDateFormat("yyyy/MM/dd - hh:mm a", Locale("ar")).format(Date(file.lastModified()))
+                                                val sizeKb = file.length() / 1024
+                                                Text(
+                                                    text = "$dateStr (${sizeKb} KB)",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = LocalAppColors.current.textSub
+                                                )
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Button(
+                                            onClick = { confirmRestoreFile = file },
+                                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                                            shape = RoundedCornerShape(8.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                        ) {
+                                            Text("استعادة", color = Color.White, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Button(
+                        onClick = { showInternalExplorer = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("الرجوع للقائمة السابقة", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(18.dp)
+                        .verticalScroll(rememberScrollState()),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = null,
+                            tint = Color(0xFF8E24AA),
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Text(
+                            text = "إدارة النسخ الاحتياطية (.db)",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = LocalAppColors.current.text
+                        )
+                    }
+
+                    if (!hasPermission) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = AmberOrange.copy(alpha = 0.15f)),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, AmberOrange),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(14.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = "⚠️ أذونات الوصول لملفات ومجلدات الهاتف غير مفعلة",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = AmberOrange
+                                )
+                                Text(
+                                    text = "لتجنب مشاكل المتصفح الخارجي ولتمكين التطبيق من تصفح مجلداتك (مثل المستندات و WhatsApp) وحفظ واستعادة النسخ بحرية، يرجى منح الصلاحية:",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = LocalAppColors.current.text,
+                                    textAlign = TextAlign.Center
+                                )
+                                Button(
+                                    onClick = {
+                                        requestStoragePermission(context)
+                                        hasPermission = hasStoragePermission(context)
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AmberOrange),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("🔑 تفعيل صلاحية إدارة الملفات في الإعدادات", color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.5f), thickness = 1.dp)
+
                     Text(
-                        text = strings.backupDescription,
+                        text = "📥 إنشاء ومشاركة نسخة احتياطية (.db)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = EmeraldGreen,
+                        modifier = Modifier.align(Alignment.Start)
+                    )
+                    Text(
+                        text = "يتم حفظ النسخة مباشرة في ذاكرة الهاتف في مجلد (SmartWorker) بتسمية ذكية تحتوي على اسم الحساب والتاريخ والوقت.",
                         style = MaterialTheme.typography.bodySmall,
                         color = LocalAppColors.current.textSub,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Start,
+                        modifier = Modifier.fillMaxWidth()
                     )
 
                     Button(
                         onClick = {
-                            onDismiss()
-                            onExportBackup()
+                            onSaveToPhone()
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                        Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = strings.createBackupBtn,
+                            text = "نسخة احتياطية في الجوال",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
@@ -4339,48 +4997,151 @@ fun BackupDialog(
 
                     Button(
                         onClick = {
-                            onDismiss()
-                            onRestoreBackup()
+                            onShareBackup()
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E24AA)),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
+                        Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = strings.restoreBackupBtn,
+                            text = "مشاركة النسخة الاحتياطية",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
                         )
                     }
 
-                    OutlinedButton(
-                        onClick = { showPasteMode = true },
+                    HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.5f), thickness = 1.dp)
+
+                    Text(
+                        text = "🔄 استعادة البيانات من نسخة محفوظة",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF1565C0),
+                        modifier = Modifier.align(Alignment.Start)
+                    )
+
+                    Button(
+                        onClick = {
+                            if (!hasPermission) {
+                                requestStoragePermission(context)
+                            }
+                            showInternalExplorer = true
+                        },
                         modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF8E24AA)),
-                        border = BorderStroke(1.5.dp, Color(0xFF8E24AA)),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color(0xFF8E24AA))
+                        Icon(imageVector = Icons.Default.Search, contentDescription = null, modifier = Modifier.size(20.dp), tint = Color.White)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = strings.restoreByPasteBtn,
+                            text = "استرجاع النسخة الاحتياطية من الهاتف",
                             style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(2.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            onDismiss()
+                            onBrowseExternalFile()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color(0xFFE65100))
+                    ) {
+                        Icon(imageVector = Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color(0xFFE65100))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "استرجاع عبر متصفح الملفات الخارجي (ملفاتي)",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFE65100)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
 
                     Button(
                         onClick = onDismiss,
-                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border.copy(alpha = 0.4f)),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(strings.cancelBtn, color = LocalAppColors.current.text)
+                        Text(strings.cancelBtn, color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
                     }
                 }
+            }
+        }
+    }
+
+    if (confirmRestoreFile != null) {
+        AlertDialog(
+            onDismissRequest = { confirmRestoreFile = null },
+            icon = { Icon(imageVector = Icons.Default.Info, contentDescription = null, tint = AmberOrange, modifier = Modifier.size(36.dp)) },
+            title = { Text("تأكيد استعادة النسخة الاحتياطية", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = LocalAppColors.current.text) },
+            text = {
+                Text(
+                    "هل أنت متأكد من رغبتك في استعادة البيانات من الملف:\n\n(${confirmRestoreFile!!.name})؟\n\nسيتم استبدال البيانات الحالية ببيانات هذه النسخة وإعادة تشغيل التطبيق.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalAppColors.current.textSub,
+                    textAlign = TextAlign.Center
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val target = confirmRestoreFile!!
+                        confirmRestoreFile = null
+                        onDismiss()
+                        onRestoreFromFile(target)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = EarnedBlue),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("نعم، استعادة الآن", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRestoreFile = null }) {
+                    Text("إلغاء", color = LocalAppColors.current.textSub)
+                }
+            },
+            containerColor = LocalAppColors.current.surface,
+            shape = RoundedCornerShape(20.dp)
+        )
+    }
+}
+
+@Composable
+fun MenuSectionGroup(
+    title: String,
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+            color = LocalAppColors.current.textSub,
+            modifier = Modifier.padding(start = 6.dp, end = 6.dp)
+        )
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg.copy(alpha = 0.7f)),
+            shape = RoundedCornerShape(18.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border.copy(alpha = 0.6f))
+        ) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                content()
             }
         }
     }
@@ -4394,62 +5155,54 @@ fun MenuOptionCard(
     color: Color,
     onClick: () -> Unit
 ) {
-    Card(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() },
-        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
-        shape = RoundedCornerShape(16.dp),
-        border = BorderStroke(1.dp, color.copy(alpha = 0.3f))
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Row(
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                .size(42.dp)
+                .background(color.copy(alpha = 0.15f), shape = RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .size(42.dp)
-                    .background(color.copy(alpha = 0.15f), shape = CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = color,
-                    modifier = Modifier.size(22.dp)
-                )
-            }
-
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-                horizontalAlignment = Alignment.Start
-            ) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = LocalAppColors.current.text
-                )
-                if (!subtitle.isNullOrBlank()) {
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LocalAppColors.current.textSub
-                    )
-                }
-            }
-
             Icon(
-                imageVector = Icons.Default.KeyboardArrowLeft,
+                imageVector = icon,
                 contentDescription = null,
-                tint = LocalAppColors.current.textMuted,
-                modifier = Modifier.size(20.dp)
+                tint = color,
+                modifier = Modifier.size(22.dp)
             )
         }
+
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+            horizontalAlignment = Alignment.Start
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = LocalAppColors.current.text
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.textMuted
+                )
+            }
+        }
+
+        Icon(
+            imageVector = Icons.Default.KeyboardArrowLeft,
+            contentDescription = null,
+            tint = LocalAppColors.current.textMuted.copy(alpha = 0.7f),
+            modifier = Modifier.size(20.dp)
+        )
     }
 }
 
@@ -4588,7 +5341,18 @@ fun AppUpdateDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
-    Dialog(onDismissRequest = onDismiss) {
+    val isMandatoryUpdate = updateInfoState.hasUpdate && updateInfoState.isMandatory
+    Dialog(
+        onDismissRequest = {
+            if (!isMandatoryUpdate) {
+                onDismiss()
+            }
+        },
+        properties = DialogProperties(
+            dismissOnBackPress = !isMandatoryUpdate,
+            dismissOnClickOutside = !isMandatoryUpdate
+        )
+    ) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -4626,10 +5390,10 @@ fun AppUpdateDialog(
 
                 if (updateInfoState.hasUpdate) {
                     Text(
-                        text = "📢 يتوفر تحديث جديد للتطبيق!",
+                        text = if (isMandatoryUpdate) "🚨 تحديث إجباري ضروري!" else "📢 يتوفر تحديث جديد للتطبيق!",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
-                        color = EmeraldGreen
+                        color = if (isMandatoryUpdate) CrimsonRed else EmeraldGreen
                     )
                     Text(
                         text = "الإصدار المتاح: ${updateInfoState.versionName}",
@@ -4653,10 +5417,12 @@ fun AppUpdateDialog(
                             } catch (e: Exception) {
                                 Toast.makeText(context, "تعذر فتح رابط التحميل", Toast.LENGTH_SHORT).show()
                             }
-                            onDismiss()
+                            if (!isMandatoryUpdate) {
+                                onDismiss()
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (isMandatoryUpdate) CrimsonRed else EmeraldGreen),
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Text("تحميل التحديث الجديد", color = Color.White, fontWeight = FontWeight.Bold)
@@ -4681,7 +5447,7 @@ fun AppUpdateDialog(
                                 textAlign = TextAlign.Center
                             )
                             Text(
-                                text = "لا توجد تحديثات جديدة متاحة حالياً.\nإصدارك الحالي: v1.0.0",
+                                text = "لا توجد تحديثات جديدة متاحة حالياً.\nإصدارك الحالي: v1.3.0",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = LocalAppColors.current.textSub,
                                 textAlign = TextAlign.Center
@@ -4701,13 +5467,24 @@ fun AppUpdateDialog(
                     }
                 }
 
-                Button(
-                    onClick = onDismiss,
-                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                if (!isMandatoryUpdate) {
+                    Button(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    Text(
+                        text = "⚠️ هذا التحديث إجباري ولا يمكن استخدام التطبيق حتى يتم التحديث.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CrimsonRed,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
                 }
             }
         }
@@ -4771,7 +5548,7 @@ fun DeveloperInfoDialog(
                         horizontalAlignment = Alignment.Start
                     ) {
                         Text(
-                            text = "📱 تطبيق حساب العامل الذكي v1.0",
+                            text = "📱 تطبيق حساب العامل الذكي v1.3.0",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = EmeraldGreen

@@ -278,17 +278,17 @@ class LanguageStrings(val lang: AppLanguage) {
     }
 
     val createBackupBtn: String = when (lang) {
-        AppLanguage.ARABIC -> "إنشاء نسخة احتياطية (تصدير)"
-        AppLanguage.ENGLISH -> "Create Backup (Export)"
-        AppLanguage.FRENCH -> "Créer une sauvegarde (Exporter)"
-        AppLanguage.URDU -> "بیک اپ بنائیں (ایکسپورٹ)"
+        AppLanguage.ARABIC -> "حفظ نسخة من قاعدة البيانات (.db)"
+        AppLanguage.ENGLISH -> "Backup Database File (.db)"
+        AppLanguage.FRENCH -> "Sauvegarder la base de données (.db)"
+        AppLanguage.URDU -> "ڈیٹا بیس فائل کا بیک اپ لیں (.db)"
     }
 
     val restoreBackupBtn: String = when (lang) {
-        AppLanguage.ARABIC -> "استعادة نسخة احتياطية (استيراد)"
-        AppLanguage.ENGLISH -> "Restore Backup (Import)"
-        AppLanguage.FRENCH -> "Restaurer une sauvegarde (Importer)"
-        AppLanguage.URDU -> "بیک اپ بحال کریں (امپورٹ)"
+        AppLanguage.ARABIC -> "استعادة قاعدة البيانات من ملف (.db)"
+        AppLanguage.ENGLISH -> "Restore from Database File (.db)"
+        AppLanguage.FRENCH -> "Restaurer à partir du fichier (.db)"
+        AppLanguage.URDU -> "ڈیٹا بیس فائل (.db) سے بحال کریں"
     }
 
     val restoreByPasteBtn: String = when (lang) {
@@ -320,10 +320,10 @@ class LanguageStrings(val lang: AppLanguage) {
     }
 
     val backupDescription: String = when (lang) {
-        AppLanguage.ARABIC -> "احفظ كافة سجلاتك والراتب والإعدادات في ملف آمن بالجوال لضمان عدم ضياع أي بيانات إذا تم حذف التطبيق."
-        AppLanguage.ENGLISH -> "Save all your logs, salary details, and settings in a secure file on your phone so your data is never lost if the app is deleted."
-        AppLanguage.FRENCH -> "Enregistrez tous vos enregistrements, salaires et paramètres dans un fichier sécurisé sur votre téléphone."
-        AppLanguage.URDU -> "اپنے تمام ریکارڈز، تنخواہ اور سیٹنگز کو اپنے فون میں محفوظ کریں تاکہ ایپ ڈیلیٹ ہونے پر ڈیٹا ضائع نہ ہو۔"
+        AppLanguage.ARABIC -> "يتم حفظ واستعادة ملف قاعدة البيانات (.db) مباشرة لضمان الاحتفاظ بكافة سجلاتك وحسابات الراتب بأمان وبكل بساطة. عند الاستعادة يتم إغلاق الاتصال بالقاعدة مؤقتاً لضمان سلامة التحديث وإعادة التشغيل."
+        AppLanguage.ENGLISH -> "Directly backup and restore your database file (.db). During restore, the connection is temporarily closed to ensure safe replacement and restart."
+        AppLanguage.FRENCH -> "Sauvegardez et restaurez directement le fichier de base de données (.db). Connexion temporairement fermée lors de la restauration."
+        AppLanguage.URDU -> "ڈیٹا بیس فائل (.db) کا براہ راست بیک اپ لیں اور بحال کریں۔ بحالی کے دوران کنکشن عارضی طور پر بند کیا جاتا ہے۔"
     }
 
     val appObjective: String = when (lang) {

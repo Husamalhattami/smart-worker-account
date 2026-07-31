@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.salarycompanion.arifi"
     minSdk = 24
     targetSdk = 35
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 130
+    versionName = "1.3.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -114,6 +114,7 @@ dependencies {
   implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
+  implementation(libs.play.services.ads)
   implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)

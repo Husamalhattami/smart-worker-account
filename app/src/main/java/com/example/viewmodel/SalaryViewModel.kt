@@ -36,7 +36,8 @@ data class UpdateInfo(
     val hasUpdate: Boolean = false,
     val versionName: String = "",
     val changelog: String = "",
-    val updateUrl: String = ""
+    val updateUrl: String = "",
+    val isMandatory: Boolean = false
 )
 
 class SalaryViewModel(application: Application) : AndroidViewModel(application) {
@@ -641,6 +642,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         val versionName = json.optString("versionName", json.optString("version_name", "1.3.0"))
                         val changelog = json.optString("changelog", json.optString("notes", ""))
                         val updateUrl = json.optString("updateUrl", json.optString("download_url", "https://github.com/husamalhattami100"))
+                        val isMandatory = json.optBoolean("isMandatory", json.optBoolean("is_mandatory", json.optBoolean("forceUpdate", json.optBoolean("force_update", false))))
 
                         val hasNewer = isRemoteVersionNewer(versionCode, versionName)
 
@@ -649,7 +651,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                                 hasUpdate = true,
                                 versionName = versionName,
                                 changelog = changelog,
-                                updateUrl = updateUrl
+                                updateUrl = updateUrl,
+                                isMandatory = isMandatory
                             )
                             if (isManual) {
                                 _userNotice.tryEmit("📢 يتوفر تحديث جديد v$versionName!")

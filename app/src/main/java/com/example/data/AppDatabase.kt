@@ -111,5 +111,31 @@ abstract class AppDatabase : RoomDatabase() {
                 instance
             }
         }
+
+        fun closeDatabase() {
+            synchronized(this) {
+                if (INSTANCE?.isOpen == true) {
+                    try {
+                        INSTANCE?.close()
+                    } catch (e: Exception) {
+                        Log.e("AppDatabase", "Error closing database", e)
+                    }
+                }
+                INSTANCE = null
+            }
+        }
+
+        fun checkpointDatabase(context: Context) {
+            try {
+                val db = getDatabase(context)
+                if (db.isOpen) {
+                    db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE)").use { cursor ->
+                        cursor.moveToFirst()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("AppDatabase", "Checkpoint failed or not needed", e)
+            }
+        }
     }
 }

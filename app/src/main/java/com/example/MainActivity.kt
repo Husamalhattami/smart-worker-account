@@ -11,6 +11,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import com.example.ui.SalaryApp
 import com.example.ui.theme.MyApplicationTheme
+import com.example.util.AdMobManager
 import com.example.viewmodel.SalaryViewModel
 
 class MainActivity : FragmentActivity() {
@@ -18,6 +19,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AdMobManager.init(this)
         enableEdgeToEdge()
         setContent {
             val settingsState by viewModel.settings.collectAsState()
