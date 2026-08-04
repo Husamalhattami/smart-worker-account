@@ -61,10 +61,10 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
-        <!-- Google AdMob Application ID (Test ID) -->
+        <!-- Google AdMob Application ID (Production ID) -->
         <meta-data
             android:name="com.google.android.gms.ads.APPLICATION_ID"
-            android:value="ca-app-pub-3940256099942544~3347511713" />
+            android:value="ca-app-pub-1241288532566123~7520011293" />
     </application>
 
 </manifest>

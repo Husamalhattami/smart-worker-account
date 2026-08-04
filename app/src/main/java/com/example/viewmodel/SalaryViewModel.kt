@@ -90,6 +90,10 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     private var temporaryAudioPath: String? = null
 
     init {
+        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet()) ?: emptySet()
+        registeredUsers.value = usersSet.toList().sorted()
+        activeUser.value = sharedPrefs.getString("active_user", null)
+
         // Ensure default settings and currencies exist in the database if empty
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -98,6 +102,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 if (current == null) {
                     repository.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = ""))
                     Log.d("SalaryViewModel", "Initialized default empty salary settings row in database.")
+                } else if (current.employeeName.isNotBlank()) {
+                    loginUser(current.employeeName)
                 }
             } catch (e: Exception) {
                 Log.e("SalaryViewModel", "Error checking/initializing default settings", e)
@@ -285,9 +291,22 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         viewModelScope.launch {
             val current = repository.getSalarySettingsDirect() ?: SalarySettings()
+            
+            // Check if monthly salary rate changed without changing start date
+            var finalOpeningBalance = openingBalance
+            var finalStartDate = startDate
+            
+            if (current.monthlySalary > 0.0 && salary != current.monthlySalary && startDate == current.startWorkDate) {
+                val txList = repository.getAllTransactionsDirect()
+                val oldMetrics = calculateSalaryMetrics(current, txList)
+                // Lock in earned salary under old rate into opening balance
+                finalOpeningBalance += oldMetrics.earnedSalary
+                finalStartDate = System.currentTimeMillis()
+            }
+
             val updated = current.copy(
                 monthlySalary = salary,
-                startWorkDate = startDate,
+                startWorkDate = finalStartDate,
                 currency = currency,
                 standardSpendingAmount = standardSpending,
                 priorAbsenceCount = priorAbsences,
@@ -298,7 +317,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 dailyReminderMinute = dailyReminderMinute,
                 employeeName = employeeName,
                 voiceEnabled = voiceEnabled,
-                openingBalance = openingBalance,
+                openingBalance = finalOpeningBalance,
                 securityEnabled = securityEnabled,
                 securityPin = securityPin,
                 biometricEnabled = biometricEnabled,
@@ -308,6 +327,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 appLanguage = appLanguage
             )
             repository.insertOrUpdateSalarySettings(updated)
+            if (employeeName.isNotBlank()) {
+                loginUser(employeeName)
+            }
             
             // Re-schedule or cancel alarm based on settings change
             if (dailyReminderEnabled) {

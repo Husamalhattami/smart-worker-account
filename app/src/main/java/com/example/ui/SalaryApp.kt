@@ -133,6 +133,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showGuideDialog by remember { mutableStateOf(false) }
     var showAddTxDialog by remember { mutableStateOf(false) }
+    var showPdfOptionsDialog by remember { mutableStateOf(false) }
     var editingTransaction by remember { mutableStateOf<Transaction?>(null) }
     var isAppUnlocked by remember { mutableStateOf(false) }
     var hasRecordPermission by remember {
@@ -408,10 +409,14 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         }
     } else if (settingsState?.employeeName.isNullOrBlank()) {
         WelcomeLoginScreen(
-            registeredUsers = emptyList(),
-            onLogin = {},
+            registeredUsers = registeredUsers,
+            onLogin = { userName ->
+                hasGreeted = false
+                viewModel.loginUser(userName)
+            },
             onRegister = { name, salary, startDate, currency, standardSpending, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, openingBalance ->
                 hasGreeted = false
+                viewModel.loginUser(name)
                 viewModel.updateSalarySettings(
                     salary = salary,
                     startDate = startDate,
@@ -428,7 +433,9 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     openingBalance = openingBalance
                 )
             },
-            onDeleteUser = {}
+            onDeleteUser = { userName ->
+                viewModel.deleteUser(userName)
+            }
         )
     } else if (settingsState?.securityEnabled == true && !isAppUnlocked) {
         AppLockScreen(
@@ -532,7 +539,10 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         ) {
             
             // --- HEADER: Welcome & Date info ---
-            WelcomeSection(settingsState ?: SalarySettings())
+            WelcomeSection(
+                settings = settingsState ?: SalarySettings(),
+                onPrintPdfClick = { showPdfOptionsDialog = true }
+            )
 
             val currentCurrency = (settingsState ?: SalarySettings()).currency
 
@@ -615,18 +625,39 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     shareReport(context, rText, empName)
                 },
                 onPrintClick = {
-                    AdMobManager.showInterstitial(activity) {
-                        val settings = settingsState ?: SalarySettings()
-                        val txList = transactionsState
-                        val metrics = metricsState
-                        PdfPrintHelper.printSalaryReport(context, settings, txList, metrics)
-                    }
+                    showPdfOptionsDialog = true
                 }
             )
 
             Spacer(modifier = Modifier.height(80.dp))
         }
     }
+    }
+
+    // --- PDF OPTIONS DIALOG ---
+    if (showPdfOptionsDialog) {
+        PdfOptionsDialog(
+            settings = settingsState ?: SalarySettings(),
+            onDismiss = { showPdfOptionsDialog = false },
+            onPrint = { startDate, endDate, showSummary, balanceMode ->
+                showPdfOptionsDialog = false
+                AdMobManager.showInterstitial(activity) {
+                    val settings = settingsState ?: SalarySettings()
+                    val txList = transactionsState
+                    val metrics = metricsState
+                    PdfPrintHelper.printSalaryReport(
+                        context = context,
+                        settings = settings,
+                        transactions = txList,
+                        metrics = metrics,
+                        startDateFilter = startDate,
+                        endDateFilter = endDate,
+                        showTotalSummary = showSummary,
+                        balanceDisplayMode = balanceMode
+                    )
+                }
+            }
+        )
     }
 
     // --- MAIN MENU DIALOG ---
@@ -668,6 +699,10 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 AdMobManager.showInterstitial(activity) {
                     showDeveloperInfoDialog = true
                 }
+            },
+            onSwitchWorker = {
+                showMainMenuDialog = false
+                viewModel.logoutUser()
             }
         )
     }
@@ -886,10 +921,14 @@ fun SalaryApp(viewModel: SalaryViewModel) {
 }
 
 @Composable
-fun WelcomeSection(settings: SalarySettings) {
+fun WelcomeSection(
+    settings: SalarySettings,
+    onPrintPdfClick: () -> Unit = {}
+) {
     val sdf = SimpleDateFormat("EEEE, d MMMM yyyy", Locale("ar"))
     val dateString = sdf.format(Date())
-    
+    val empName = if (settings.employeeName.isBlank()) "حسام الحطامي" else settings.employeeName
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
@@ -900,7 +939,7 @@ fun WelcomeSection(settings: SalarySettings) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
+                .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -909,23 +948,47 @@ fun WelcomeSection(settings: SalarySettings) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.CalendarToday,
+                    imageVector = Icons.Default.Person,
                     contentDescription = null,
-                    tint = EmeraldGreen,
-                    modifier = Modifier.size(18.dp)
+                    tint = EarnedBlue,
+                    modifier = Modifier.size(20.dp)
                 )
                 Text(
-                    text = "اليوم:",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = LocalAppColors.current.textMuted,
-                    fontWeight = FontWeight.Bold
+                    text = "العامل: $empName",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text
                 )
+
+                // PDF Print button right next to worker name
+                Button(
+                    onClick = onPrintPdfClick,
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Print,
+                        contentDescription = "طباعة PDF",
+                        tint = Color.White,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "طباعة PDF 🖨️",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
             }
+
             Text(
                 text = dateString,
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.SemiBold,
-                color = LocalAppColors.current.text
+                color = LocalAppColors.current.textSub
             )
         }
     }
@@ -2498,6 +2561,244 @@ fun SettingsDialog(
 }
 
 @Composable
+fun PdfOptionsDialog(
+    settings: SalarySettings,
+    onDismiss: () -> Unit,
+    onPrint: (startDate: Long?, endDate: Long?, showTotalSummary: Boolean, balanceDisplayMode: String) -> Unit
+) {
+    val sdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+
+    var startDateFilter by remember { mutableStateOf<Long?>(settings.startWorkDate) }
+    var endDateFilter by remember { mutableStateOf<Long?>(System.currentTimeMillis()) }
+    var showStartDatePicker by remember { mutableStateOf(false) }
+    var showEndDatePicker by remember { mutableStateOf(false) }
+
+    var showTotalSummary by remember { mutableStateOf(true) }
+    var balanceDisplayMode by remember { mutableStateOf("AFTER_EACH_TX") } // "AFTER_EACH_TX", "END_OF_MONTH", "END_OF_REPORT"
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, LocalAppColors.current.border)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(imageVector = Icons.Default.Print, contentDescription = null, tint = EmeraldGreen)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "خيارات تصدير وطباعة PDF",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // 1. Date Range Options
+                Text(
+                    text = "1. تاريخ الفترة المحددة للكشف:",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Start Date
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("من تاريخ:", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                        OutlinedButton(
+                            onClick = { showStartDatePicker = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                text = startDateFilter?.let { sdf.format(Date(it)) } ?: "البداية",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+                    }
+
+                    // End Date
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("إلى تاريخ:", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                        OutlinedButton(
+                            onClick = { showEndDatePicker = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                text = endDateFilter?.let { sdf.format(Date(it)) } ?: "الان",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+                    }
+                }
+
+                // 2. Show Total Summary Toggle
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 0.5.dp)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = showTotalSummary,
+                        onCheckedChange = { showTotalSummary = it },
+                        colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = EmeraldGreen)
+                    )
+                    Text(
+                        text = "2. إجمالي الكشف (إظهار ملخص الراتب):",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = LocalAppColors.current.text
+                    )
+                }
+
+                // 3. Balance Calculation Mode Selection
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 0.5.dp)
+
+                Text(
+                    text = "3. احتساب وتفصيل الرصيد:",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text
+                )
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { balanceDisplayMode = "AFTER_EACH_TX" }
+                    ) {
+                        RadioButton(
+                            selected = balanceDisplayMode == "AFTER_EACH_TX",
+                            onClick = { balanceDisplayMode = "AFTER_EACH_TX" },
+                            colors = RadioButtonDefaults.colors(selectedColor = EmeraldGreen)
+                        )
+                        Text(
+                            text = "رصيد بعد كل عملية (رصيد متتابع)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = LocalAppColors.current.text
+                        )
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { balanceDisplayMode = "END_OF_MONTH" }
+                    ) {
+                        RadioButton(
+                            selected = balanceDisplayMode == "END_OF_MONTH",
+                            onClick = { balanceDisplayMode = "END_OF_MONTH" },
+                            colors = RadioButtonDefaults.colors(selectedColor = EmeraldGreen)
+                        )
+                        Text(
+                            text = "نهاية كل شهر (ملخص شهري)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = LocalAppColors.current.text
+                        )
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { balanceDisplayMode = "END_OF_REPORT" }
+                    ) {
+                        RadioButton(
+                            selected = balanceDisplayMode == "END_OF_REPORT",
+                            onClick = { balanceDisplayMode = "END_OF_REPORT" },
+                            colors = RadioButtonDefaults.colors(selectedColor = EmeraldGreen)
+                        )
+                        Text(
+                            text = "نهاية الكشف (صافي إجمالي في أسفل التقرير)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = LocalAppColors.current.text
+                        )
+                    }
+                }
+
+                // Dialog Action Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("إلغاء", color = LocalAppColors.current.text)
+                    }
+
+                    Button(
+                        onClick = {
+                            onPrint(startDateFilter, endDateFilter, showTotalSummary, balanceDisplayMode)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        modifier = Modifier.weight(1.5f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Print, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("طباعة الآن 📄", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
+    if (showStartDatePicker) {
+        DatePickerDialogHelper(
+            initialTime = startDateFilter ?: System.currentTimeMillis(),
+            onDismiss = { showStartDatePicker = false },
+            onDateSelected = { date ->
+                startDateFilter = date
+                showStartDatePicker = false
+            }
+        )
+    }
+
+    if (showEndDatePicker) {
+        DatePickerDialogHelper(
+            initialTime = endDateFilter ?: System.currentTimeMillis(),
+            onDismiss = { showEndDatePicker = false },
+            onDateSelected = { date ->
+                endDateFilter = date
+                showEndDatePicker = false
+            }
+        )
+    }
+}
+
+@Composable
 fun UserSettingsDialog(
     currentSettings: SalarySettings,
     currencies: List<CurrencyItem> = emptyList(),
@@ -2591,7 +2892,7 @@ fun UserSettingsDialog(
                     value = salaryInput,
                     onValueChange = { salaryInput = it },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    placeholder = { Text("مثلاً: 150000", color = Color.Gray) },
+                    placeholder = { Text("ادخل الراتب الشهري", color = Color.Gray) },
                     textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
@@ -3848,9 +4149,81 @@ fun WelcomeLoginScreen(
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
-            
+
+            // Multi-Worker Accounts Card (If registered workers exist)
+            if (registeredUsers.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.4f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Group, contentDescription = null, tint = EmeraldGreen)
+                            Text(
+                                text = "حسابات العمال المسجلة (اختر عامل للدخول):",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                        }
+
+                        HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                        registeredUsers.forEach { user ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(LocalAppColors.current.bg, RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Person, contentDescription = null, tint = EarnedBlue)
+                                    Text(
+                                        text = user,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        color = LocalAppColors.current.text
+                                    )
+                                }
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Button(
+                                        onClick = { onLogin(user) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("دخول الحساب", color = Color.White, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                    }
+
+                                    IconButton(onClick = { onDeleteUser(user) }) {
+                                        Icon(imageVector = Icons.Default.Delete, contentDescription = "حذف العامل", tint = CrimsonRed)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Text(
-                text = "الرجاء إدخال اسمك وبياناتك المالية لإعداد حسابك والبدء في تتبع راتبك وصرفياتك بكل سهولة.",
+                text = if (registeredUsers.isEmpty()) "الرجاء إدخال بيانات العامل لإعداد الحساب والبدء." else "أو إضافة حساب عامل جديد:",
                 style = MaterialTheme.typography.bodyMedium,
                 color = LocalAppColors.current.textSub,
                 textAlign = TextAlign.Center,
@@ -3900,7 +4273,7 @@ fun WelcomeLoginScreen(
                     OutlinedTextField(
                         value = salaryInput,
                         onValueChange = { salaryInput = it },
-                        placeholder = { Text("مثلاً: 150000", color = LocalAppColors.current.textMuted) },
+                        placeholder = { Text("ادخل الراتب الشهري", color = LocalAppColors.current.textMuted) },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         singleLine = true,
@@ -4388,7 +4761,8 @@ fun MainMenuDialog(
     onOpenBackup: () -> Unit,
     onCheckUpdate: () -> Unit,
     onOpenGuide: () -> Unit,
-    onOpenDeveloperInfo: () -> Unit
+    onOpenDeveloperInfo: () -> Unit,
+    onSwitchWorker: () -> Unit = {}
 ) {
     val appLang = AppLanguage.fromCode(appLanguage)
     val strings = LanguageStrings(appLang)
@@ -4539,6 +4913,14 @@ fun MainMenuDialog(
                                 icon = Icons.Default.Person,
                                 color = EarnedBlue,
                                 onClick = { dismissWithAnimation(); onOpenUserSettings() }
+                            )
+                            HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
+                            MenuOptionCard(
+                                title = "👥 حسابات العمال (تبديل العامل)",
+                                subtitle = "التبديل بين حسابات العمال أو إضافة عامل جديد",
+                                icon = Icons.Default.Group,
+                                color = Color(0xFF00897B),
+                                onClick = { dismissWithAnimation(); onSwitchWorker() }
                             )
                         }
 

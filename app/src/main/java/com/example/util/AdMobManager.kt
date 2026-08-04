@@ -54,18 +54,16 @@ import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
  * عند إطلاق التطبيق وتحقيق الأرباح، استبدل هذه المعرفات بالمعرفات الحقيقية من حسابك في AdMob.
  */
 object AdMobIds {
-    // معرفات الإعلانات التجريبية الرسمية من Google AdMob للاختبار والتأكد من عمل الإعلانات 100%
-    const val APP_ID = "ca-app-pub-3940256099942544~3347511713"
-    const val BANNER_ID = "ca-app-pub-3940256099942544/6300978111"
-    const val INTERSTITIAL_ID = "ca-app-pub-3940256099942544/1033173712"
+    // المعرفات الحقيقية الرسمية الخاصة بحسابك في Google AdMob
+    const val APP_ID = "ca-app-pub-1241288532566123~7520011293"
+    const val BANNER_ID = "ca-app-pub-1241288532566123/9891143904"
+    const val INTERSTITIAL_ID = "ca-app-pub-1241288532566123/3936109640"
     const val REWARDED_ID = "ca-app-pub-3940256099942544/5224354917"
 
-    /* 
-    --- معرفاتك الحقيقية الخاصة بنشر التطبيق على متجر جوجل بلاي ---
-    const val PROD_APP_ID = "ca-app-pub-1241288532566123~7520011293"
-    const val PROD_BANNER_ID = "ca-app-pub-1241288532566123/9891143904"
-    const val PROD_INTERSTITIAL_ID = "ca-app-pub-1241288532566123/3936109640"
-    */
+    // معرفات الاختبار الاحتياطية (Google Test IDs)
+    const val TEST_APP_ID = "ca-app-pub-3940256099942544~3347511713"
+    const val TEST_BANNER_ID = "ca-app-pub-3940256099942544/6300978111"
+    const val TEST_INTERSTITIAL_ID = "ca-app-pub-3940256099942544/1033173712"
 }
 
 /**
@@ -90,8 +88,9 @@ object AdMobManager {
         try {
             MobileAds.initialize(context) { initializationStatus ->
                 Log.d("AdMobManager", "AdMob Initialized: $initializationStatus")
+                // تحميل الإعلان البيني فور اكتمال التهيئة
+                loadInterstitial(context.applicationContext)
             }
-            loadInterstitial(context)
         } catch (e: Exception) {
             Log.e("AdMobManager", "Error initializing AdMob: ${e.message}", e)
         }
@@ -119,7 +118,7 @@ object AdMobManager {
                 }
 
                 override fun onAdFailedToLoad(error: LoadAdError) {
-                    Log.e("AdMobManager", "Interstitial Ad Failed to load: ${error.message}")
+                    Log.e("AdMobManager", "Interstitial Ad Failed to load: ${error.message} (Code: ${error.code})")
                     interstitialAd = null
                     isLoadingInterstitial = false
                 }
@@ -142,7 +141,6 @@ object AdMobManager {
     fun showInterstitial(activity: Activity?, onAdClosed: () -> Unit = {}) {
         val ad = interstitialAd
         if (ad != null && activity != null) {
-            Toast.makeText(activity, "🎬 جاري عرض إعلان Google AdMob (Interstitial)...", Toast.LENGTH_SHORT).show()
             ad.fullScreenContentCallback = object : FullScreenContentCallback() {
                 override fun onAdDismissedFullScreenContent() {
                     Log.d("AdMobManager", "Interstitial Ad Dismissed.")
@@ -161,9 +159,7 @@ object AdMobManager {
             }
             ad.show(activity)
         } else {
-            // إذا لم يكن الإعلان جاهزاً بعد (أو في بيئة تجريبية)، نظهر توضيح للمستخدم ونبدأ تحميل الإعلان
             if (activity != null) {
-                Toast.makeText(activity, "📢 تم استدعاء إعلان AdMob (Interstitial) - (جاري التحميل...)", Toast.LENGTH_SHORT).show()
                 loadInterstitial(activity)
             }
             onAdClosed()
@@ -262,7 +258,7 @@ fun AdMobBanner(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "📢 موقع إعلان Google AdMob التجريبي (Banner)",
+                            text = "📢 إعلان مدعوم من Google AdMob",
                             style = MaterialTheme.typography.labelMedium,
                             color = Color(0xFF10B981)
                         )

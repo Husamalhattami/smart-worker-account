@@ -20,13 +20,51 @@ object PdfPrintHelper {
         context: Context,
         settings: SalarySettings,
         transactions: List<Transaction>,
-        metrics: SalaryMetrics
+        metrics: SalaryMetrics,
+        startDateFilter: Long? = null,
+        endDateFilter: Long? = null,
+        showTotalSummary: Boolean = true,
+        balanceDisplayMode: String = "AFTER_EACH_TX" // "AFTER_EACH_TX", "END_OF_MONTH", "END_OF_REPORT"
     ) {
         val sdf = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("ar"))
         val dateString = sdf.format(Date())
 
         val startSdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
         val startWorkDateStr = startSdf.format(Date(settings.startWorkDate))
+
+        val currency = if (settings.currency.isBlank()) "ريال" else settings.currency
+
+        // Filter transactions based on date range
+        val filteredTransactions = transactions.filter { tx ->
+            val matchStart = startDateFilter == null || tx.timestamp >= startDateFilter
+            val matchEnd = endDateFilter == null || tx.timestamp <= (endDateFilter + 86400000L - 1L)
+            matchStart && matchEnd
+        }.sortedBy { it.timestamp }
+
+        // Filter label text
+        val periodLabel = if (startDateFilter != null && endDateFilter != null) {
+            "الفترة من ${startSdf.format(Date(startDateFilter))} إلى ${startSdf.format(Date(endDateFilter))}"
+        } else if (startDateFilter != null) {
+            "الفترة من ${startSdf.format(Date(startDateFilter))}"
+        } else if (endDateFilter != null) {
+            "الفترة حتى ${startSdf.format(Date(endDateFilter))}"
+        } else {
+            "كشف حساب شامل لجميع العمليات"
+        }
+
+        // Calculate accounting parameters
+        val dailyWage = if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0
+        val periodSpendings = filteredTransactions.filter { it.type == "SPENDING" }.sumOf { it.amount }
+        val periodDraws = filteredTransactions.filter { it.type == "DRAW" }.sumOf { it.amount }
+        val absenceCount = filteredTransactions.count { it.type == "ABSENCE" }
+        val absenceDeduction = absenceCount * dailyWage
+
+        val monthlySalary = settings.monthlySalary
+        val openingBalance = settings.openingBalance
+        val netMonthEarnings = monthlySalary - periodSpendings - periodDraws - absenceDeduction
+        val finalNetBalance = netMonthEarnings + openingBalance
+
+        val empName = if (settings.employeeName.isBlank()) "حسام الحطامي" else settings.employeeName
 
         // Build HTML Content
         val htmlContent = buildString {
@@ -35,7 +73,7 @@ object PdfPrintHelper {
                 <html dir="rtl" lang="ar">
                 <head>
                     <meta charset="UTF-8">
-                    <title>كشف الحساب المالي</title>
+                    <title>كشف حساب مالي - $empName</title>
                     <style>
                         body {
                             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif, 'Cairo';
@@ -48,7 +86,7 @@ object PdfPrintHelper {
                         .header-container {
                             border-bottom: 3px solid #10b981;
                             padding-bottom: 15px;
-                            margin-bottom: 30px;
+                            margin-bottom: 20px;
                             display: flex;
                             justify-content: space-between;
                             align-items: center;
@@ -56,7 +94,7 @@ object PdfPrintHelper {
                         .app-title {
                             font-size: 24px;
                             font-weight: bold;
-                            color: #10b981;
+                            color: #059669;
                             margin: 0;
                         }
                         .report-subtitle {
@@ -66,10 +104,10 @@ object PdfPrintHelper {
                         }
                         .employee-card {
                             background-color: #f8fafc;
-                            border: 1px solid #e2e8f0;
+                            border: 1px solid #cbd5e1;
                             border-radius: 12px;
-                            padding: 20px;
-                            margin-bottom: 25px;
+                            padding: 16px;
+                            margin-bottom: 20px;
                         }
                         .employee-name {
                             font-size: 20px;
@@ -81,14 +119,14 @@ object PdfPrintHelper {
                         .meta-grid {
                             display: grid;
                             grid-template-columns: 1fr 1fr;
-                            gap: 15px;
+                            gap: 12px;
                             font-size: 14px;
                         }
                         .meta-item {
                             display: flex;
                             justify-content: space-between;
                             border-bottom: 1px dashed #e2e8f0;
-                            padding-bottom: 5px;
+                            padding-bottom: 4px;
                         }
                         .meta-label {
                             color: #64748b;
@@ -98,103 +136,93 @@ object PdfPrintHelper {
                             color: #0f172a;
                             font-weight: bold;
                         }
-                        
-                        /* Metrics Grid Cards */
-                        .metrics-container {
-                            display: grid;
-                            grid-template-columns: 1fr 1fr 1fr 1fr;
-                            gap: 15px;
-                            margin-bottom: 30px;
-                        }
-                        .metric-card {
-                            border-radius: 10px;
-                            padding: 15px;
-                            text-align: center;
-                            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-                        }
-                        .metric-blue {
-                            background-color: #eff6ff;
-                            border: 1px solid #bfdbfe;
-                            color: #1e40af;
-                        }
-                        .metric-red {
-                            background-color: #fef2f2;
-                            border: 1px solid #fecaca;
-                            color: #991b1b;
-                        }
-                        .metric-orange {
-                            background-color: #fffbeb;
-                            border: 1px solid #fde68a;
-                            color: #92400e;
-                        }
-                        .metric-green {
+
+                        /* Accounting Calculation Summary Box */
+                        .accounting-summary-box {
                             background-color: #ecfdf5;
-                            border: 1px solid #a7f3d0;
-                            color: #065f46;
+                            border: 2px solid #059669;
+                            border-radius: 12px;
+                            padding: 16px;
+                            margin-bottom: 25px;
                         }
-                        .metric-title {
-                            font-size: 12px;
-                            color: #64748b;
-                            margin-bottom: 5px;
-                            text-transform: uppercase;
-                        }
-                        .metric-value {
-                            font-size: 18px;
+                        .summary-title {
+                            font-size: 16px;
                             font-weight: bold;
+                            color: #047857;
+                            margin-bottom: 12px;
+                            border-bottom: 1px solid #a7f3d0;
+                            padding-bottom: 6px;
+                        }
+                        .summary-grid {
+                            display: grid;
+                            grid-template-columns: 1fr 1fr;
+                            gap: 10px;
+                            font-size: 14px;
+                            margin-bottom: 12px;
+                        }
+                        .step-item {
+                            display: flex;
+                            justify-content: space-between;
+                            background-color: #ffffff;
+                            padding: 8px 12px;
+                            border-radius: 8px;
+                            border: 1px solid #d1fae5;
+                        }
+                        .step-result-row {
+                            background-color: #d1fae5;
+                            color: #065f46;
+                            padding: 10px 14px;
+                            border-radius: 8px;
+                            font-weight: bold;
+                            font-size: 15px;
+                            display: flex;
+                            justify-content: space-between;
+                            margin-top: 8px;
+                        }
+                        .step-final-row {
+                            background-color: #059669;
+                            color: #ffffff;
+                            padding: 12px 16px;
+                            border-radius: 8px;
+                            font-weight: bold;
+                            font-size: 16px;
+                            display: flex;
+                            justify-content: space-between;
+                            margin-top: 10px;
                         }
 
-                        /* Main Table */
+                        /* Accounting Table */
                         table {
                             width: 100%;
                             border-collapse: collapse;
-                            margin-bottom: 30px;
+                            margin-bottom: 25px;
                         }
                         th {
-                            background-color: #0f172a;
-                            color: #ffffff;
-                            text-align: right;
-                            padding: 12px 15px;
-                            font-size: 14px;
+                            padding: 10px 12px;
+                            font-size: 13px;
                             font-weight: bold;
+                            text-align: center;
+                            border: 1px solid #cbd5e1;
                         }
                         td {
-                            padding: 12px 15px;
-                            border-bottom: 1px solid #e2e8f0;
+                            padding: 10px 12px;
+                            border: 1px solid #e2e8f0;
                             font-size: 13px;
+                            text-align: center;
                         }
                         tr:nth-child(even) {
                             background-color: #f8fafc;
                         }
-                        .badge {
-                            display: inline-block;
-                            padding: 4px 8px;
-                            border-radius: 6px;
-                            font-size: 11px;
-                            font-weight: bold;
-                            text-align: center;
-                        }
-                        .badge-spending {
-                            background-color: #fecaca;
-                            color: #991b1b;
-                        }
-                        .badge-draw {
-                            background-color: #fde68a;
-                            color: #92400e;
-                        }
-                        .badge-absence {
-                            background-color: #e2e8f0;
-                            color: #475569;
-                        }
                         
                         /* Footer signature */
                         .footer-container {
-                            margin-top: 50px;
+                            margin-top: 40px;
                             display: flex;
                             justify-content: space-between;
                             align-items: center;
                             font-size: 12px;
-                            color: #94a3b8;
-                            border-top: 1px solid #e2e8f0;
+                            color: #64748b;
+                            border-top: 1px solid #cbd5e1;
                             padding-top: 15px;
                         }
 
@@ -203,9 +231,6 @@ object PdfPrintHelper {
                                 margin: 0;
                                 -webkit-print-color-adjust: exact;
                             }
-                            .no-print {
-                                display: none;
-                            }
                         }
                     </style>
                 </head>
@@ -213,7 +238,7 @@ object PdfPrintHelper {
                     <div class="header-container">
                         <div>
                             <h1 class="app-title">حساب العامل الذكي 📱</h1>
-                            <p class="report-subtitle">كشف حساب مالي رسمي ودقيق للموظف</p>
+                            <p class="report-subtitle">كشف حساب مالي رسمي ومستند محاسبي ($periodLabel)</p>
                         </div>
                         <div style="text-align: left; font-size: 12px; color: #64748b;">
                             تاريخ الطباعة: $dateString
@@ -221,7 +246,7 @@ object PdfPrintHelper {
                     </div>
 
                     <div class="employee-card">
-                        <div class="employee-name">الموظف: ${if (settings.employeeName.isBlank()) "حسام الحطامي" else settings.employeeName}</div>
+                        <div class="employee-name">الموظف / العامل: $empName</div>
                         <div class="meta-grid">
                             <div class="meta-item">
                                 <span class="meta-label">تاريخ بدء العمل:</span>
@@ -229,146 +254,166 @@ object PdfPrintHelper {
                             </div>
                             <div class="meta-item">
                                 <span class="meta-label">الراتب الشهري الأساسي:</span>
-                                <span class="meta-value">${settings.monthlySalary.toInt()} ${settings.currency}</span>
+                                <span class="meta-value" style="color: #059669;">${monthlySalary.toInt()} $currency</span>
                             </div>
                             <div class="meta-item">
-                                <span class="meta-label">إجمالي الأيام المنقضية:</span>
-                                <span class="meta-value">${metrics.elapsedDays} أيام</span>
+                                <span class="meta-label">معدل الأجر اليومي:</span>
+                                <span class="meta-value">${dailyWage.toInt()} $currency / يوم</span>
                             </div>
                             <div class="meta-item">
-                                <span class="meta-label">أيام الغياب غير المدفوعة:</span>
-                                <span class="meta-value">${metrics.absenceCount} أيام</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">أيام الشغل الفعلية:</span>
-                                <span class="meta-value" style="color: #10b981;">${metrics.workedDays} أيام</span>
-                            </div>
-                            ${if (settings.openingBalance != 0.0) """
-                            <div class="meta-item">
-                                <span class="meta-label">حساب سابق (رصيد افتتاحي):</span>
-                                <span class="meta-value" style="color: #10b981;">${settings.openingBalance.toInt()} ${settings.currency}</span>
-                            </div>
-                            """ else ""}
-                        </div>
-                    </div>
-
-                    <div class="metrics-container">
-                        <div class="metric-card metric-blue">
-                            <div class="metric-title">الراتب المستحق</div>
-                            <div class="metric-value">${metrics.earnedSalary.toInt()} ${settings.currency}</div>
-                        </div>
-                        <div class="metric-card metric-red">
-                            <div class="metric-title">إجمالي المصروفات</div>
-                            <div class="metric-value">${metrics.totalSpendings.toInt()} ${settings.currency}</div>
-                        </div>
-                        <div class="metric-card metric-orange">
-                            <div class="metric-title">إجمالي السحبيات</div>
-                            <div class="metric-value">${metrics.totalDraws.toInt()} ${settings.currency}</div>
-                        </div>
-                        <div class="metric-card metric-green">
-                            <div class="metric-title">المتبقي الصافي له</div>
-                            <div class="metric-value" style="font-size: 20px;">${metrics.netBalance.toInt()} ${settings.currency}</div>
-                        </div>
-                    </div>
-
-                    <!-- Single Day Analysis & Total Worked Days Summary -->
-                    <div style="margin-top: 25px; margin-bottom: 25px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 15px;">
-                            <h4 style="margin-top: 0; margin-bottom: 10px; color: #0f172a; border-bottom: 2px solid #3b82f6; padding-bottom: 5px;">📅 التفاصيل لليوم الواحد:</h4>
-                            <div class="meta-item" style="margin-bottom: 8px;">
-                                <span class="meta-label">مستحق الراتب لليوم الواحد:</span>
-                                <span class="meta-value" style="color: #1e40af;">${metrics.dailyRate.toInt()} ${settings.currency}</span>
-                            </div>
-                            <div class="meta-item" style="margin-bottom: 8px;">
-                                <span class="meta-label">متوسط الصرفيات لليوم الواحد:</span>
-                                <span class="meta-value" style="color: #991b1b;">${if (metrics.workedDays > 0) (metrics.totalSpendings / metrics.workedDays).toInt() else 0} ${settings.currency}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">متوسط السحبيات لليوم الواحد:</span>
-                                <span class="meta-value" style="color: #92400e;">${if (metrics.workedDays > 0) (metrics.totalDraws / metrics.workedDays).toInt() else 0} ${settings.currency}</span>
-                            </div>
-                        </div>
-                        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 15px;">
-                            <h4 style="margin-top: 0; margin-bottom: 10px; color: #0f172a; border-bottom: 2px solid #10b981; padding-bottom: 5px;">💸 إجمالي التفاصيل لأيام الشغل كامل:</h4>
-                            <div class="meta-item" style="margin-bottom: 8px;">
-                                <span class="meta-label">أيام الشغل الفعلية:</span>
-                                <span class="meta-value" style="color: #065f46;">${metrics.workedDays} أيام</span>
-                            </div>
-                            <div class="meta-item" style="margin-bottom: 8px;">
-                                <span class="meta-label">إجمالي الصرفيات لكامل المدة:</span>
-                                <span class="meta-value" style="color: #991b1b;">${metrics.totalSpendings.toInt()} ${settings.currency}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">إجمالي السحبيات وسلفيات:</span>
-                                <span class="meta-value" style="color: #92400e;">${metrics.totalDraws.toInt()} ${settings.currency}</span>
+                                <span class="meta-label">الرصيد الافتتاحي (السابق):</span>
+                                <span class="meta-value" style="color: #1e40af;">${openingBalance.toInt()} $currency</span>
                             </div>
                         </div>
                     </div>
-
-                    <h3>سجل تفاصيل العمليات اليومية 📋</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th style="width: 25%;">التاريخ الوقت</th>
-                                <th style="width: 20%;">نوع العملية</th>
-                                <th style="width: 20%;">المبلغ</th>
-                                <th style="width: 35%;">ملاحظة / كلام صوتي</th>
-                            </tr>
-                        </thead>
-                        <tbody>
             """.trimIndent())
 
-            if (transactions.isEmpty()) {
+            // Detailed Accounting Monthly Calculation Summary Box
+            if (showTotalSummary) {
+                append("""
+                    <div class="accounting-summary-box">
+                        <div class="summary-title">📊 تفصيل وتصفية الحساب الشهري المالي:</div>
+                        <div class="summary-grid">
+                            <div class="step-item">
+                                <span>1. راتب وأجر الشهر الأساسي:</span>
+                                <span style="font-weight: bold; color: #059669;">+${monthlySalary.toInt()} $currency</span>
+                            </div>
+                            <div class="step-item">
+                                <span>2. إجمالي الصرفيات (خصم):</span>
+                                <span style="font-weight: bold; color: #b91c1c;">-${periodSpendings.toInt()} $currency</span>
+                            </div>
+                            <div class="step-item">
+                                <span>3. إجمالي السحبيات (خصم):</span>
+                                <span style="font-weight: bold; color: #b91c1c;">-${periodDraws.toInt()} $currency</span>
+                            </div>
+                            <div class="step-item">
+                                <span>4. خصم الغياب ($absenceCount أيام):</span>
+                                <span style="font-weight: bold; color: #b91c1c;">-${absenceDeduction.toInt()} $currency</span>
+                            </div>
+                        </div>
+
+                        <div class="step-result-row">
+                            <span>👈 صافي المتبقي من مستحق هذا الشهر:</span>
+                            <span>${monthlySalary.toInt()} - ${periodSpendings.toInt()} - ${periodDraws.toInt()} - ${absenceDeduction.toInt()} = <u>${netMonthEarnings.toInt()} $currency</u></span>
+                        </div>
+
+                        ${if (openingBalance != 0.0) """
+                        <div class="step-final-row">
+                            <span>💰 إجمالي الصافي النهائي الكلي (المتبقي للعامل مع الرصيد السابق):</span>
+                            <span>${netMonthEarnings.toInt()} + ${openingBalance.toInt()} = ${finalNetBalance.toInt()} $currency</span>
+                        </div>
+                        """ else """
+                        <div class="step-final-row">
+                            <span>💰 إجمالي الصافي النهائي المتبقي للعامل:</span>
+                            <span>${netMonthEarnings.toInt()} $currency</span>
+                        </div>
+                        """}
+                    </div>
+                """.trimIndent())
+            }
+
+            // Table Header with strictly requested columns
+            append("""
+                <h3>سجل الحركة اليومية للحساب (التاريخ / ملاحظة / عليكم / لكم / الإجمالي) 📋</h3>
+                <table>
+                    <thead>
+                        <tr style="background-color: #0f172a; color: #ffffff;">
+                            <th style="width: 18%;">التاريخ</th>
+                            <th style="width: 32%;">ملاحظة / البيان</th>
+                            <th style="width: 17%; background-color: #991b1b; color: #ffffff;">عليكم (خصم/صرفة/سحبية)</th>
+                            <th style="width: 17%; background-color: #059669; color: #ffffff;">لكم (باقي الراتب اليومي/مستحق)</th>
+                            <th style="width: 16%; background-color: #1e40af; color: #ffffff;">الإجمالي (الرصيد)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            """.trimIndent())
+
+            var runningBalance = openingBalance
+
+            // Opening Balance Row
+            if (openingBalance != 0.0) {
+                append("""
+                    <tr style="background-color: #f1f5f9; font-weight: bold;">
+                        <td>$startWorkDateStr</td>
+                        <td>رصيد سابق / رصيد افتتاحي</td>
+                        <td style="color: #64748b;">-</td>
+                        <td style="color: #059669;">${openingBalance.toInt()} $currency</td>
+                        <td style="color: #1e40af; font-size: 14px;">${runningBalance.toInt()} $currency</td>
+                    </tr>
+                """.trimIndent())
+            }
+
+            if (filteredTransactions.isEmpty() && openingBalance == 0.0) {
                 append("""
                     <tr>
-                        <td colspan="4" style="text-align: center; color: #94a3b8; padding: 30px;">
-                            لا توجد أي عمليات مسجلة في هذا الكشف حتى الآن.
+                        <td colspan="5" style="text-align: center; color: #94a3b8; padding: 30px;">
+                            لا توجد أي عمليات مسجلة في هذه الفترة المحددة.
                         </td>
                     </tr>
                 """.trimIndent())
             } else {
                 val itemSdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
-                for (tx in transactions) {
-                    val formattedTime = itemSdf.format(Date(tx.timestamp))
-                    val badgeClass = when (tx.type) {
-                        "SPENDING" -> "badge-spending"
-                        "DRAW" -> "badge-draw"
-                        "ABSENCE" -> "badge-absence"
-                        else -> ""
-                    }
-                    val typeLabel = when (tx.type) {
-                        "SPENDING" -> "صرفة"
-                        "DRAW" -> "سحبيّة"
-                        "ABSENCE" -> "تسجيل غياب"
-                        else -> "عملية"
-                    }
-                    val amountLabel = when (tx.type) {
-                        "ABSENCE" -> {
-                            val hrs = tx.amount
-                            if (hrs == 12.0 || hrs <= 0.0) "يوم كامل" else "${hrs.toInt()} ساعات"
+
+                for (i in filteredTransactions.indices) {
+                    val tx = filteredTransactions[i]
+                    val formattedDate = itemSdf.format(Date(tx.timestamp))
+
+                    val noteText = tx.voiceText?.takeIf { it.isNotBlank() } ?: ""
+
+                    var aleikumStr = "-"
+                    var lakumStr = "-"
+                    var noteLabel = ""
+
+                    when (tx.type) {
+                        "SPENDING" -> {
+                            noteLabel = if (noteText.isNotBlank()) "صرفة: $noteText" else "صرفة يومية"
+                            aleikumStr = "${tx.amount.toInt()} $currency"
+                            lakumStr = "${dailyWage.toInt()} $currency"
+                            runningBalance += (dailyWage - tx.amount)
                         }
-                        else -> "${tx.amount.toInt()} ${settings.currency}"
+                        "DRAW" -> {
+                            noteLabel = if (noteText.isNotBlank()) "سحبيّة: $noteText" else "سحبيّة نقداً"
+                            aleikumStr = "${tx.amount.toInt()} $currency"
+                            lakumStr = "-"
+                            runningBalance -= tx.amount
+                        }
+                        "ABSENCE" -> {
+                            noteLabel = if (noteText.isNotBlank()) "خصم غياب: $noteText" else "تسجيل غياب يوم"
+                            aleikumStr = "${dailyWage.toInt()} $currency"
+                            lakumStr = "-"
+                            runningBalance -= dailyWage
+                        }
                     }
-                    val noteText = tx.voiceText ?: "سجلت بالصوت"
 
                     append("""
                         <tr>
-                            <td>$formattedTime</td>
-                            <td><span class="badge $badgeClass">$typeLabel</span></td>
-                            <td style="font-weight: bold;">$amountLabel</td>
-                            <td>$noteText</td>
+                            <td>$formattedDate</td>
+                            <td style="text-align: right; font-weight: 500;">$noteLabel</td>
+                            <td style="font-weight: bold; color: #991b1b;">$aleikumStr</td>
+                            <td style="font-weight: bold; color: #059669;">$lakumStr</td>
+                            <td style="font-weight: bold; color: #1e40af;">${runningBalance.toInt()} $currency</td>
                         </tr>
                     """.trimIndent())
                 }
             }
+
+            // Final Summary Row
+            append("""
+                <tr style="background-color: #ecfdf5; font-size: 14px; font-weight: bold; border-top: 3px solid #059669;">
+                    <td colspan="2" style="text-align: right; color: #065f46; padding: 12px;">إجمالي صافي الرصيد المتبقي للعامل حتى الآن:</td>
+                    <td style="color: #991b1b;">${(periodSpendings + periodDraws + absenceDeduction).toInt()} $currency</td>
+                    <td style="color: #059669;">${(monthlySalary + openingBalance).toInt()} $currency</td>
+                    <td style="color: #1e40af; font-size: 15px;">${runningBalance.toInt()} $currency</td>
+                </tr>
+            """.trimIndent())
 
             append("""
                         </tbody>
                     </table>
 
                     <div class="footer-container">
-                        <span>تم إصدار هذا الكشف تلقائياً وبأمان عبر حساب العامل الذكي</span>
-                        <span>توقيع الموظف: ............................</span>
+                        <span>تم إصدار كشف الحساب رسمياً وبدقة عبر تطبيق حساب العامل الذكي 📱</span>
+                        <span>توقيع واستلام العامل: ............................</span>
                     </div>
                 </body>
                 </html>
@@ -380,12 +425,10 @@ object PdfPrintHelper {
             val webView = WebView(context)
             webView.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Create PrintManager instance
                     val printManager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                    val employeeCleanName = if (settings.employeeName.isBlank()) "حسام_الحطامي" else settings.employeeName.replace(" ", "_")
+                    val employeeCleanName = empName.replace(" ", "_")
                     val jobName = "كشف_حساب_$employeeCleanName"
 
-                    // Get print adapter
                     val printAdapter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         webView.createPrintDocumentAdapter(jobName)
                     } else {
@@ -393,18 +436,17 @@ object PdfPrintHelper {
                         webView.createPrintDocumentAdapter()
                     }
 
-                    // Print document with standard settings
                     printManager.print(
                         jobName,
                         printAdapter,
                         PrintAttributes.Builder().build()
                     )
-                    Toast.makeText(context, "جاري فتح نافذة الطباعة وتصدير الـ PDF...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "جاري تحضير كشف الحساب وفتح نافذة الطباعة / تصدير PDF...", Toast.LENGTH_SHORT).show()
                 }
             }
 
-            // Load generated HTML dynamically
             webView.loadDataWithBaseURL(null, htmlContent, "text/html", "utf-8", null)
         }
     }
 }
+
