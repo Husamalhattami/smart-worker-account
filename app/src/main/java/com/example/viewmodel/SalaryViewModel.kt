@@ -345,7 +345,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val hourlyRate = dailyRate / 12.0 // standard 12-hour workday
 
         // Filter transactions for current ACTIVE period (timestamp >= activePeriodStart)
-        val activeTxList = txList.filter { it.timestamp >= activePeriodStart }
+        val activeTxList = txList.filter { it.timestamp >= activePeriodStart && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE" }
 
         // Calculate active period absence hours. If amount == 0.0, we treat it as 12 hours (full day).
         val totalAbsenceHours = activeTxList.filter { it.type == "ABSENCE" }.sumOf { 
@@ -425,34 +425,126 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     // Explicitly Settle and Lock current active period: turns current net balance into new opening balance, resets active counters
-    fun settleAndLockAccount() {
+    fun settleAndLockAccount(cutOffDateMs: Long = System.currentTimeMillis()) {
         viewModelScope.launch {
             val currentSettings = repository.getSalarySettingsDirect() ?: SalarySettings()
             val txList = repository.getAllTransactionsDirect()
-            val metrics = calculateSalaryMetrics(currentSettings, txList)
 
-            val now = System.currentTimeMillis()
+            // End of cutoff day: 23:59:59.999
+            val calCutoffEnd = Calendar.getInstance().apply {
+                timeInMillis = cutOffDateMs
+                set(Calendar.HOUR_OF_DAY, 23)
+                set(Calendar.MINUTE, 59)
+                set(Calendar.SECOND, 59)
+                set(Calendar.MILLISECOND, 999)
+            }
+            val effectiveCutoffMs = calCutoffEnd.timeInMillis
 
-            // 1. Record chronological SETTLEMENT transaction into database
+            // Period start midnight
+            val calStartMidnight = Calendar.getInstance().apply {
+                timeInMillis = currentSettings.startWorkDate
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+
+            // Period cutoff midnight
+            val calCutoffMidnight = Calendar.getInstance().apply {
+                timeInMillis = cutOffDateMs
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+
+            val diffMs = calCutoffMidnight.timeInMillis - calStartMidnight.timeInMillis
+            val diffInDays = (diffMs / (1000 * 60 * 60 * 24)).toInt()
+            val elapsedDays = if (diffInDays < 0) 0 else (diffInDays + 1)
+
+            val dailyRate = if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0
+            val hourlyRate = dailyRate / 12.0
+
+            // Filter active transactions from period start midnight up to cut-off end timestamp
+            val activeTxList = txList.filter { 
+                it.timestamp >= calStartMidnight.timeInMillis && it.timestamp <= effectiveCutoffMs && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE"
+            }
+
+            val totalAbsenceHours = activeTxList.filter { it.type == "ABSENCE" }.sumOf { 
+                if (it.amount <= 0.0) 12.0 else it.amount 
+            } + (currentSettings.priorAbsenceCount * 12.0)
+
+            val absenceDeduction = totalAbsenceHours * hourlyRate
+            val totalSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount } + currentSettings.priorSpendingsAmount
+            val totalDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount } + currentSettings.priorDrawsAmount
+
+            val totalEarnedSalary = maxOf(0.0, (elapsedDays.toDouble() * dailyRate) - absenceDeduction)
+            val netSettlementBalance = if (currentSettings.isSpendingDeductedFromSalary) {
+                currentSettings.openingBalance + totalEarnedSalary - totalSpendings - totalDraws
+            } else {
+                currentSettings.openingBalance + totalEarnedSalary - totalDraws
+            }
+
+            // 1. Record chronological SETTLEMENT transaction into database with effective cutoff timestamp
+            val sdfDate = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+            val dateFormatted = sdfDate.format(Date(effectiveCutoffMs))
             val settlementTx = Transaction(
                 type = "SETTLEMENT",
-                amount = metrics.netBalance,
-                timestamp = now,
+                amount = netSettlementBalance,
+                timestamp = effectiveCutoffMs,
                 voiceText = "🔒 تصفية وإقفال حساب وتدوير الرصيد"
             )
             repository.insertTransaction(settlementTx)
 
-            // 2. Update baseline settings for the new period
+            // 2. Next period starts at start of next day
+            val nextPeriodStartMs = calCutoffMidnight.apply { add(Calendar.DAY_OF_YEAR, 1) }.timeInMillis
+
+            // Update baseline settings for the new period
             val updated = currentSettings.copy(
-                openingBalance = metrics.netBalance,
-                startWorkDate = now,
+                openingBalance = netSettlementBalance,
+                startWorkDate = nextPeriodStartMs,
+                stopWorkDate = null,
+                isWorkPaused = false,
                 priorAbsenceCount = 0,
                 priorSpendingsAmount = 0.0,
                 priorDrawsAmount = 0.0
             )
             repository.insertOrUpdateSalarySettings(updated)
-            _userNotice.tryEmit("🔒 تم تصفية وإقفال حساب الفترة الحالية وتدوير الرصيد المتبقي كرصيد افتتاحي جديد بنجاح")
-            speakOutText("تمت تصفية وإقفال حساب الفترة السابقة وتدوير الصافي المتبقي كرصيد افتتاحي جديد بنجاح")
+            _userNotice.tryEmit("🔒 تم تصفية وإقفال حساب الفترة حتى $dateFormatted وتدوير الصافي (${netSettlementBalance.toInt()} ريال) بنجاح")
+            speakOutText("تمت تصفية وإقفال حساب الفترة وتدوير الصافي المتبقي بنجاح")
+        }
+    }
+
+    // Toggle pause/resume work
+    fun toggleWorkPause(isPaused: Boolean) {
+        viewModelScope.launch {
+            val currentSettings = repository.getSalarySettingsDirect() ?: SalarySettings()
+            val now = System.currentTimeMillis()
+            if (isPaused) {
+                val updated = currentSettings.copy(
+                    isWorkPaused = true,
+                    stopWorkDate = now
+                )
+                repository.insertOrUpdateSalarySettings(updated)
+                _userNotice.tryEmit("⏸️ تم إيقاف احتساب العمل والتراكم اليومي مؤقتاً (وضع الإجازة)")
+                speakOutText("تم إيقاف احتساب العمل مؤقتاً")
+            } else {
+                val pauseStart = currentSettings.stopWorkDate
+                val newStartWorkDate = if (pauseStart != null && now > pauseStart) {
+                    val pausedDuration = now - pauseStart
+                    currentSettings.startWorkDate + pausedDuration
+                } else {
+                    currentSettings.startWorkDate
+                }
+                val updated = currentSettings.copy(
+                    isWorkPaused = false,
+                    stopWorkDate = null,
+                    startWorkDate = newStartWorkDate
+                )
+                repository.insertOrUpdateSalarySettings(updated)
+                _userNotice.tryEmit("▶️ تم استئناف احتساب العمل والأجر اليومي بنجاح")
+                speakOutText("تم استئناف احتساب العمل بنجاح")
+            }
         }
     }
 
@@ -476,6 +568,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         biometricEnabled: Boolean = false,
         autoAddDailySpending: Boolean = false,
         isSpendingDeductedFromSalary: Boolean = true,
+        isWorkPaused: Boolean = false,
         themeMode: String = "DARK",
         appLanguage: String = "ar"
     ) {
@@ -513,6 +606,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 biometricEnabled = biometricEnabled,
                 autoAddDailySpending = autoAddDailySpending,
                 isSpendingDeductedFromSalary = isSpendingDeductedFromSalary,
+                isWorkPaused = isWorkPaused,
                 themeMode = themeMode,
                 appLanguage = appLanguage
             )

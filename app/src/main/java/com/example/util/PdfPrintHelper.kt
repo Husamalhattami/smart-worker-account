@@ -70,7 +70,7 @@ object PdfPrintHelper {
                 else -> true
             }
             matchStart && matchEnd && matchType
-        }.sortedBy { it.timestamp }
+        }.sortedWith(compareBy({ it.timestamp }, { if (it.type == "SETTLEMENT") 1 else 0 }))
 
         val filteredTransactions = rawFilteredTransactions
 
@@ -95,20 +95,30 @@ object PdfPrintHelper {
         }
 
         // Calculate opening balance at report start date
-        val (reportOpeningBalance, reportStartDateStr) = if (startDateFilter != null && startDateFilter > settings.startWorkDate) {
-            val priorTransactions = transactions.filter { it.timestamp < startDateFilter }
-            val priorSpendings = priorTransactions.filter { it.type == "SPENDING" }.sumOf { it.amount }
-            val priorDraws = priorTransactions.filter { it.type == "DRAW" }.sumOf { it.amount }
-            val priorAbsenceCount = priorTransactions.count { it.type == "ABSENCE" }
-            val priorAbsenceDeduction = priorAbsenceCount * dailyWage
-            
-            val priorDays = ((startDateFilter - settings.startWorkDate) / (24 * 3600 * 1000L)).coerceAtLeast(0L)
-            val priorEarnedSalary = priorDays * dailyWage
-            
-            val computedOpening = settings.openingBalance + priorEarnedSalary - priorSpendings - priorDraws - priorAbsenceDeduction
-            Pair(computedOpening, startSdf.format(Date(startDateFilter)))
+        val openingTx = transactions.firstOrNull { it.type == "OPENING_BALANCE" }
+        val initialOpeningAmount = openingTx?.amount ?: settings.openingBalance
+        val initialStartDateMs = openingTx?.timestamp ?: settings.startWorkDate
+
+        val (reportOpeningBalance, reportStartDateStr) = if (startCal.timeInMillis <= initialStartDateMs) {
+            Pair(initialOpeningAmount, startSdf.format(Date(startCal.timeInMillis)))
         } else {
-            Pair(settings.openingBalance, startWorkDateStr)
+            val priorSettlement = transactions.filter { it.type == "SETTLEMENT" && it.timestamp < startCal.timeInMillis }
+                .maxByOrNull { it.timestamp }
+            val baseOpening = priorSettlement?.amount ?: initialOpeningAmount
+            val baseMs = priorSettlement?.timestamp ?: initialStartDateMs
+
+            val priorTxs = transactions.filter { it.timestamp >= baseMs && it.timestamp < startCal.timeInMillis }
+            val priorSpendings = priorTxs.filter { it.type == "SPENDING" }.sumOf { it.amount }
+            val priorDraws = priorTxs.filter { it.type == "DRAW" }.sumOf { it.amount }
+            val priorAbsenceTx = priorTxs.filter { it.type == "ABSENCE" }
+            val priorAbsenceHours = priorAbsenceTx.sumOf { if (it.amount <= 0.0) 12.0 else it.amount }
+            val priorAbsenceDeduction = priorAbsenceHours * (dailyWage / 12.0)
+
+            val priorDays = ((startCal.timeInMillis - baseMs) / (24 * 3600 * 1000L)).coerceAtLeast(0L)
+            val priorEarnedSalary = priorDays * dailyWage
+
+            val computedOpening = baseOpening + priorEarnedSalary - priorSpendings - priorDraws - priorAbsenceDeduction
+            Pair(computedOpening, startSdf.format(Date(startCal.timeInMillis)))
         }
 
         // Calculate actual worked days in the period
@@ -411,8 +421,24 @@ object PdfPrintHelper {
 
             if (transactionTypeFilter == "ALL") {
                 // Detailed daily breakdown with daily wage accrual
-                val currLoopCal = Calendar.getInstance().apply { timeInMillis = startCal.timeInMillis }
-                val endLoopMs = endCal.timeInMillis
+                val firstTxMs = transactions.minOfOrNull { it.timestamp } ?: settings.startWorkDate
+                val activeStartBound = minOf(settings.startWorkDate, firstTxMs)
+                val effectiveStartMs = maxOf(startCal.timeInMillis, activeStartBound)
+
+                val currLoopCal = Calendar.getInstance().apply {
+                    timeInMillis = effectiveStartMs
+                    set(Calendar.HOUR_OF_DAY, 0)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                val endLoopMs = Calendar.getInstance().apply {
+                    timeInMillis = effectiveEndMs
+                    set(Calendar.HOUR_OF_DAY, 0)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }.timeInMillis
 
                 var currentMonthKey = ""
                 var monthSpendings = 0.0
@@ -426,7 +452,7 @@ object PdfPrintHelper {
                     val mKey = monthKeySdf.format(Date(dayMidnight))
 
                     if (mKey != currentMonthKey) {
-                        if (currentMonthKey.isNotBlank()) {
+                        if (currentMonthKey.isNotBlank() && (monthSpendings > 0 || monthDraws > 0 || monthAbsences > 0 || monthEarned > 0)) {
                             // Monthly Subtotal Summary Row
                             append("""
                                 <tr style="background-color: #f0fdf4; border-top: 1.5px solid #059669; border-bottom: 1.5px solid #059669; font-weight: bold;">
@@ -492,13 +518,13 @@ object PdfPrintHelper {
                                     noteLabel = if (noteText.isNotBlank()) noteText else "رصيد افتتاحي أولي"
                                     earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
                                     runningBalance = tx.amount
-                                    monthEarned += tx.amount
+                                    dailyWageCredited = true
                                 }
                                 "SETTLEMENT" -> {
                                     noteLabel = if (noteText.isNotBlank()) noteText else "🔒 تصفية وإقفال حساب وتدوير رصيد"
-                                    earnedCell = "<span style='color: #6b21a8; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
+                                    earnedCell = "<span style='color: #6b21a8; font-weight: bold;'>تدوير: ${tx.amount.toInt()} $currency</span>"
                                     runningBalance = tx.amount
-                                    monthEarned += tx.amount
+                                    dailyWageCredited = true
                                 }
                                 "SPENDING" -> {
                                     noteLabel = if (noteText.isNotBlank()) noteText else "صرفة يومية"
@@ -567,7 +593,7 @@ object PdfPrintHelper {
                     currLoopCal.add(Calendar.DAY_OF_YEAR, 1)
                 }
 
-                if (currentMonthKey.isNotBlank()) {
+                if (currentMonthKey.isNotBlank() && (monthSpendings > 0 || monthDraws > 0 || monthAbsences > 0 || monthEarned > 0)) {
                     // Final Month Summary Row
                     append("""
                         <tr style="background-color: #f0fdf4; border-top: 1.5px solid #059669; border-bottom: 1.5px solid #059669; font-weight: bold;">

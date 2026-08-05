@@ -25,6 +25,7 @@ data class SalarySettings(
     val biometricEnabled: Boolean = false,
     val autoAddDailySpending: Boolean = false,
     val isSpendingDeductedFromSalary: Boolean = true,
+    val isWorkPaused: Boolean = false,
     val themeMode: String = "DARK",
     val appLanguage: String = "ar"
 )

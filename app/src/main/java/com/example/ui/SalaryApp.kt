@@ -568,6 +568,59 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 onPrintPdfClick = { showPdfOptionsDialog = true }
             )
 
+            // --- WORK PAUSED / LEAVE BANNER ---
+            if (settingsState?.isWorkPaused == true) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = AmberOrange.copy(alpha = 0.15f)),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, AmberOrange)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .background(AmberOrange.copy(alpha = 0.2f), shape = CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Pause,
+                                contentDescription = null,
+                                tint = AmberOrange,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "⏸️ احتساب العمل متوقف مؤقتاً (إجازة)",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                            Text(
+                                text = "تراكم الأجر اليومي متوقف حالياً. يمكنك الاستئناف عند العودة للعمل.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.textSub
+                            )
+                        }
+                        Button(
+                            onClick = { viewModel.toggleWorkPause(false) },
+                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("استئناف ◀️", color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+
             val currentCurrency = (settingsState ?: SalarySettings()).currency
 
             // --- VISUAL CENTRAL BALANCE DIAL ---
@@ -773,7 +826,30 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     // --- SETTLE AND CLOSE PERIOD CONFIRMATION DIALOG ---
     if (showSettleConfirmDialog) {
         val cur = settingsState?.currency ?: "ريال يمني"
-        val remainingNet = metricsState.netBalance.toInt()
+        var cutOffDateMs by remember { mutableStateOf(System.currentTimeMillis()) }
+        var showCutoffDatePicker by remember { mutableStateOf(false) }
+
+        val sdfCutoff = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+        val cutoffFormatted = sdfCutoff.format(Date(cutOffDateMs))
+
+        if (showCutoffDatePicker) {
+            val cal = Calendar.getInstance().apply { timeInMillis = cutOffDateMs }
+            android.app.DatePickerDialog(
+                context,
+                { _, yr, mo, dy ->
+                    val selectedCal = Calendar.getInstance().apply {
+                        set(Calendar.YEAR, yr)
+                        set(Calendar.MONTH, mo)
+                        set(Calendar.DAY_OF_MONTH, dy)
+                    }
+                    cutOffDateMs = selectedCal.timeInMillis
+                    showCutoffDatePicker = false
+                },
+                cal.get(Calendar.YEAR),
+                cal.get(Calendar.MONTH),
+                cal.get(Calendar.DAY_OF_MONTH)
+            ).show()
+        }
 
         AlertDialog(
             onDismissRequest = { showSettleConfirmDialog = false },
@@ -796,11 +872,40 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "ما الذي سيحدث عند الإقفال؟",
+                        text = "تاريخ الإقفال والتصفية:",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Bold,
-                        color = LocalAppColors.current.text
+                        color = LocalAppColors.current.textSub
                     )
+
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showCutoffDatePicker = true },
+                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.5f))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Default.CalendarToday, contentDescription = null, tint = EmeraldGreen, modifier = Modifier.size(20.dp))
+                                Text(
+                                    text = "حتى تاريخ: $cutoffFormatted",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = LocalAppColors.current.text
+                                )
+                            }
+                            Text("تغيير 📅", color = EmeraldGreen, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
                     Surface(
                         color = LocalAppColors.current.bg,
                         shape = RoundedCornerShape(10.dp),
@@ -808,17 +913,17 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     ) {
                         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(
-                                text = "1. تدوير المبلغ الصافي المتبقي ($remainingNet $cur) ليكون رصيداً افتتاحياً سابقاً للفترة القادمة.",
+                                text = "1. يتم تدوير المبلغ الصافي المستحق حتى تاريخ ($cutoffFormatted) ليكون رصيداً افتتاحياً جديداً للفترة التالية.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = LocalAppColors.current.text
                             )
                             Text(
-                                text = "2. تصفير العدادات للفترة الجديدة (الغيابات، الصرفيات، السحبيات).",
+                                text = "2. تشمل التصفية كافة الصرفيات، السحبيات، والغيابات المسجلة حتى هذا اليوم.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = LocalAppColors.current.text
                             )
                             Text(
-                                text = "3. تبدأ الفترة الجديدة من تاريخ اليوم تلقائياً، مع الاحتفاظ التام بسجل كافة العمليات السابقة وقابليتها للتعديل أو الطباعة بأي وقت.",
+                                text = "3. تبدأ الفترة الجديدة من اليوم التالي لتاريخ الإقفال تلقائياً، مع الاحتفاظ التام بكافة السجلات السابقة.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = EmeraldGreen,
                                 fontWeight = FontWeight.Bold
@@ -832,13 +937,13 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     onClick = {
                         showSettleConfirmDialog = false
                         AdMobManager.showInterstitial(activity) {
-                            viewModel.settleAndLockAccount()
+                            viewModel.settleAndLockAccount(cutOffDateMs)
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = CrimsonRed),
                     shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("نعم، تصفية وإقفال 🔒", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("تأكيد التصفية والإقفال 🔒", color = Color.White, fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
@@ -965,7 +1070,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 viewModel.deleteCurrency(item)
             },
             onDismiss = { showUserSettingsDialog = false },
-            onSave = { employeeName, salary, currency, standardSpending, startDate, autoAddDailySpending, isSpendingDeductedFromSalary, openingBalance, priorAbsences, priorSpendings, priorDraws ->
+            onSave = { employeeName, salary, currency, standardSpending, startDate, autoAddDailySpending, isSpendingDeductedFromSalary, isWorkPaused, openingBalance, priorAbsences, priorSpendings, priorDraws ->
                 AdMobManager.showInterstitial(activity) {
                     val curr = settingsState ?: SalarySettings()
                     viewModel.updateSalarySettings(
@@ -987,6 +1092,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                         biometricEnabled = curr.biometricEnabled,
                         autoAddDailySpending = autoAddDailySpending,
                         isSpendingDeductedFromSalary = isSpendingDeductedFromSalary,
+                        isWorkPaused = isWorkPaused,
                         themeMode = curr.themeMode,
                         appLanguage = curr.appLanguage
                     )
@@ -1765,22 +1871,19 @@ fun TransactionItem(
                 verticalArrangement = Arrangement.spacedBy(2.dp),
                 horizontalAlignment = Alignment.Start
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(
-                        text = typeLabel,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = LocalAppColors.current.text,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "• $dateStr",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = LocalAppColors.current.textMuted
-                    )
-                }
+                Text(
+                    text = typeLabel,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = LocalAppColors.current.text,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = dateStr,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.textMuted
+                )
 
                 if (!transaction.voiceText.isNullOrBlank()) {
                     Text(
@@ -3063,6 +3166,7 @@ fun UserSettingsDialog(
         startDate: Long,
         autoAddDailySpending: Boolean,
         isSpendingDeductedFromSalary: Boolean,
+        isWorkPaused: Boolean,
         openingBalance: Double,
         priorAbsences: Int,
         priorSpendings: Double,
@@ -3076,6 +3180,7 @@ fun UserSettingsDialog(
     var standardSpendingInput by remember { mutableStateOf(currentSettings.standardSpendingAmount.toInt().toString()) }
     var autoAddDailySpending by remember { mutableStateOf(currentSettings.autoAddDailySpending) }
     var isSpendingDeductedFromSalary by remember { mutableStateOf(currentSettings.isSpendingDeductedFromSalary) }
+    var isWorkPaused by remember { mutableStateOf(currentSettings.isWorkPaused) }
     var openingBalanceInput by remember { mutableStateOf(currentSettings.openingBalance.toInt().toString()) }
     var priorAbsencesInput by remember { mutableStateOf(currentSettings.priorAbsenceCount.toString()) }
     var priorSpendingsInput by remember { mutableStateOf(currentSettings.priorSpendingsAmount.toInt().toString()) }
@@ -3358,6 +3463,37 @@ fun UserSettingsDialog(
 
                 HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
 
+                // Work Pause Toggle Switch
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = isWorkPaused,
+                        onCheckedChange = { isWorkPaused = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = AmberOrange
+                        )
+                    )
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(
+                            text = "⏸️ إيقاف العمل مؤقتاً (إجازة / سفر):",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = LocalAppColors.current.text
+                        )
+                        Text(
+                            text = "تجميد احتساب الأجر اليومي والتنبيهات عند الإجازة.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textSub
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
                 Text(
                     text = "📜 بيانات سابقة (لمطابقة الكشف القديم):",
                     style = MaterialTheme.typography.titleMedium,
@@ -3479,6 +3615,7 @@ fun UserSettingsDialog(
                                 selectedDateInMillis,
                                 autoAddDailySpending,
                                 isSpendingDeductedFromSalary,
+                                isWorkPaused,
                                 openingBalance,
                                 priorAbsences,
                                 priorSpendings,
