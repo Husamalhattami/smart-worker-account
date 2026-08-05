@@ -47,19 +47,27 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     val activeUser = MutableStateFlow<String?>(null)
     val registeredUsers = MutableStateFlow<List<String>>(emptyList())
 
-    private val db = AppDatabase.getDatabase(application)
-    private val repository = SalaryRepository(db.salaryDao(), db.transactionDao(), db.currencyDao())
+    private fun getRepoForUser(userName: String?): SalaryRepository {
+        val userDb = AppDatabase.getDatabaseForUser(getApplication(), userName)
+        return SalaryRepository(userDb.salaryDao(), userDb.transactionDao(), userDb.currencyDao())
+    }
+
+    private val currentRepoFlow = MutableStateFlow<SalaryRepository>(getRepoForUser(sharedPrefs.getString("active_user", null)))
+    private val repository: SalaryRepository get() = currentRepoFlow.value
     private val ttsHelper: ArabicTtsHelper = ArabicTtsHelper(application)
     private val recorderHelper: VoiceRecorderHelper = VoiceRecorderHelper(application)
     private var isCheckingAutoSpendings = false
 
-    val settings: StateFlow<SalarySettings?> = repository.salarySettings
+    val settings: StateFlow<SalarySettings?> = currentRepoFlow
+        .flatMapLatest { it.salarySettings }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    val transactions: StateFlow<List<Transaction>> = repository.allTransactions
+    val transactions: StateFlow<List<Transaction>> = currentRepoFlow
+        .flatMapLatest { it.allTransactions }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    val currenciesState: StateFlow<List<CurrencyItem>> = repository.allCurrencies
+    val currenciesState: StateFlow<List<CurrencyItem>> = currentRepoFlow
+        .flatMapLatest { it.allCurrencies }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val metrics: StateFlow<SalaryMetrics>
@@ -90,9 +98,13 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     private var temporaryAudioPath: String? = null
 
     init {
-        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet()) ?: emptySet()
+        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
+        val initialActive = sharedPrefs.getString("active_user", null)
+        if (!initialActive.isNullOrBlank()) {
+            usersSet.add(initialActive.trim())
+        }
+        activeUser.value = initialActive
         registeredUsers.value = usersSet.toList().sorted()
-        activeUser.value = sharedPrefs.getString("active_user", null)
 
         // Ensure default settings and currencies exist in the database if empty
         viewModelScope.launch(Dispatchers.IO) {
@@ -100,10 +112,18 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 repository.seedDefaultCurrenciesIfEmpty()
                 val current = repository.getSalarySettingsDirect()
                 if (current == null) {
-                    repository.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = ""))
+                    repository.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = initialActive ?: ""))
                     Log.d("SalaryViewModel", "Initialized default empty salary settings row in database.")
                 } else if (current.employeeName.isNotBlank()) {
-                    loginUser(current.employeeName)
+                    val existingName = current.employeeName.trim()
+                    if (!usersSet.contains(existingName)) {
+                        usersSet.add(existingName)
+                        sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
+                        registeredUsers.value = usersSet.toList().sorted()
+                    }
+                    if (initialActive.isNull_or_blank_check()) {
+                        loginUser(existingName)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("SalaryViewModel", "Error checking/initializing default settings", e)
@@ -161,47 +181,144 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    private fun String?.isNull_or_blank_check(): Boolean = this.isNullOrBlank()
+
+    fun registerNewUserAccount(
+        name: String,
+        salary: Double,
+        startDate: Long,
+        currency: String,
+        standardSpending: Double,
+        dailyReminderEnabled: Boolean,
+        dailyReminderHour: Int,
+        dailyReminderMinute: Int,
+        openingBalance: Double
+    ) {
+        val trimmedName = name.trim()
+        if (trimmedName.isBlank()) return
+
+        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
+        val isBrandNew = !usersSet.contains(trimmedName)
+        usersSet.add(trimmedName)
+        activeUser.value?.let { curr ->
+            if (curr.isNotBlank()) usersSet.add(curr.trim())
+        }
+        sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
+        sharedPrefs.edit().putString("active_user", trimmedName).apply()
+        registeredUsers.value = usersSet.toList().sorted()
+        activeUser.value = trimmedName
+
+        AppDatabase.closeDatabaseForUser(trimmedName)
+
+        val newRepo = getRepoForUser(trimmedName)
+        currentRepoFlow.value = newRepo
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (isBrandNew) {
+                    newRepo.deleteAllTransactions()
+                }
+                newRepo.seedDefaultCurrenciesIfEmpty()
+                val current = newRepo.getSalarySettingsDirect() ?: SalarySettings(id = 1)
+                val newSettings = current.copy(
+                    id = 1,
+                    monthlySalary = salary,
+                    startWorkDate = startDate,
+                    currency = currency,
+                    standardSpendingAmount = standardSpending,
+                    priorAbsenceCount = 0,
+                    priorSpendingsAmount = 0.0,
+                    priorDrawsAmount = 0.0,
+                    dailyReminderEnabled = dailyReminderEnabled,
+                    dailyReminderHour = dailyReminderHour,
+                    dailyReminderMinute = dailyReminderMinute,
+                    employeeName = trimmedName,
+                    voiceEnabled = true,
+                    openingBalance = openingBalance
+                )
+                newRepo.insertOrUpdateSalarySettings(newSettings)
+            } catch (e: Exception) {
+                Log.e("SalaryViewModel", "Error registering new user account for $trimmedName", e)
+            }
+        }
+    }
+
     fun loginUser(name: String) {
         val trimmedName = name.trim()
+        if (trimmedName.isBlank()) return
         sharedPrefs.edit().putString("active_user", trimmedName).apply()
         
-        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet()) ?: emptySet()
-        val newUsersSet = usersSet.toMutableSet().apply { add(trimmedName) }
-        sharedPrefs.edit().putStringSet("registered_users", newUsersSet).apply()
+        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
+        usersSet.add(trimmedName)
+        activeUser.value?.let { curr ->
+            if (curr.isNotBlank()) usersSet.add(curr.trim())
+        }
+        sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
         
-        registeredUsers.value = newUsersSet.toList().sorted()
+        registeredUsers.value = usersSet.toList().sorted()
         activeUser.value = trimmedName
+
+        val newRepo = getRepoForUser(trimmedName)
+        currentRepoFlow.value = newRepo
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                newRepo.seedDefaultCurrenciesIfEmpty()
+                val current = newRepo.getSalarySettingsDirect()
+                if (current == null) {
+                    newRepo.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = trimmedName))
+                } else if (current.employeeName.isBlank()) {
+                    newRepo.insertOrUpdateSalarySettings(current.copy(employeeName = trimmedName))
+                }
+            } catch (e: Exception) {
+                Log.e("SalaryViewModel", "Error initializing repo for user $trimmedName", e)
+            }
+        }
     }
 
     fun logoutUser() {
         sharedPrefs.edit().remove("active_user").apply()
         activeUser.value = null
+        val defaultRepo = getRepoForUser(null)
+        currentRepoFlow.value = defaultRepo
     }
 
     fun deleteUser(name: String) {
         val trimmedName = name.trim()
-        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet()) ?: emptySet()
-        val newUsersSet = usersSet.toMutableSet().apply { remove(trimmedName) }
-        sharedPrefs.edit().putStringSet("registered_users", newUsersSet).apply()
+        val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
+        usersSet.remove(trimmedName)
+        sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
         
-        registeredUsers.value = newUsersSet.toList().sorted()
+        registeredUsers.value = usersSet.toList().sorted()
         
-        if (activeUser.value == trimmedName) {
-            logoutUser()
-        }
+        AppDatabase.closeDatabaseForUser(trimmedName)
         
         try {
-            val dbName = "salary_db_${trimmedName.replace("\\s+".toRegex(), "_").lowercase()}"
+            val dbName = AppDatabase.getDatabaseNameForUser(trimmedName)
             getApplication<Application>().deleteDatabase(dbName)
         } catch (e: Exception) {
             e.printStackTrace()
+        }
+
+        if (activeUser.value == trimmedName) {
+            val nextUser = registeredUsers.value.firstOrNull()
+            if (nextUser != null) {
+                loginUser(nextUser)
+            } else {
+                logoutUser()
+            }
         }
     }
 
     private fun calculateSalaryMetrics(settings: SalarySettings, txList: List<Transaction>): SalaryMetrics {
         val calendarNow = Calendar.getInstance()
         
-        // Normalize calendars to midnight to compute precise difference in days
+        val calStartRaw = Calendar.getInstance().apply { timeInMillis = settings.startWorkDate }
+        val isIntradayStart = calStartRaw.get(Calendar.HOUR_OF_DAY) != 0 || 
+                              calStartRaw.get(Calendar.MINUTE) != 0 || 
+                              calStartRaw.get(Calendar.SECOND) != 0
+
+        // Period start timestamp
         val calStartMidnight = Calendar.getInstance().apply {
             timeInMillis = settings.startWorkDate
             set(Calendar.HOUR_OF_DAY, 0)
@@ -209,6 +326,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }
+        val activePeriodStart = if (isIntradayStart) settings.startWorkDate else calStartMidnight.timeInMillis
         
         val calNowMidnight = Calendar.getInstance().apply {
             timeInMillis = settings.stopWorkDate ?: calendarNow.timeInMillis
@@ -220,23 +338,25 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         
         val diffInMillis = calNowMidnight.timeInMillis - calStartMidnight.timeInMillis
         val diffInDays = (diffInMillis / (1000 * 60 * 60 * 24)).toInt()
-        val elapsedDays = if (diffInDays < 0) 0 else (diffInDays + 1)
+        val elapsedDays = if (diffInDays < 0) 0 else if (isIntradayStart) diffInDays else (diffInDays + 1)
 
         // Standard month is 30 days for base rate calculation
-        val dailyRate = settings.monthlySalary / 30.0
+        val dailyRate = if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0
         val hourlyRate = dailyRate / 12.0 // standard 12-hour workday
 
-        // Calculate total absence hours. If amount == 0.0, we treat it as 12 hours (full day).
-        // If amount > 0.0, we treat it as the exact missed hours.
-        val totalAbsenceHours = txList.filter { it.type == "ABSENCE" }.sumOf { 
+        // Filter transactions for current ACTIVE period (timestamp >= activePeriodStart)
+        val activeTxList = txList.filter { it.timestamp >= activePeriodStart }
+
+        // Calculate active period absence hours. If amount == 0.0, we treat it as 12 hours (full day).
+        val totalAbsenceHours = activeTxList.filter { it.type == "ABSENCE" }.sumOf { 
             if (it.amount <= 0.0) 12.0 else it.amount 
         } + (settings.priorAbsenceCount * 12.0)
 
         // absenceCount in days (Double)
         val absenceCount = totalAbsenceHours / 12.0
 
-        val totalSpendings = txList.filter { it.type == "SPENDING" }.sumOf { it.amount } + settings.priorSpendingsAmount
-        val totalDraws = txList.filter { it.type == "DRAW" }.sumOf { it.amount } + settings.priorDrawsAmount
+        val totalSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount } + settings.priorSpendingsAmount
+        val totalDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount } + settings.priorDrawsAmount
 
         // workedDays in days (Double)
         val workedDays = maxOf(0.0, elapsedDays.toDouble() - absenceCount)
@@ -244,8 +364,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         // Earned salary is base rate * elapsed days, minus absence deduction
         val earnedSalary = maxOf(0.0, (elapsedDays.toDouble() * dailyRate) - (totalAbsenceHours * hourlyRate))
         
-        // If spending is deducted from salary, subtract total spendings from net balance.
-        // If spending is outside salary (net salary rate), do NOT subtract spendings from net balance owed.
+        // Net balance: Opening balance + active earned salary - active spendings - active draws
         val netBalance = if (settings.isSpendingDeductedFromSalary) {
             earnedSalary + settings.openingBalance - totalSpendings - totalDraws
         } else {
@@ -264,6 +383,77 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             netBalance = netBalance,
             openingBalance = settings.openingBalance
         )
+    }
+
+    // Helper to adjust current opening balance when a transaction prior to active period is added, modified, or deleted
+    private fun adjustOpeningBalanceForOldTx(
+        currentSettings: SalarySettings,
+        oldTx: Transaction?,
+        newTx: Transaction?
+    ): SalarySettings {
+        val dailyRate = if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0
+        val hourlyRate = dailyRate / 12.0
+
+        val txTime = newTx?.timestamp ?: oldTx?.timestamp ?: return currentSettings
+        if (txTime < currentSettings.startWorkDate) {
+            val oldEffect = when (oldTx?.type) {
+                "SPENDING", "DRAW" -> - (oldTx.amount)
+                "ABSENCE" -> {
+                    val hrs = if (oldTx.amount <= 0.0) 12.0 else oldTx.amount
+                    - (hrs * hourlyRate)
+                }
+                else -> 0.0
+            }
+
+            val newEffect = when (newTx?.type) {
+                "SPENDING", "DRAW" -> - (newTx.amount)
+                "ABSENCE" -> {
+                    val hrs = if (newTx.amount <= 0.0) 12.0 else newTx.amount
+                    - (hrs * hourlyRate)
+                }
+                else -> 0.0
+            }
+
+            val delta = newEffect - oldEffect
+            if (delta != 0.0) {
+                return currentSettings.copy(
+                    openingBalance = currentSettings.openingBalance + delta
+                )
+            }
+        }
+        return currentSettings
+    }
+
+    // Explicitly Settle and Lock current active period: turns current net balance into new opening balance, resets active counters
+    fun settleAndLockAccount() {
+        viewModelScope.launch {
+            val currentSettings = repository.getSalarySettingsDirect() ?: SalarySettings()
+            val txList = repository.getAllTransactionsDirect()
+            val metrics = calculateSalaryMetrics(currentSettings, txList)
+
+            val now = System.currentTimeMillis()
+
+            // 1. Record chronological SETTLEMENT transaction into database
+            val settlementTx = Transaction(
+                type = "SETTLEMENT",
+                amount = metrics.netBalance,
+                timestamp = now,
+                voiceText = "🔒 تصفية وإقفال حساب وتدوير الرصيد"
+            )
+            repository.insertTransaction(settlementTx)
+
+            // 2. Update baseline settings for the new period
+            val updated = currentSettings.copy(
+                openingBalance = metrics.netBalance,
+                startWorkDate = now,
+                priorAbsenceCount = 0,
+                priorSpendingsAmount = 0.0,
+                priorDrawsAmount = 0.0
+            )
+            repository.insertOrUpdateSalarySettings(updated)
+            _userNotice.tryEmit("🔒 تم تصفية وإقفال حساب الفترة الحالية وتدوير الرصيد المتبقي كرصيد افتتاحي جديد بنجاح")
+            speakOutText("تمت تصفية وإقفال حساب الفترة السابقة وتدوير الصافي المتبقي كرصيد افتتاحي جديد بنجاح")
+        }
     }
 
     // Update Salary settings (with custom name, currency, standard spending, historical adjustments, and daily reminder settings)
@@ -292,15 +482,15 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             val current = repository.getSalarySettingsDirect() ?: SalarySettings()
             
-            // Check if monthly salary rate changed without changing start date
+            // Check if monthly salary rate changed or user explicitly reset start date
             var finalOpeningBalance = openingBalance
             var finalStartDate = startDate
             
             if (current.monthlySalary > 0.0 && salary != current.monthlySalary && startDate == current.startWorkDate) {
                 val txList = repository.getAllTransactionsDirect()
                 val oldMetrics = calculateSalaryMetrics(current, txList)
-                // Lock in earned salary under old rate into opening balance
-                finalOpeningBalance += oldMetrics.earnedSalary
+                // Lock in net balance under old rate into opening balance
+                finalOpeningBalance = oldMetrics.netBalance
                 finalStartDate = System.currentTimeMillis()
             }
 
@@ -327,6 +517,21 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 appLanguage = appLanguage
             )
             repository.insertOrUpdateSalarySettings(updated)
+
+            // Ensure initial OPENING_BALANCE transaction is recorded if non-zero and no prior settlement/opening exists
+            val existingTx = repository.getAllTransactionsDirect()
+            val hasOpeningOrSettlement = existingTx.any { it.type == "OPENING_BALANCE" || it.type == "SETTLEMENT" }
+            if (!hasOpeningOrSettlement && finalOpeningBalance > 0.0) {
+                repository.insertTransaction(
+                    Transaction(
+                        type = "OPENING_BALANCE",
+                        amount = finalOpeningBalance,
+                        timestamp = finalStartDate,
+                        voiceText = "رصيد افتتاحي سابق / أولي"
+                    )
+                )
+            }
+
             if (employeeName.isNotBlank()) {
                 loginUser(employeeName)
             }
@@ -357,6 +562,14 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 voiceText = text
             )
             repository.insertTransaction(tx)
+            
+            val currentSettings = repository.getSalarySettingsDirect()
+            if (currentSettings != null) {
+                val adjusted = adjustOpeningBalanceForOldTx(currentSettings, null, tx)
+                if (adjusted != currentSettings) {
+                    repository.insertOrUpdateSalarySettings(adjusted)
+                }
+            }
             
             val cur = settings.value?.currency ?: "ريال يمني"
             // Speak confirmation in clean Arabic words
@@ -482,6 +695,15 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     fun deleteTransaction(tx: Transaction) {
         viewModelScope.launch {
             repository.deleteTransaction(tx)
+            
+            val currentSettings = repository.getSalarySettingsDirect()
+            if (currentSettings != null) {
+                val adjusted = adjustOpeningBalanceForOldTx(currentSettings, tx, null)
+                if (adjusted != currentSettings) {
+                    repository.insertOrUpdateSalarySettings(adjusted)
+                }
+            }
+
             // Delete voice file if exists
             tx.voiceNotePath?.let { path ->
                 val file = File(path)
@@ -496,7 +718,18 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateTransaction(tx: Transaction) {
         viewModelScope.launch {
+            val oldTxList = repository.getAllTransactionsDirect()
+            val oldTx = oldTxList.find { it.id == tx.id }
             repository.insertTransaction(tx)
+
+            val currentSettings = repository.getSalarySettingsDirect()
+            if (currentSettings != null && oldTx != null) {
+                val adjusted = adjustOpeningBalanceForOldTx(currentSettings, oldTx, tx)
+                if (adjusted != currentSettings) {
+                    repository.insertOrUpdateSalarySettings(adjusted)
+                }
+            }
+
             _userNotice.tryEmit("✏️ تم تحديث العملية بنجاح")
             speakOutText("تم تحديث العملية بنجاح")
         }
@@ -791,6 +1024,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             val root = JSONObject(jsonString)
             if (root.has("settings")) {
                 val sObj = root.getJSONObject("settings")
+                val activeName = activeUser.value
+                val targetName = if (!activeName.isNullOrBlank()) activeName else sObj.optString("employeeName", "")
                 val restoredSettings = SalarySettings(
                     id = 1,
                     monthlySalary = sObj.optDouble("monthlySalary", 150000.0),
@@ -804,7 +1039,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     dailyReminderEnabled = sObj.optBoolean("dailyReminderEnabled", true),
                     dailyReminderHour = sObj.optInt("dailyReminderHour", 5),
                     dailyReminderMinute = sObj.optInt("dailyReminderMinute", 0),
-                    employeeName = sObj.optString("employeeName", ""),
+                    employeeName = targetName,
                     voiceEnabled = sObj.optBoolean("voiceEnabled", true),
                     openingBalance = sObj.optDouble("openingBalance", 0.0),
                     securityEnabled = sObj.optBoolean("securityEnabled", false),

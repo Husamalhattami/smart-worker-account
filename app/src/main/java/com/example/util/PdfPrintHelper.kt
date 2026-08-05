@@ -24,7 +24,8 @@ object PdfPrintHelper {
         startDateFilter: Long? = null,
         endDateFilter: Long? = null,
         showTotalSummary: Boolean = true,
-        balanceDisplayMode: String = "AFTER_EACH_TX" // "AFTER_EACH_TX", "END_OF_MONTH", "END_OF_REPORT"
+        balanceDisplayMode: String = "AFTER_EACH_TX", // "AFTER_EACH_TX", "END_OF_MONTH", "END_OF_REPORT"
+        transactionTypeFilter: String = "ALL" // "ALL", "SPENDING", "DRAW", "ABSENCE", "SETTLEMENT"
     ) {
         val sdf = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("ar"))
         val dateString = sdf.format(Date())
@@ -34,103 +35,173 @@ object PdfPrintHelper {
 
         val currency = if (settings.currency.isBlank()) "ريال" else settings.currency
 
-        // Filter transactions based on date range
-        val filteredTransactions = transactions.filter { tx ->
-            val matchStart = startDateFilter == null || tx.timestamp >= startDateFilter
-            val matchEnd = endDateFilter == null || tx.timestamp <= (endDateFilter + 86400000L - 1L)
-            matchStart && matchEnd
-        }.sortedBy { it.timestamp }
+        // Determine effective report start and end timestamps
+        val nowMs = System.currentTimeMillis()
+        val effectiveStartMs = startDateFilter ?: settings.startWorkDate
+        val effectiveEndMs = if (endDateFilter != null) Math.min(endDateFilter + 86400000L - 1L, nowMs) else nowMs
 
-        // Filter label text
-        val periodLabel = if (startDateFilter != null && endDateFilter != null) {
-            "الفترة من ${startSdf.format(Date(startDateFilter))} إلى ${startSdf.format(Date(endDateFilter))}"
-        } else if (startDateFilter != null) {
-            "الفترة من ${startSdf.format(Date(startDateFilter))}"
-        } else if (endDateFilter != null) {
-            "الفترة حتى ${startSdf.format(Date(endDateFilter))}"
-        } else {
-            "كشف حساب شامل لجميع العمليات"
+        val startCal = Calendar.getInstance().apply {
+            timeInMillis = effectiveStartMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
         }
 
-        // Calculate accounting parameters
+        val endCal = Calendar.getInstance().apply {
+            timeInMillis = effectiveEndMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+
         val dailyWage = if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0
+
+        // Filter transactions based on date range & type filter
+        val rawFilteredTransactions = transactions.filter { tx ->
+            val matchStart = tx.timestamp >= startCal.timeInMillis
+            val matchEnd = tx.timestamp <= (endCal.timeInMillis + 86400000L - 1L)
+            val matchType = when (transactionTypeFilter) {
+                "SPENDING" -> tx.type == "SPENDING"
+                "DRAW" -> tx.type == "DRAW"
+                "ABSENCE" -> tx.type == "ABSENCE"
+                "SETTLEMENT" -> tx.type == "OPENING_BALANCE" || tx.type == "SETTLEMENT"
+                else -> true
+            }
+            matchStart && matchEnd && matchType
+        }.sortedBy { it.timestamp }
+
+        val filteredTransactions = rawFilteredTransactions
+
+        // Type filter label
+        val typeFilterTitle = when (transactionTypeFilter) {
+            "SPENDING" -> "كشف الصرفيات والمصروفات اليومية"
+            "DRAW" -> "كشف السحبيات والسلف المالية"
+            "ABSENCE" -> "كشف سجل الغيابات وخصم الساعات"
+            "SETTLEMENT" -> "كشف التصفيات الأسبوعية والأرصدة"
+            else -> "كشف حساب مالي شامل"
+        }
+
+        // Period filter label text
+        val periodLabel = if (startDateFilter != null && endDateFilter != null) {
+            "من ${startSdf.format(Date(startDateFilter))} إلى ${startSdf.format(Date(endDateFilter))}"
+        } else if (startDateFilter != null) {
+            "من ${startSdf.format(Date(startDateFilter))}"
+        } else if (endDateFilter != null) {
+            "حتى ${startSdf.format(Date(endDateFilter))}"
+        } else {
+            "كشف شامل من بداية التسجيل حتى اليوم"
+        }
+
+        // Calculate opening balance at report start date
+        val (reportOpeningBalance, reportStartDateStr) = if (startDateFilter != null && startDateFilter > settings.startWorkDate) {
+            val priorTransactions = transactions.filter { it.timestamp < startDateFilter }
+            val priorSpendings = priorTransactions.filter { it.type == "SPENDING" }.sumOf { it.amount }
+            val priorDraws = priorTransactions.filter { it.type == "DRAW" }.sumOf { it.amount }
+            val priorAbsenceCount = priorTransactions.count { it.type == "ABSENCE" }
+            val priorAbsenceDeduction = priorAbsenceCount * dailyWage
+            
+            val priorDays = ((startDateFilter - settings.startWorkDate) / (24 * 3600 * 1000L)).coerceAtLeast(0L)
+            val priorEarnedSalary = priorDays * dailyWage
+            
+            val computedOpening = settings.openingBalance + priorEarnedSalary - priorSpendings - priorDraws - priorAbsenceDeduction
+            Pair(computedOpening, startSdf.format(Date(startDateFilter)))
+        } else {
+            Pair(settings.openingBalance, startWorkDateStr)
+        }
+
+        // Calculate actual worked days in the period
+        val diffMs = (endCal.timeInMillis - startCal.timeInMillis).coerceAtLeast(0L)
+        val workedDaysInPeriod = ((diffMs / 86400000L) + 1L).toInt()
+        val totalEarnedSalaryInPeriod = workedDaysInPeriod * dailyWage
+
         val periodSpendings = filteredTransactions.filter { it.type == "SPENDING" }.sumOf { it.amount }
         val periodDraws = filteredTransactions.filter { it.type == "DRAW" }.sumOf { it.amount }
-        val absenceCount = filteredTransactions.count { it.type == "ABSENCE" }
-        val absenceDeduction = absenceCount * dailyWage
+        
+        val absenceTxList = filteredTransactions.filter { it.type == "ABSENCE" }
+        val absenceHoursTotal = absenceTxList.sumOf { if (it.amount <= 0.0) 12.0 else it.amount }
+        val absenceDaysCount = (absenceHoursTotal / 12.0)
+        val absenceDeduction = absenceHoursTotal * (dailyWage / 12.0)
 
-        val monthlySalary = settings.monthlySalary
-        val openingBalance = settings.openingBalance
-        val netMonthEarnings = monthlySalary - periodSpendings - periodDraws - absenceDeduction
-        val finalNetBalance = netMonthEarnings + openingBalance
+        val netPeriodEarnings = totalEarnedSalaryInPeriod - periodSpendings - periodDraws - absenceDeduction
+        val finalNetBalance = reportOpeningBalance + netPeriodEarnings
 
         val empName = if (settings.employeeName.isBlank()) "حسام الحطامي" else settings.employeeName
 
-        // Build HTML Content
+        // Build Paper-Optimized HTML Content
         val htmlContent = buildString {
             append("""
                 <!DOCTYPE html>
                 <html dir="rtl" lang="ar">
                 <head>
                     <meta charset="UTF-8">
-                    <title>كشف حساب مالي - $empName</title>
+                    <title>$typeFilterTitle - $empName</title>
                     <style>
+                        @page {
+                            size: A4;
+                            margin: 6mm;
+                        }
                         body {
-                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif, 'Cairo';
-                            color: #1e293b;
+                            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+                            color: #0f172a;
                             background-color: #ffffff;
-                            margin: 20px;
-                            padding: 0;
+                            margin: 0;
+                            padding: 4px;
                             direction: rtl;
+                            font-size: 10px;
+                            line-height: 1.25;
                         }
                         .header-container {
-                            border-bottom: 3px solid #10b981;
-                            padding-bottom: 15px;
-                            margin-bottom: 20px;
+                            border-bottom: 2px solid #059669;
+                            padding-bottom: 4px;
+                            margin-bottom: 8px;
                             display: flex;
                             justify-content: space-between;
                             align-items: center;
                         }
                         .app-title {
-                            font-size: 24px;
+                            font-size: 16px;
                             font-weight: bold;
                             color: #059669;
                             margin: 0;
                         }
                         .report-subtitle {
-                            font-size: 14px;
-                            color: #64748b;
-                            margin: 5px 0 0 0;
+                            font-size: 10px;
+                            color: #475569;
+                            margin: 2px 0 0 0;
                         }
                         .employee-card {
                             background-color: #f8fafc;
                             border: 1px solid #cbd5e1;
-                            border-radius: 12px;
-                            padding: 16px;
-                            margin-bottom: 20px;
+                            border-radius: 6px;
+                            padding: 6px 10px;
+                            margin-bottom: 8px;
                         }
                         .employee-name {
-                            font-size: 20px;
+                            font-size: 14px;
                             font-weight: bold;
                             color: #0f172a;
-                            margin-top: 0;
-                            margin-bottom: 10px;
+                            margin: 0 0 4px 0;
                         }
                         .meta-grid {
                             display: grid;
-                            grid-template-columns: 1fr 1fr;
-                            gap: 12px;
-                            font-size: 14px;
+                            grid-template-columns: repeat(4, 1fr);
+                            gap: 6px;
+                            font-size: 10px;
                         }
                         .meta-item {
-                            display: flex;
-                            justify-content: space-between;
-                            border-bottom: 1px dashed #e2e8f0;
-                            padding-bottom: 4px;
+                            background-color: #ffffff;
+                            padding: 3px 6px;
+                            border-radius: 4px;
+                            border: 1px solid #e2e8f0;
+                            text-align: center;
                         }
                         .meta-label {
                             color: #64748b;
-                            font-weight: bold;
+                            display: block;
+                            font-size: 8.5px;
+                            margin-bottom: 1px;
                         }
                         .meta-value {
                             color: #0f172a;
@@ -138,77 +209,74 @@ object PdfPrintHelper {
                         }
 
                         /* Accounting Calculation Summary Box */
-                        .accounting-summary-box {
+                        .summary-box {
                             background-color: #ecfdf5;
-                            border: 2px solid #059669;
-                            border-radius: 12px;
-                            padding: 16px;
-                            margin-bottom: 25px;
+                            border: 1.5px solid #059669;
+                            border-radius: 6px;
+                            padding: 6px 10px;
+                            margin-bottom: 10px;
+                            font-size: 10px;
                         }
                         .summary-title {
-                            font-size: 16px;
+                            font-size: 11px;
                             font-weight: bold;
                             color: #047857;
-                            margin-bottom: 12px;
+                            margin-bottom: 4px;
                             border-bottom: 1px solid #a7f3d0;
-                            padding-bottom: 6px;
+                            padding-bottom: 3px;
                         }
                         .summary-grid {
                             display: grid;
-                            grid-template-columns: 1fr 1fr;
-                            gap: 10px;
-                            font-size: 14px;
-                            margin-bottom: 12px;
+                            grid-template-columns: repeat(4, 1fr);
+                            gap: 6px;
+                            margin-bottom: 4px;
                         }
                         .step-item {
-                            display: flex;
-                            justify-content: space-between;
                             background-color: #ffffff;
-                            padding: 8px 12px;
-                            border-radius: 8px;
+                            padding: 4px 6px;
+                            border-radius: 4px;
                             border: 1px solid #d1fae5;
-                        }
-                        .step-result-row {
-                            background-color: #d1fae5;
-                            color: #065f46;
-                            padding: 10px 14px;
-                            border-radius: 8px;
-                            font-weight: bold;
-                            font-size: 15px;
-                            display: flex;
-                            justify-content: space-between;
-                            margin-top: 8px;
+                            text-align: center;
                         }
                         .step-final-row {
                             background-color: #059669;
                             color: #ffffff;
-                            padding: 12px 16px;
-                            border-radius: 8px;
+                            padding: 5px 8px;
+                            border-radius: 5px;
                             font-weight: bold;
-                            font-size: 16px;
+                            font-size: 11px;
                             display: flex;
                             justify-content: space-between;
-                            margin-top: 10px;
+                            margin-top: 3px;
                         }
 
-                        /* Accounting Table */
+                        /* Compact Accounting Table */
                         table {
                             width: 100%;
                             border-collapse: collapse;
-                            margin-bottom: 25px;
+                            margin-bottom: 10px;
+                            font-size: 9.5px;
+                            page-break-inside: auto;
+                        }
+                        tr {
+                            page-break-inside: avoid;
+                            page-break-after: auto;
                         }
                         th {
-                            padding: 10px 12px;
-                            font-size: 13px;
+                            padding: 5px 3px;
+                            font-size: 9.5px;
                             font-weight: bold;
                             text-align: center;
-                            border: 1px solid #cbd5e1;
+                            border: 1px solid #475569;
+                            background-color: #0f172a;
+                            color: #ffffff;
                         }
                         td {
-                            padding: 10px 12px;
-                            border: 1px solid #e2e8f0;
-                            font-size: 13px;
+                            padding: 4px 3px;
+                            border: 1px solid #cbd5e1;
+                            font-size: 9.5px;
                             text-align: center;
+                            vertical-align: middle;
                         }
                         tr:nth-child(even) {
                             background-color: #f8fafc;
@@ -216,14 +284,15 @@ object PdfPrintHelper {
                         
                         /* Footer signature */
                         .footer-container {
-                            margin-top: 40px;
+                            margin-top: 15px;
                             display: flex;
                             justify-content: space-between;
                             align-items: center;
-                            font-size: 12px;
+                            font-size: 9.5px;
                             color: #64748b;
                             border-top: 1px solid #cbd5e1;
-                            padding-top: 15px;
+                            padding-top: 6px;
+                            page-break-inside: avoid;
                         }
 
                         @media print {
@@ -237,11 +306,11 @@ object PdfPrintHelper {
                 <body>
                     <div class="header-container">
                         <div>
-                            <h1 class="app-title">حساب العامل الذكي 📱</h1>
-                            <p class="report-subtitle">كشف حساب مالي رسمي ومستند محاسبي ($periodLabel)</p>
+                            <h1 class="app-title">$typeFilterTitle 📋</h1>
+                            <p class="report-subtitle">مستند مالي محدد للفترة: ($periodLabel)</p>
                         </div>
-                        <div style="text-align: left; font-size: 12px; color: #64748b;">
-                            تاريخ الطباعة: $dateString
+                        <div style="text-align: left; font-size: 9.5px; color: #64748b;">
+                            تاريخ الإصدار: $dateString
                         </div>
                     </div>
 
@@ -249,161 +318,331 @@ object PdfPrintHelper {
                         <div class="employee-name">الموظف / العامل: $empName</div>
                         <div class="meta-grid">
                             <div class="meta-item">
-                                <span class="meta-label">تاريخ بدء العمل:</span>
+                                <span class="meta-label">تاريخ بدء العمل</span>
                                 <span class="meta-value">$startWorkDateStr</span>
                             </div>
                             <div class="meta-item">
-                                <span class="meta-label">الراتب الشهري الأساسي:</span>
-                                <span class="meta-value" style="color: #059669;">${monthlySalary.toInt()} $currency</span>
+                                <span class="meta-label">الراتب الشهري المحدد</span>
+                                <span class="meta-value" style="color: #059669;">${settings.monthlySalary.toInt()} $currency</span>
                             </div>
                             <div class="meta-item">
-                                <span class="meta-label">معدل الأجر اليومي:</span>
+                                <span class="meta-label">الأجر اليومي المستحق</span>
                                 <span class="meta-value">${dailyWage.toInt()} $currency / يوم</span>
                             </div>
                             <div class="meta-item">
-                                <span class="meta-label">الرصيد الافتتاحي (السابق):</span>
-                                <span class="meta-value" style="color: #1e40af;">${openingBalance.toInt()} $currency</span>
+                                <span class="meta-label">الرصيد الافتتاحي</span>
+                                <span class="meta-value" style="color: #1e40af;">${reportOpeningBalance.toInt()} $currency</span>
                             </div>
                         </div>
                     </div>
             """.trimIndent())
 
-            // Detailed Accounting Monthly Calculation Summary Box
+            // Header Accounting Calculation Summary Box
             if (showTotalSummary) {
                 append("""
-                    <div class="accounting-summary-box">
-                        <div class="summary-title">📊 تفصيل وتصفية الحساب الشهري المالي:</div>
+                    <div class="summary-box">
+                        <div class="summary-title">📊 الخلاصة المالية والتصفية للفترة الحالية ($workedDaysInPeriod يوم عمل):</div>
                         <div class="summary-grid">
                             <div class="step-item">
-                                <span>1. راتب وأجر الشهر الأساسي:</span>
-                                <span style="font-weight: bold; color: #059669;">+${monthlySalary.toInt()} $currency</span>
+                                <span style="color: #64748b; display: block; font-size: 8.5px;">إجمالي الصرفيات (-)</span>
+                                <span style="font-weight: bold; color: #1d4ed8;">-${periodSpendings.toInt()} $currency</span>
                             </div>
                             <div class="step-item">
-                                <span>2. إجمالي الصرفيات (خصم):</span>
-                                <span style="font-weight: bold; color: #b91c1c;">-${periodSpendings.toInt()} $currency</span>
+                                <span style="color: #64748b; display: block; font-size: 8.5px;">إجمالي السحبيات (-)</span>
+                                <span style="font-weight: bold; color: #b45309;">-${periodDraws.toInt()} $currency</span>
                             </div>
                             <div class="step-item">
-                                <span>3. إجمالي السحبيات (خصم):</span>
-                                <span style="font-weight: bold; color: #b91c1c;">-${periodDraws.toInt()} $currency</span>
-                            </div>
-                            <div class="step-item">
-                                <span>4. خصم الغياب ($absenceCount أيام):</span>
+                                <span style="color: #64748b; display: block; font-size: 8.5px;">خصم الغياب (${absenceDaysCount} يوم) (-)</span>
                                 <span style="font-weight: bold; color: #b91c1c;">-${absenceDeduction.toInt()} $currency</span>
                             </div>
+                            <div class="step-item">
+                                <span style="color: #64748b; display: block; font-size: 8.5px;">مستحق أجر العمل للفترة ($workedDaysInPeriod يوم) (+)</span>
+                                <span style="font-weight: bold; color: #047857;">+${totalEarnedSalaryInPeriod.toInt()} $currency</span>
+                            </div>
                         </div>
 
-                        <div class="step-result-row">
-                            <span>👈 صافي المتبقي من مستحق هذا الشهر:</span>
-                            <span>${monthlySalary.toInt()} - ${periodSpendings.toInt()} - ${periodDraws.toInt()} - ${absenceDeduction.toInt()} = <u>${netMonthEarnings.toInt()} $currency</u></span>
-                        </div>
-
-                        ${if (openingBalance != 0.0) """
                         <div class="step-final-row">
-                            <span>💰 إجمالي الصافي النهائي الكلي (المتبقي للعامل مع الرصيد السابق):</span>
-                            <span>${netMonthEarnings.toInt()} + ${openingBalance.toInt()} = ${finalNetBalance.toInt()} $currency</span>
+                            <span>💰 إجمالي الصافي المتبقي الكلي للعامل (شامل الرصيد السابق والأجر اليومي):</span>
+                            <span>${finalNetBalance.toInt()} $currency</span>
                         </div>
-                        """ else """
-                        <div class="step-final-row">
-                            <span>💰 إجمالي الصافي النهائي المتبقي للعامل:</span>
-                            <span>${netMonthEarnings.toInt()} $currency</span>
-                        </div>
-                        """}
                     </div>
                 """.trimIndent())
             }
 
-            // Table Header with strictly requested columns
+            // Table Header with strictly requested 7 columns:
+            // 1. التاريخ | 2. البيان/الملاحظة | 3. الصرفيات (-) | 4. السحبيات (-) | 5. الغيابات (-) | 6. المستحقات (+) | 7. الرصيد المتبقي
             append("""
-                <h3>سجل الحركة اليومية للحساب (التاريخ / ملاحظة / عليكم / لكم / الإجمالي) 📋</h3>
-                <table>
+                <table style="width: 100%;">
                     <thead>
-                        <tr style="background-color: #0f172a; color: #ffffff;">
-                            <th style="width: 18%;">التاريخ</th>
-                            <th style="width: 32%;">ملاحظة / البيان</th>
-                            <th style="width: 17%; background-color: #991b1b; color: #ffffff;">عليكم (خصم/صرفة/سحبية)</th>
-                            <th style="width: 17%; background-color: #059669; color: #ffffff;">لكم (باقي الراتب اليومي/مستحق)</th>
-                            <th style="width: 16%; background-color: #1e40af; color: #ffffff;">الإجمالي (الرصيد)</th>
+                        <tr>
+                            <th style="width: 12%;">التاريخ</th>
+                            <th style="width: 27%;">البيان / الملاحظة</th>
+                            <th style="width: 12%; background-color: #1e40af; color: #ffffff;">الصرفيات (-)</th>
+                            <th style="width: 12%; background-color: #d97706; color: #ffffff;">السحبيات (-)</th>
+                            <th style="width: 12%; background-color: #b91c1c; color: #ffffff;">الغيابات (-)</th>
+                            <th style="width: 12%; background-color: #047857; color: #ffffff;">المستحقات (+)</th>
+                            <th style="width: 13%; background-color: #0f172a; color: #ffffff;">الرصيد المتبقي</th>
                         </tr>
                     </thead>
                     <tbody>
             """.trimIndent())
 
-            var runningBalance = openingBalance
+            var runningBalance = if (startDateFilter != null && startDateFilter > settings.startWorkDate) reportOpeningBalance else reportOpeningBalance
 
-            // Opening Balance Row
-            if (openingBalance != 0.0) {
+            val hasOpeningOrSettlementTx = filteredTransactions.any { it.type == "OPENING_BALANCE" || it.type == "SETTLEMENT" }
+
+            // Opening Balance Header Row
+            if (reportOpeningBalance != 0.0 && startDateFilter != null && !hasOpeningOrSettlementTx) {
                 append("""
                     <tr style="background-color: #f1f5f9; font-weight: bold;">
-                        <td>$startWorkDateStr</td>
-                        <td>رصيد سابق / رصيد افتتاحي</td>
-                        <td style="color: #64748b;">-</td>
-                        <td style="color: #059669;">${openingBalance.toInt()} $currency</td>
-                        <td style="color: #1e40af; font-size: 14px;">${runningBalance.toInt()} $currency</td>
+                        <td>$reportStartDateStr</td>
+                        <td style="text-align: right; padding-right: 6px;">رصيد سابق مترحل حتى بداية الفترة</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td style="color: #059669;">+${reportOpeningBalance.toInt()} $currency</td>
+                        <td style="color: #1e40af; font-size: 10px;">${runningBalance.toInt()} $currency</td>
                     </tr>
                 """.trimIndent())
             }
 
-            if (filteredTransactions.isEmpty() && openingBalance == 0.0) {
-                append("""
-                    <tr>
-                        <td colspan="5" style="text-align: center; color: #94a3b8; padding: 30px;">
-                            لا توجد أي عمليات مسجلة في هذه الفترة المحددة.
-                        </td>
-                    </tr>
-                """.trimIndent())
+            val itemSdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+            val monthKeySdf = SimpleDateFormat("yyyy/MM", Locale("ar"))
+
+            if (transactionTypeFilter == "ALL") {
+                // Detailed daily breakdown with daily wage accrual
+                val currLoopCal = Calendar.getInstance().apply { timeInMillis = startCal.timeInMillis }
+                val endLoopMs = endCal.timeInMillis
+
+                var currentMonthKey = ""
+                var monthSpendings = 0.0
+                var monthDraws = 0.0
+                var monthAbsences = 0.0
+                var monthEarned = 0.0
+
+                while (currLoopCal.timeInMillis <= endLoopMs) {
+                    val dayMidnight = currLoopCal.timeInMillis
+                    val formattedDate = itemSdf.format(Date(dayMidnight))
+                    val mKey = monthKeySdf.format(Date(dayMidnight))
+
+                    if (mKey != currentMonthKey) {
+                        if (currentMonthKey.isNotBlank()) {
+                            // Monthly Subtotal Summary Row
+                            append("""
+                                <tr style="background-color: #f0fdf4; border-top: 1.5px solid #059669; border-bottom: 1.5px solid #059669; font-weight: bold;">
+                                    <td colspan="2" style="text-align: right; color: #166534; padding: 5px;">📌 ملخص نهاية شهر ($currentMonthKey):</td>
+                                    <td style="color: #1d4ed8;">-${monthSpendings.toInt()} $currency</td>
+                                    <td style="color: #b45309;">-${monthDraws.toInt()} $currency</td>
+                                    <td style="color: #b91c1c;">-${monthAbsences.toInt()} $currency</td>
+                                    <td style="color: #047857;">+${monthEarned.toInt()} $currency</td>
+                                    <td style="color: #1e40af;">${runningBalance.toInt()} $currency</td>
+                                </tr>
+                            """.trimIndent())
+                        }
+                        currentMonthKey = mKey
+                        monthSpendings = 0.0
+                        monthDraws = 0.0
+                        monthAbsences = 0.0
+                        monthEarned = 0.0
+                    }
+
+                    // Find transactions on this exact day
+                    val dayTxList = filteredTransactions.filter { tx ->
+                        val txCal = Calendar.getInstance().apply {
+                            timeInMillis = tx.timestamp
+                            set(Calendar.HOUR_OF_DAY, 0)
+                            set(Calendar.MINUTE, 0)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }
+                        txCal.timeInMillis == dayMidnight
+                    }
+
+                    if (dayTxList.isEmpty()) {
+                        // Work day with no special deductions -> standard daily wage earned
+                        runningBalance += dailyWage
+                        monthEarned += dailyWage
+
+                        val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
+
+                        append("""
+                            <tr>
+                                <td>$formattedDate</td>
+                                <td style="text-align: right; padding-right: 6px; color: #334155;">أجر عمل يومي مستحق 💼</td>
+                                <td>-</td>
+                                <td>-</td>
+                                <td>-</td>
+                                <td><span style="color: #047857; font-weight: bold;">+${dailyWage.toInt()} $currency</span></td>
+                                <td style="font-weight: bold; color: #1e40af;">$showBal</td>
+                            </tr>
+                        """.trimIndent())
+                    } else {
+                        var dailyWageCredited = false
+                        for (tx in dayTxList) {
+                            val noteText = tx.voiceText?.takeIf { it.isNotBlank() } ?: ""
+
+                            var spendingCell = "-"
+                            var drawCell = "-"
+                            var absenceCell = "-"
+                            var earnedCell = "-"
+                            var noteLabel = ""
+
+                            when (tx.type) {
+                                "OPENING_BALANCE" -> {
+                                    noteLabel = if (noteText.isNotBlank()) noteText else "رصيد افتتاحي أولي"
+                                    earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                                    runningBalance = tx.amount
+                                    monthEarned += tx.amount
+                                }
+                                "SETTLEMENT" -> {
+                                    noteLabel = if (noteText.isNotBlank()) noteText else "🔒 تصفية وإقفال حساب وتدوير رصيد"
+                                    earnedCell = "<span style='color: #6b21a8; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
+                                    runningBalance = tx.amount
+                                    monthEarned += tx.amount
+                                }
+                                "SPENDING" -> {
+                                    noteLabel = if (noteText.isNotBlank()) noteText else "صرفة يومية"
+                                    spendingCell = "<span style='color: #1d4ed8; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
+                                    monthSpendings += tx.amount
+
+                                    if (!dailyWageCredited) {
+                                        runningBalance += (dailyWage - tx.amount)
+                                        monthEarned += dailyWage
+                                        earnedCell = "<span style='color: #047857; font-weight: bold;'>+${dailyWage.toInt()} $currency</span>"
+                                        dailyWageCredited = true
+                                    } else {
+                                        runningBalance -= tx.amount
+                                    }
+                                }
+                                "DRAW" -> {
+                                    noteLabel = if (noteText.isNotBlank()) noteText else "سحبية / سلفة"
+                                    drawCell = "<span style='color: #b45309; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
+                                    monthDraws += tx.amount
+
+                                    if (!dailyWageCredited) {
+                                        runningBalance += (dailyWage - tx.amount)
+                                        monthEarned += dailyWage
+                                        earnedCell = "<span style='color: #047857; font-weight: bold;'>+${dailyWage.toInt()} $currency</span>"
+                                        dailyWageCredited = true
+                                    } else {
+                                        runningBalance -= tx.amount
+                                    }
+                                }
+                                "ABSENCE" -> {
+                                    val absHours = if (tx.amount <= 0.0) 12.0 else tx.amount
+                                    val absDed = absHours * (dailyWage / 12.0)
+                                    val durationText = if (absHours == 12.0) "خصم غياب (يوم كامل)" else "خصم غياب ($absHours ساعات)"
+                                    noteLabel = if (noteText.isNotBlank()) "$durationText - $noteText" else durationText
+                                    absenceCell = "<span style='color: #b91c1c; font-weight: bold;'>-${absDed.toInt()} $currency</span>"
+                                    monthAbsences += absDed
+
+                                    if (!dailyWageCredited) {
+                                        // Standard daily wage earned, minus absence deduction
+                                        runningBalance += (dailyWage - absDed)
+                                        monthEarned += dailyWage
+                                        earnedCell = "<span style='color: #047857; font-weight: bold;'>+${dailyWage.toInt()} $currency</span>"
+                                        dailyWageCredited = true
+                                    } else {
+                                        runningBalance -= absDed
+                                    }
+                                }
+                            }
+
+                            val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
+
+                            append("""
+                                <tr>
+                                    <td>$formattedDate</td>
+                                    <td style="text-align: right; padding-right: 6px;">$noteLabel</td>
+                                    <td>$spendingCell</td>
+                                    <td>$drawCell</td>
+                                    <td>$absenceCell</td>
+                                    <td>$earnedCell</td>
+                                    <td style="font-weight: bold; color: #1e40af;">$showBal</td>
+                                </tr>
+                            """.trimIndent())
+                        }
+                    }
+
+                    currLoopCal.add(Calendar.DAY_OF_YEAR, 1)
+                }
+
+                if (currentMonthKey.isNotBlank()) {
+                    // Final Month Summary Row
+                    append("""
+                        <tr style="background-color: #f0fdf4; border-top: 1.5px solid #059669; border-bottom: 1.5px solid #059669; font-weight: bold;">
+                            <td colspan="2" style="text-align: right; color: #166534; padding: 5px;">📌 ملخص نهاية شهر ($currentMonthKey):</td>
+                            <td style="color: #1d4ed8;">-${monthSpendings.toInt()} $currency</td>
+                            <td style="color: #b45309;">-${monthDraws.toInt()} $currency</td>
+                            <td style="color: #b91c1c;">-${monthAbsences.toInt()} $currency</td>
+                            <td style="color: #047857;">+${monthEarned.toInt()} $currency</td>
+                            <td style="color: #1e40af;">${runningBalance.toInt()} $currency</td>
+                        </tr>
+                    """.trimIndent())
+                }
             } else {
-                val itemSdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
-
-                for (i in filteredTransactions.indices) {
-                    val tx = filteredTransactions[i]
+                // Type-filtered list (e.g. SPENDING only, DRAW only, etc.)
+                for (tx in filteredTransactions) {
                     val formattedDate = itemSdf.format(Date(tx.timestamp))
-
                     val noteText = tx.voiceText?.takeIf { it.isNotBlank() } ?: ""
 
-                    var aleikumStr = "-"
-                    var lakumStr = "-"
+                    var spendingCell = "-"
+                    var drawCell = "-"
+                    var absenceCell = "-"
+                    var earnedCell = "-"
                     var noteLabel = ""
 
                     when (tx.type) {
                         "SPENDING" -> {
-                            noteLabel = if (noteText.isNotBlank()) "صرفة: $noteText" else "صرفة يومية"
-                            aleikumStr = "${tx.amount.toInt()} $currency"
-                            lakumStr = "${dailyWage.toInt()} $currency"
-                            runningBalance += (dailyWage - tx.amount)
+                            noteLabel = if (noteText.isNotBlank()) noteText else "صرفة يومية"
+                            spendingCell = "<span style='color: #1d4ed8; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
+                            runningBalance -= tx.amount
                         }
                         "DRAW" -> {
-                            noteLabel = if (noteText.isNotBlank()) "سحبيّة: $noteText" else "سحبيّة نقداً"
-                            aleikumStr = "${tx.amount.toInt()} $currency"
-                            lakumStr = "-"
+                            noteLabel = if (noteText.isNotBlank()) noteText else "سحبية / سلفة"
+                            drawCell = "<span style='color: #b45309; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
                             runningBalance -= tx.amount
                         }
                         "ABSENCE" -> {
-                            noteLabel = if (noteText.isNotBlank()) "خصم غياب: $noteText" else "تسجيل غياب يوم"
-                            aleikumStr = "${dailyWage.toInt()} $currency"
-                            lakumStr = "-"
-                            runningBalance -= dailyWage
+                            val absHours = if (tx.amount <= 0.0) 12.0 else tx.amount
+                            val absDed = absHours * (dailyWage / 12.0)
+                            val durationText = if (absHours == 12.0) "خصم غياب (يوم كامل)" else "خصم غياب ($absHours ساعات)"
+                            noteLabel = if (noteText.isNotBlank()) "$durationText - $noteText" else durationText
+                            absenceCell = "<span style='color: #b91c1c; font-weight: bold;'>-${absDed.toInt()} $currency</span>"
+                            runningBalance -= absDed
+                        }
+                        else -> {
+                            noteLabel = if (noteText.isNotBlank()) noteText else "تصفية / رصيد"
+                            earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                            runningBalance = tx.amount
                         }
                     }
+
+                    val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
 
                     append("""
                         <tr>
                             <td>$formattedDate</td>
-                            <td style="text-align: right; font-weight: 500;">$noteLabel</td>
-                            <td style="font-weight: bold; color: #991b1b;">$aleikumStr</td>
-                            <td style="font-weight: bold; color: #059669;">$lakumStr</td>
-                            <td style="font-weight: bold; color: #1e40af;">${runningBalance.toInt()} $currency</td>
+                            <td style="text-align: right; padding-right: 6px;">$noteLabel</td>
+                            <td>$spendingCell</td>
+                            <td>$drawCell</td>
+                            <td>$absenceCell</td>
+                            <td>$earnedCell</td>
+                            <td style="font-weight: bold; color: #1e40af;">$showBal</td>
                         </tr>
                     """.trimIndent())
                 }
             }
 
-            // Final Summary Row
+            // Final Summary Row at Report End
             append("""
-                <tr style="background-color: #ecfdf5; font-size: 14px; font-weight: bold; border-top: 3px solid #059669;">
-                    <td colspan="2" style="text-align: right; color: #065f46; padding: 12px;">إجمالي صافي الرصيد المتبقي للعامل حتى الآن:</td>
-                    <td style="color: #991b1b;">${(periodSpendings + periodDraws + absenceDeduction).toInt()} $currency</td>
-                    <td style="color: #059669;">${(monthlySalary + openingBalance).toInt()} $currency</td>
-                    <td style="color: #1e40af; font-size: 15px;">${runningBalance.toInt()} $currency</td>
+                <tr style="background-color: #ecfdf5; font-size: 10.5px; font-weight: bold; border-top: 2.5px solid #059669;">
+                    <td colspan="2" style="text-align: right; color: #065f46; padding: 6px;">إجمالي المستحق والصافي النهائي المتبقي للعامل:</td>
+                    <td style="color: #1d4ed8;">-${periodSpendings.toInt()} $currency</td>
+                    <td style="color: #b45309;">-${periodDraws.toInt()} $currency</td>
+                    <td style="color: #b91c1c;">-${absenceDeduction.toInt()} $currency</td>
+                    <td style="color: #047857;">+${totalEarnedSalaryInPeriod.toInt()} $currency</td>
+                    <td style="color: #1e40af; font-size: 11px; background-color: #d1fae5;">${finalNetBalance.toInt()} $currency</td>
                 </tr>
             """.trimIndent())
 
@@ -412,8 +651,8 @@ object PdfPrintHelper {
                     </table>
 
                     <div class="footer-container">
-                        <span>تم إصدار كشف الحساب رسمياً وبدقة عبر تطبيق حساب العامل الذكي 📱</span>
-                        <span>توقيع واستلام العامل: ............................</span>
+                        <span>مستند حساب مالي رسمي مطبوع عبر تطبيق (حساب العامل الذكي 📱)</span>
+                        <span>توقيع واستلام الموظف/العامل: ............................</span>
                     </div>
                 </body>
                 </html>
@@ -441,7 +680,7 @@ object PdfPrintHelper {
                         printAdapter,
                         PrintAttributes.Builder().build()
                     )
-                    Toast.makeText(context, "جاري تحضير كشف الحساب وفتح نافذة الطباعة / تصدير PDF...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "جاري فتح كشف الحساب ونظام الطباعة / PDF...", Toast.LENGTH_SHORT).show()
                 }
             }
 
@@ -449,4 +688,3 @@ object PdfPrintHelper {
         }
     }
 }
-

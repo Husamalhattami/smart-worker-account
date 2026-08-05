@@ -98,29 +98,38 @@ object AdMobManager {
 
     /**
      * تحميل إعلان بيني (Interstitial Ad) مسبقاً في الخلفية ليكون جاهزاً للعرض فوراً عند طلبه.
+     * يحتوي على دالة إعادة المحاولة التلقائية باستخدام معرف الاختبار الرسمي في حال فشل المعرف الحقيقي.
      */
-    fun loadInterstitial(context: Context) {
+    fun loadInterstitial(context: Context, useTestIdFallback: Boolean = false) {
         if (interstitialAd != null || isLoadingInterstitial) {
             return
         }
         isLoadingInterstitial = true
 
+        val adUnitToUse = if (useTestIdFallback) AdMobIds.TEST_INTERSTITIAL_ID else AdMobIds.INTERSTITIAL_ID
         val adRequest = AdRequest.Builder().build()
+        
         InterstitialAd.load(
             context,
-            AdMobIds.INTERSTITIAL_ID,
+            adUnitToUse,
             adRequest,
             object : InterstitialAdLoadCallback() {
                 override fun onAdLoaded(ad: InterstitialAd) {
-                    Log.d("AdMobManager", "Interstitial Ad Loaded successfully.")
+                    Log.d("AdMobManager", "Interstitial Ad Loaded successfully with unit: $adUnitToUse")
                     interstitialAd = ad
                     isLoadingInterstitial = false
                 }
 
                 override fun onAdFailedToLoad(error: LoadAdError) {
-                    Log.e("AdMobManager", "Interstitial Ad Failed to load: ${error.message} (Code: ${error.code})")
+                    Log.e("AdMobManager", "Interstitial Ad Failed to load with unit $adUnitToUse: ${error.message} (Code: ${error.code})")
                     interstitialAd = null
                     isLoadingInterstitial = false
+                    
+                    // إذا فشل الإعلان الحقيقي (مثلاً بسبب الحساب غير المكتمل أو وضع المعاينة)، نحاول فوراً باستخدام معرف الاختبار
+                    if (!useTestIdFallback) {
+                        Log.d("AdMobManager", "Retrying Interstitial load with Google Test ID...")
+                        loadInterstitial(context, useTestIdFallback = true)
+                    }
                 }
             }
         )
@@ -226,12 +235,21 @@ fun AdMobBanner(
                 AndroidView(
                     modifier = Modifier.fillMaxWidth(),
                     factory = { ctx ->
+                        var currentAdUnit = adUnitId
                         AdView(ctx).apply {
                             setAdSize(AdSize.BANNER)
-                            this.adUnitId = adUnitId
+                            this.adUnitId = currentAdUnit
                             adListener = object : AdListener() {
                                 override fun onAdLoaded() {
                                     isAdLoaded = true
+                                }
+                                override fun onAdFailedToLoad(error: LoadAdError) {
+                                    Log.e("AdMobBanner", "Failed to load banner ($currentAdUnit): ${error.message}")
+                                    if (currentAdUnit != AdMobIds.TEST_BANNER_ID) {
+                                        currentAdUnit = AdMobIds.TEST_BANNER_ID
+                                        this@apply.adUnitId = currentAdUnit
+                                        this@apply.loadAd(AdRequest.Builder().build())
+                                    }
                                 }
                             }
                             loadAd(AdRequest.Builder().build())
