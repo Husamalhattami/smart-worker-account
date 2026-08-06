@@ -171,7 +171,27 @@ object LocalArabicParser {
         }
         
         // Find amount
-        val amount = extractNumber(normalizedText)
+        val amount = if (type == "ABSENCE") {
+            when {
+                normalizedText.contains("كامل") || normalizedText.contains("يوم") -> 12.0
+                normalizedText.contains("ساعه ونص") || normalizedText.contains("ساعة ونص") || normalizedText.contains("ساعه ونصف") || normalizedText.contains("ساعة ونصف") -> 1.5
+                normalizedText.contains("ساعه وربع") || normalizedText.contains("ساعة وربع") -> 1.25
+                normalizedText.contains("ساعه و 45") || normalizedText.contains("ساعه و45") || normalizedText.contains("ساعة و45") -> 1.75
+                normalizedText.contains("ساعتين ونص") || normalizedText.contains("ساعتين ونصف") -> 2.5
+                normalizedText.contains("ساعتين وربع") -> 2.25
+                normalizedText.contains("ساعتين و45") || normalizedText.contains("ساعتين و 45") -> 2.75
+                normalizedText.contains("نصف ساعه") || normalizedText.contains("نصف ساعة") || normalizedText.contains("نص ساعه") || normalizedText.contains("نص ساعة") -> 0.5
+                normalizedText.contains("ربع ساعه") || normalizedText.contains("ربع ساعة") -> 0.25
+                normalizedText.contains("45 دقيقه") || normalizedText.contains("45 دقيقة") -> 0.75
+                normalizedText.contains("ساعتين") -> 2.0
+                else -> {
+                    val extracted = extractNumber(normalizedText)
+                    if (extracted > 0.0) AbsenceUtils.parseAbsenceHours(extracted.toString()) else 12.0
+                }
+            }
+        } else {
+            extractNumber(normalizedText)
+        }
 
         // Try extracting note
         var cleanNote = text

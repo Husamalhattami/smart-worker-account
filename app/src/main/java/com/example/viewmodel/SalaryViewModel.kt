@@ -49,7 +49,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun getRepoForUser(userName: String?): SalaryRepository {
         val userDb = AppDatabase.getDatabaseForUser(getApplication(), userName)
-        return SalaryRepository(userDb.salaryDao(), userDb.transactionDao(), userDb.currencyDao())
+        return SalaryRepository(userDb.salaryDao(), userDb.transactionDao(), userDb.currencyDao(), userDb.salaryHistoryDao())
     }
 
     private val currentRepoFlow = MutableStateFlow<SalaryRepository>(getRepoForUser(sharedPrefs.getString("active_user", null)))
@@ -69,6 +69,10 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     val currenciesState: StateFlow<List<CurrencyItem>> = currentRepoFlow
         .flatMapLatest { it.allCurrencies }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val salaryHistoriesState: StateFlow<List<SalaryHistory>> = currentRepoFlow
+        .flatMapLatest { it.salaryHistories }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val metrics: StateFlow<SalaryMetrics>
 
@@ -125,15 +129,16 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         loginUser(existingName)
                     }
                 }
+                repairSettlementBalancesIfNeeded(repository)
             } catch (e: Exception) {
                 Log.e("SalaryViewModel", "Error checking/initializing default settings", e)
             }
         }
 
-        // Combine settings and transactions to compute metrics in real-time
-        metrics = combine(settings, transactions) { settingsVal, txList ->
+        // Combine settings, transactions, and salaryHistories to compute metrics in real-time
+        metrics = combine(settings, transactions, salaryHistoriesState) { settingsVal, txList, historiesList ->
             val actualSettings = settingsVal ?: SalarySettings()
-            calculateSalaryMetrics(actualSettings, txList)
+            calculateSalaryMetrics(actualSettings, txList, historiesList)
         }.stateIn(viewModelScope, SharingStarted.Eagerly, SalaryMetrics())
 
         // Collect changes to settings to initialize user database if needed & schedule reminder
@@ -310,7 +315,11 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun calculateSalaryMetrics(settings: SalarySettings, txList: List<Transaction>): SalaryMetrics {
+    private fun calculateSalaryMetrics(
+        settings: SalarySettings,
+        txList: List<Transaction>,
+        salaryHistories: List<SalaryHistory> = emptyList()
+    ): SalaryMetrics {
         val calendarNow = Calendar.getInstance()
         
         val calStartRaw = Calendar.getInstance().apply { timeInMillis = settings.startWorkDate }
@@ -318,7 +327,6 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                               calStartRaw.get(Calendar.MINUTE) != 0 || 
                               calStartRaw.get(Calendar.SECOND) != 0
 
-        // Period start timestamp
         val calStartMidnight = Calendar.getInstance().apply {
             timeInMillis = settings.startWorkDate
             set(Calendar.HOUR_OF_DAY, 0)
@@ -338,33 +346,43 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         
         val diffInMillis = calNowMidnight.timeInMillis - calStartMidnight.timeInMillis
         val diffInDays = (diffInMillis / (1000 * 60 * 60 * 24)).toInt()
-        val elapsedDays = if (diffInDays < 0) 0 else if (isIntradayStart) diffInDays else (diffInDays + 1)
+        val elapsedDays = maxOf(0, diffInDays + 1)
 
-        // Standard month is 30 days for base rate calculation
-        val dailyRate = if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0
-        val hourlyRate = dailyRate / 12.0 // standard 12-hour workday
+        // Calculate gross earned day-by-day based on active SalaryHistory for each day
+        var grossEarned = 0.0
+        for (d in 0 until elapsedDays) {
+            val dayMs = calStartMidnight.timeInMillis + (d * 86400000L)
+            val activeHist = salaryHistories.filter { it.effectiveStartDate <= dayMs }
+                .maxByOrNull { it.effectiveStartDate }
+            val dayRate = activeHist?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
+            grossEarned += dayRate
+        }
 
-        // Filter transactions for current ACTIVE period (timestamp >= activePeriodStart)
         val activeTxList = txList.filter { it.timestamp >= activePeriodStart && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE" }
 
-        // Calculate active period absence hours. If amount == 0.0, we treat it as 12 hours (full day).
+        val currentDailyRate = salaryHistories.filter { it.effectiveStartDate <= calendarNow.timeInMillis }
+            .maxByOrNull { it.effectiveStartDate }?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
+        val currentHourlyRate = currentDailyRate / 12.0
+
         val totalAbsenceHours = activeTxList.filter { it.type == "ABSENCE" }.sumOf { 
             if (it.amount <= 0.0) 12.0 else it.amount 
         } + (settings.priorAbsenceCount * 12.0)
 
-        // absenceCount in days (Double)
-        val absenceCount = totalAbsenceHours / 12.0
+        val absenceDeduction = activeTxList.filter { it.type == "ABSENCE" }.sumOf { tx ->
+            val txHours = if (tx.amount <= 0.0) 12.0 else tx.amount
+            val txHist = salaryHistories.filter { it.effectiveStartDate <= tx.timestamp }
+                .maxByOrNull { it.effectiveStartDate }
+            val txRate = txHist?.dailyRate ?: currentDailyRate
+            txHours * (txRate / 12.0)
+        } + (settings.priorAbsenceCount * 12.0 * currentHourlyRate)
 
+        val absenceCount = totalAbsenceHours / 12.0
         val totalSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount } + settings.priorSpendingsAmount
         val totalDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount } + settings.priorDrawsAmount
-
-        // workedDays in days (Double)
         val workedDays = maxOf(0.0, elapsedDays.toDouble() - absenceCount)
         
-        // Earned salary is base rate * elapsed days, minus absence deduction
-        val earnedSalary = maxOf(0.0, (elapsedDays.toDouble() * dailyRate) - (totalAbsenceHours * hourlyRate))
+        val earnedSalary = maxOf(0.0, grossEarned - absenceDeduction)
         
-        // Net balance: Opening balance + active earned salary - active spendings - active draws
         val netBalance = if (settings.isSpendingDeductedFromSalary) {
             earnedSalary + settings.openingBalance - totalSpendings - totalDraws
         } else {
@@ -372,8 +390,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         return SalaryMetrics(
-            daysInMonth = 30, // Base is 30
-            dailyRate = dailyRate,
+            daysInMonth = 30,
+            dailyRate = currentDailyRate,
             elapsedDays = elapsedDays,
             absenceCount = absenceCount,
             workedDays = workedDays,
@@ -458,31 +476,74 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 set(Calendar.MILLISECOND, 0)
             }
 
-            val diffMs = calCutoffMidnight.timeInMillis - calStartMidnight.timeInMillis
-            val diffInDays = (diffMs / (1000 * 60 * 60 * 24)).toInt()
-            val elapsedDays = if (diffInDays < 0) 0 else (diffInDays + 1)
+            var totalEarnedSalary = 0.0
+            var absenceDeduction = 0.0
 
-            val dailyRate = if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0
-            val hourlyRate = dailyRate / 12.0
+            val salaryHistories = repository.getAllSalaryHistoriesDirect()
 
-            // Filter active transactions from period start midnight up to cut-off end timestamp
             val activeTxList = txList.filter { 
                 it.timestamp >= calStartMidnight.timeInMillis && it.timestamp <= effectiveCutoffMs && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE"
             }
 
-            val totalAbsenceHours = activeTxList.filter { it.type == "ABSENCE" }.sumOf { 
-                if (it.amount <= 0.0) 12.0 else it.amount 
-            } + (currentSettings.priorAbsenceCount * 12.0)
+            val calcCal = Calendar.getInstance().apply {
+                timeInMillis = calStartMidnight.timeInMillis
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
 
-            val absenceDeduction = totalAbsenceHours * hourlyRate
+            val cutoffMidnightMs = calCutoffMidnight.timeInMillis
+
+            // Iterate day by day to calculate gross earned salary and absence deductions accurately using salaryHistories
+            while (calcCal.timeInMillis <= cutoffMidnightMs) {
+                val dayMs = calcCal.timeInMillis
+                val activeHist = salaryHistories.filter { hist ->
+                    val hMidnight = Calendar.getInstance().apply {
+                        timeInMillis = hist.effectiveStartDate
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                    hMidnight <= dayMs
+                }.maxByOrNull { it.effectiveStartDate }
+
+                val dayRate = activeHist?.dailyRate ?: (if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0)
+                totalEarnedSalary += dayRate
+
+                val dayAbsTxs = activeTxList.filter { tx ->
+                    val txCal = Calendar.getInstance().apply {
+                        timeInMillis = tx.timestamp
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    txCal.timeInMillis == dayMs && tx.type == "ABSENCE"
+                }
+                for (tx in dayAbsTxs) {
+                    val absHours = if (tx.amount <= 0.0) 12.0 else tx.amount
+                    absenceDeduction += absHours * (dayRate / 12.0)
+                }
+
+                calcCal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+
+            if (currentSettings.priorAbsenceCount > 0) {
+                val currentDailyRate = salaryHistories.filter { it.effectiveStartDate <= calCutoffEnd.timeInMillis }
+                    .maxByOrNull { it.effectiveStartDate }?.dailyRate ?: (if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0)
+                absenceDeduction += currentSettings.priorAbsenceCount * 12.0 * (currentDailyRate / 12.0)
+            }
+
             val totalSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount } + currentSettings.priorSpendingsAmount
             val totalDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount } + currentSettings.priorDrawsAmount
 
-            val totalEarnedSalary = maxOf(0.0, (elapsedDays.toDouble() * dailyRate) - absenceDeduction)
+            val netEarnedAfterAbsence = maxOf(0.0, totalEarnedSalary - absenceDeduction)
             val netSettlementBalance = if (currentSettings.isSpendingDeductedFromSalary) {
-                currentSettings.openingBalance + totalEarnedSalary - totalSpendings - totalDraws
+                currentSettings.openingBalance + netEarnedAfterAbsence - totalSpendings - totalDraws
             } else {
-                currentSettings.openingBalance + totalEarnedSalary - totalDraws
+                currentSettings.openingBalance + netEarnedAfterAbsence - totalDraws
             }
 
             // 1. Record chronological SETTLEMENT transaction into database with effective cutoff timestamp
@@ -510,8 +571,126 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 priorDrawsAmount = 0.0
             )
             repository.insertOrUpdateSalarySettings(updated)
+            repairSettlementBalancesIfNeeded(repository)
             _userNotice.tryEmit("🔒 تم تصفية وإقفال حساب الفترة حتى $dateFormatted وتدوير الصافي (${netSettlementBalance.toInt()} ريال) بنجاح")
             speakOutText("تمت تصفية وإقفال حساب الفترة وتدوير الصافي المتبقي بنجاح")
+        }
+    }
+
+    private suspend fun repairSettlementBalancesIfNeeded(repo: SalaryRepository) {
+        val currentSettings = repo.getSalarySettingsDirect() ?: return
+        val txList = repo.getAllTransactionsDirect()
+        val settlementTxs = txList.filter { it.type == "SETTLEMENT" }.sortedBy { it.timestamp }
+        if (settlementTxs.isEmpty()) return
+
+        val salaryHistories = repo.getAllSalaryHistoriesDirect()
+        val openingTx = txList.firstOrNull { it.type == "OPENING_BALANCE" }
+        val initialOpening = openingTx?.amount ?: currentSettings.openingBalance
+        val firstTxMs = txList.minOfOrNull { it.timestamp } ?: currentSettings.startWorkDate
+        val initialStartMs = minOf(currentSettings.startWorkDate, firstTxMs, openingTx?.timestamp ?: currentSettings.startWorkDate)
+
+        var prevOpening = initialOpening
+        var prevStartMs = initialStartMs
+
+        var updatedAny = false
+        var finalSettlementNet = initialOpening
+
+        for (sTx in settlementTxs) {
+            val sCutoffMs = sTx.timestamp
+
+            val calStartMidnight = Calendar.getInstance().apply {
+                timeInMillis = prevStartMs
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+
+            val calCutoffMidnight = Calendar.getInstance().apply {
+                timeInMillis = sCutoffMs
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+
+            val activeTxList = txList.filter {
+                it.timestamp >= calStartMidnight.timeInMillis &&
+                it.timestamp <= sCutoffMs &&
+                it.type != "SETTLEMENT" &&
+                it.type != "OPENING_BALANCE" &&
+                it.id != sTx.id
+            }
+
+            var periodEarned = 0.0
+            var periodAbsenceDeduction = 0.0
+
+            val calcCal = Calendar.getInstance().apply {
+                timeInMillis = calStartMidnight.timeInMillis
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+
+            while (calcCal.timeInMillis <= calCutoffMidnight.timeInMillis) {
+                val dayMs = calcCal.timeInMillis
+                val activeHist = salaryHistories.filter { hist ->
+                    val hMidnight = Calendar.getInstance().apply {
+                        timeInMillis = hist.effectiveStartDate
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                    hMidnight <= dayMs
+                }.maxByOrNull { it.effectiveStartDate }
+
+                val dayRate = activeHist?.dailyRate ?: (if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0)
+                periodEarned += dayRate
+
+                val dayAbsTxs = activeTxList.filter { tx ->
+                    val txCal = Calendar.getInstance().apply {
+                        timeInMillis = tx.timestamp
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    txCal.timeInMillis == dayMs && tx.type == "ABSENCE"
+                }
+                for (tx in dayAbsTxs) {
+                    val absHours = if (tx.amount <= 0.0) 12.0 else tx.amount
+                    periodAbsenceDeduction += absHours * (dayRate / 12.0)
+                }
+
+                calcCal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+
+            val periodSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount }
+            val periodDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount }
+
+            val netEarned = maxOf(0.0, periodEarned - periodAbsenceDeduction)
+            val calculatedNetBalance = if (currentSettings.isSpendingDeductedFromSalary) {
+                prevOpening + netEarned - periodSpendings - periodDraws
+            } else {
+                prevOpening + netEarned - periodDraws
+            }
+
+            if (Math.abs(sTx.amount - calculatedNetBalance) > 0.01) {
+                repo.insertTransaction(sTx.copy(amount = calculatedNetBalance))
+                updatedAny = true
+            }
+
+            finalSettlementNet = calculatedNetBalance
+            prevOpening = calculatedNetBalance
+            prevStartMs = calCutoffMidnight.apply { add(Calendar.DAY_OF_YEAR, 1) }.timeInMillis
+        }
+
+        if (updatedAny || Math.abs(currentSettings.openingBalance - finalSettlementNet) > 0.01) {
+            repo.insertOrUpdateSalarySettings(
+                currentSettings.copy(openingBalance = finalSettlementNet)
+            )
         }
     }
 
@@ -578,13 +757,28 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             // Check if monthly salary rate changed or user explicitly reset start date
             var finalOpeningBalance = openingBalance
             var finalStartDate = startDate
+            var finalPriorAbsences = priorAbsences
+            var finalPriorSpendings = priorSpendings
+            var finalPriorDraws = priorDraws
             
             if (current.monthlySalary > 0.0 && salary != current.monthlySalary && startDate == current.startWorkDate) {
                 val txList = repository.getAllTransactionsDirect()
                 val oldMetrics = calculateSalaryMetrics(current, txList)
-                // Lock in net balance under old rate into opening balance
+                // Lock in net balance under old rate into opening balance & create settlement transaction
                 finalOpeningBalance = oldMetrics.netBalance
                 finalStartDate = System.currentTimeMillis()
+                
+                val settlementTx = Transaction(
+                    type = "SETTLEMENT",
+                    amount = oldMetrics.netBalance,
+                    timestamp = finalStartDate,
+                    voiceText = "🔒 تصفية وإقفال حساب وتعديل الراتب إلى ${salary.toInt()} (الراتب السابق: ${current.monthlySalary.toInt()})"
+                )
+                repository.insertTransaction(settlementTx)
+                
+                finalPriorAbsences = 0
+                finalPriorSpendings = 0.0
+                finalPriorDraws = 0.0
             }
 
             val updated = current.copy(
@@ -592,9 +786,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 startWorkDate = finalStartDate,
                 currency = currency,
                 standardSpendingAmount = standardSpending,
-                priorAbsenceCount = priorAbsences,
-                priorSpendingsAmount = priorSpendings,
-                priorDrawsAmount = priorDraws,
+                priorAbsenceCount = finalPriorAbsences,
+                priorSpendingsAmount = finalPriorSpendings,
+                priorDrawsAmount = finalPriorDraws,
                 dailyReminderEnabled = dailyReminderEnabled,
                 dailyReminderHour = dailyReminderHour,
                 dailyReminderMinute = dailyReminderMinute,
@@ -611,6 +805,22 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 appLanguage = appLanguage
             )
             repository.insertOrUpdateSalarySettings(updated)
+
+            val calMidnight = Calendar.getInstance().apply {
+                timeInMillis = finalStartDate
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            repository.insertSalaryHistory(
+                SalaryHistory(
+                    monthlySalary = salary,
+                    dailyRate = salary / 30.0,
+                    effectiveStartDate = calMidnight.timeInMillis,
+                    note = "تحديث إعدادات الراتب"
+                )
+            )
 
             // Ensure initial OPENING_BALANCE transaction is recorded if non-zero and no prior settlement/opening exists
             val existingTx = repository.getAllTransactionsDirect()
@@ -672,11 +882,11 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 "SPENDING" -> "تم تسجيل صرفة بقيمة $amountInWords $cur"
                 "DRAW" -> "تم تسجيل سحبية بقيمة $amountInWords $cur"
                 "ABSENCE" -> {
-                    if (amount == 12.0 || amount <= 0.0) {
+                    if (amount >= 12.0 || amount <= 0.0) {
                         "تم تسجيل غياب يوم كامل"
                     } else {
-                        val hrsInWords = ArabicNumbersToWords.convert(amount.toInt())
-                        "تم تسجيل غياب لمدة $hrsInWords ساعات"
+                        val hrsDesc = AbsenceUtils.formatAbsenceHoursDescription(amount)
+                        "تم تسجيل غياب لمدة $hrsDesc"
                     }
                 }
                 else -> "تم تسجيل عملية جديدة"
@@ -1198,6 +1408,46 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             repository.deleteCurrency(currencyItem)
             _userNotice.tryEmit("🗑️ تم حذف العملة")
+        }
+    }
+
+    fun addSalaryHistory(monthlySalary: Double, effectiveStartDate: Long, note: String = "") {
+        viewModelScope.launch {
+            val dailyRate = if (monthlySalary > 0) monthlySalary / 30.0 else 0.0
+            val calMidnight = Calendar.getInstance().apply {
+                timeInMillis = effectiveStartDate
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            val history = SalaryHistory(
+                monthlySalary = monthlySalary,
+                dailyRate = dailyRate,
+                effectiveStartDate = calMidnight.timeInMillis,
+                note = note.trim()
+            )
+            repository.insertSalaryHistory(history)
+            
+            // Also update current salary settings if this is the newest rate
+            val currentSettings = repository.getSalarySettingsDirect() ?: SalarySettings()
+            val histories = repository.getAllSalaryHistoriesDirect()
+            val latestHistory = histories.maxByOrNull { it.effectiveStartDate }
+            if (latestHistory != null && latestHistory.effectiveStartDate >= currentSettings.startWorkDate) {
+                repository.insertOrUpdateSalarySettings(
+                    currentSettings.copy(
+                        monthlySalary = latestHistory.monthlySalary
+                    )
+                )
+            }
+            _userNotice.tryEmit("✅ تم حفظ سجل الراتب للفيئة المالية المحدد")
+        }
+    }
+
+    fun deleteSalaryHistory(id: Int) {
+        viewModelScope.launch {
+            repository.deleteSalaryHistoryById(id)
+            _userNotice.tryEmit("🗑️ تم حذف سجل الراتب")
         }
     }
 

@@ -8,11 +8,12 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [SalarySettings::class, Transaction::class, CurrencyItem::class], version = 11, exportSchema = false)
+@Database(entities = [SalarySettings::class, Transaction::class, CurrencyItem::class, SalaryHistory::class], version = 12, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun salaryDao(): SalaryDao
     abstract fun transactionDao(): TransactionDao
     abstract fun currencyDao(): CurrencyDao
+    abstract fun salaryHistoryDao(): SalaryHistoryDao
 
     companion object {
         @Volatile
@@ -23,6 +24,15 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL(sql)
             } catch (e: Exception) {
                 Log.w("AppDatabase", "SQL execution skipped or column already exists: $sql", e)
+            }
+        }
+
+        val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                safeExecSQL(
+                    db,
+                    "CREATE TABLE IF NOT EXISTS `salary_histories` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `monthlySalary` REAL NOT NULL, `dailyRate` REAL NOT NULL, `effectiveStartDate` INTEGER NOT NULL, `note` TEXT NOT NULL DEFAULT '')"
+                )
             }
         }
 
@@ -130,7 +140,7 @@ abstract class AppDatabase : RoomDatabase() {
                         AppDatabase::class.java,
                         key
                     )
-                    .addMigrations(MIGRATION_1_8, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
+                    .addMigrations(MIGRATION_1_8, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
                     .fallbackToDestructiveMigration()
                     .fallbackToDestructiveMigrationOnDowngrade()
                     .build()

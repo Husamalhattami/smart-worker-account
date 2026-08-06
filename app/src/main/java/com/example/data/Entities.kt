@@ -48,3 +48,12 @@ data class CurrencyItem(
     val flag: String = "",
     val isCustom: Boolean = false
 )
+
+@Entity(tableName = "salary_histories")
+data class SalaryHistory(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val monthlySalary: Double,
+    val dailyRate: Double = monthlySalary / 30.0,
+    val effectiveStartDate: Long,
+    val note: String = ""
+)

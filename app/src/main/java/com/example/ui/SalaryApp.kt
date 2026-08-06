@@ -1,5 +1,7 @@
 package com.example.ui
 
+import com.example.util.AbsenceUtils
+
 import android.Manifest
 import android.content.Context
 import android.content.Intent
@@ -68,6 +70,7 @@ import com.example.data.AppDatabase
 import com.example.data.CurrencyItem
 import com.example.data.SalarySettings
 import com.example.data.Transaction
+import com.example.data.SalaryHistory
 import android.content.ContextWrapper
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -118,6 +121,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     val errorMessage by viewModel.errorMessage.collectAsState()
     val speechInputText by viewModel.speechInputText.collectAsState()
     val updateInfoState by viewModel.updateInfo.collectAsState()
+    val salaryHistoriesState by viewModel.salaryHistoriesState.collectAsState()
     LaunchedEffect(Unit) {
         viewModel.userNotice.collect { notice ->
             Toast.makeText(context, notice, Toast.LENGTH_SHORT).show()
@@ -130,6 +134,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     var fileOpNotification by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showUserSettingsDialog by remember { mutableStateOf(false) }
+    var showSalaryHistoryDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showGuideDialog by remember { mutableStateOf(false) }
     var showAddTxDialog by remember { mutableStateOf(false) }
@@ -731,7 +736,8 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                         endDateFilter = endDate,
                         showTotalSummary = showSummary,
                         balanceDisplayMode = balanceMode,
-                        transactionTypeFilter = typeFilter
+                        transactionTypeFilter = typeFilter,
+                        salaryHistories = salaryHistoriesState
                     )
                 }
             }
@@ -1069,6 +1075,9 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             onDeleteCurrency = { item ->
                 viewModel.deleteCurrency(item)
             },
+            onOpenSalaryHistory = {
+                showSalaryHistoryDialog = true
+            },
             onDismiss = { showUserSettingsDialog = false },
             onSave = { employeeName, salary, currency, standardSpending, startDate, autoAddDailySpending, isSpendingDeductedFromSalary, isWorkPaused, openingBalance, priorAbsences, priorSpendings, priorDraws ->
                 AdMobManager.showInterstitial(activity) {
@@ -1099,6 +1108,21 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 }
                 showUserSettingsDialog = false
             }
+        )
+    }
+
+    // --- SALARY HISTORY DIALOG ---
+    if (showSalaryHistoryDialog) {
+        SalaryHistoryDialog(
+            salaryHistories = salaryHistoriesState,
+            currency = settingsState?.currency ?: "ريال",
+            onAddHistory = { monthlySalary, effectiveStartDate, note ->
+                viewModel.addSalaryHistory(monthlySalary, effectiveStartDate, note)
+            },
+            onDeleteHistory = { id ->
+                viewModel.deleteSalaryHistory(id)
+            },
+            onDismiss = { showSalaryHistoryDialog = false }
         )
     }
 
@@ -1825,7 +1849,7 @@ fun TransactionItem(
     val amountLabel = when (transaction.type) {
         "ABSENCE" -> {
             val hrs = transaction.amount
-            if (hrs == 12.0 || hrs <= 0.0) "غياب يوم كامل" else "غياب ${hrs.toInt()} ساعات"
+            if (hrs >= 12.0 || hrs <= 0.0) "غياب يوم كامل" else "غياب ${AbsenceUtils.formatAbsenceHoursDescription(hrs)}"
         }
         "SPENDING" -> "-${transaction.amount.toInt()} $currency"
         "DRAW" -> "-${transaction.amount.toInt()} $currency"
@@ -2267,18 +2291,18 @@ fun AddTransactionDialog(
                     if (!absenceIsFullDay) {
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "عدد ساعات الغياب (يوم الشغل ١٢ ساعة):",
+                            text = "عدد ساعات الغياب (مثال: 1.50 = ساعه ونص، 1.25 = ساعه وربع، 1.45 = ساعه و45 دقيقة):",
                             style = MaterialTheme.typography.bodyMedium,
                             color = LocalAppColors.current.textSub
                         )
                         OutlinedTextField(
                             value = absenceHoursInput,
                             onValueChange = { absenceHoursInput = it },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
                             textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                             placeholder = {
                                 Text(
-                                    text = "مثال: ٣ ساعات",
+                                    text = "مثال: 1.50 أو 1.25 أو 1.45 أو 1:30",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = LocalAppColors.current.textMuted
                                 )
@@ -2291,6 +2315,18 @@ fun AddTransactionDialog(
                                 unfocusedTextColor = LocalAppColors.current.text
                             )
                         )
+                        if (absenceHoursInput.isNotBlank()) {
+                            val calcHrs = AbsenceUtils.parseAbsenceHours(absenceHoursInput)
+                            if (calcHrs > 0) {
+                                Text(
+                                    text = "💡 المدة المحسوبة: ${AbsenceUtils.formatAbsenceHoursDescription(calcHrs)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = EmeraldGreen,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
+                            }
+                        }
                     }
 
                     // Absence Note Field
@@ -2396,11 +2432,14 @@ fun AddTransactionDialog(
                     Button(
                         onClick = {
                             if (selectedType == "ABSENCE") {
-                                val hrs = if (absenceIsFullDay) 12.0 else (absenceHoursInput.toDoubleOrNull() ?: 2.0)
+                                val hrs = if (absenceIsFullDay) 12.0 else AbsenceUtils.parseAbsenceHours(absenceHoursInput)
+                                val descText = AbsenceUtils.formatAbsenceHoursDescription(hrs)
                                 val note = if (noteInput.isBlank()) {
-                                    if (absenceIsFullDay) "غياب يوم كامل" else "غياب جزئي ${hrs.toInt()} ساعات"
+                                    if (absenceIsFullDay) "غياب يوم كامل" else "غياب جزئي ($descText)"
                                 } else noteInput
-                                onSave("ABSENCE", hrs, note, transactionDate)
+                                if (hrs > 0.0) {
+                                    onSave("ABSENCE", hrs, note, transactionDate)
+                                }
                             } else {
                                 val amt = amountInput.toDoubleOrNull() ?: if (selectedType == "SPENDING") settings.standardSpendingAmount else 0.0
                                 val defaultNote = if (selectedType == "SPENDING") "صرفة" else "سحبية / سلفة"
@@ -3157,6 +3196,7 @@ fun UserSettingsDialog(
     currencies: List<CurrencyItem> = emptyList(),
     onAddCustomCurrency: (String, String, String) -> Unit = { _, _, _ -> },
     onDeleteCurrency: ((CurrencyItem) -> Unit)? = null,
+    onOpenSalaryHistory: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     onSave: (
         employeeName: String,
@@ -3257,6 +3297,21 @@ fun UserSettingsDialog(
                         unfocusedTextColor = LocalAppColors.current.text
                     )
                 )
+
+                if (onOpenSalaryHistory != null) {
+                    OutlinedButton(
+                        onClick = { onOpenSalaryHistory.invoke() },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, EmeraldGreen),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = EmeraldGreen)
+                    ) {
+                        Text(
+                            text = "📅 سجل وتحديثات الراتب (حسب التاريخ والشهور)",
+                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
 
                 // Toggle: Is allowance/spending deducted from salary or net salary?
                 Card(
@@ -4042,7 +4097,15 @@ fun EditTransactionDialog(
     onSave: (Transaction) -> Unit,
     onDelete: (Transaction) -> Unit
 ) {
-    var amountInput by remember { mutableStateOf(transaction.amount.toInt().toString()) }
+    var amountInput by remember {
+        mutableStateOf(
+            if (transaction.type == "ABSENCE") {
+                AbsenceUtils.formatAbsenceHoursForInput(transaction.amount)
+            } else {
+                transaction.amount.toInt().toString()
+            }
+        )
+    }
     var voiceTextInput by remember { mutableStateOf(transaction.voiceText ?: "") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
@@ -4138,7 +4201,7 @@ fun EditTransactionDialog(
             ) {
                 // Input label
                 val inputLabel = when (transaction.type) {
-                    "ABSENCE" -> "مدة الغياب (بالساعات - 12 ساعة غياب يوم كامل):"
+                    "ABSENCE" -> "مدة الغياب بالساعات والدقائق (مثال: 1.50 = ساعه ونص، 1.25 = ساعه وربع، 1.45 = ساعه و45 دقيقة):"
                     else -> "المبلغ ($currency):"
                 }
 
@@ -4153,8 +4216,13 @@ fun EditTransactionDialog(
                 OutlinedTextField(
                     value = amountInput,
                     onValueChange = { amountInput = it },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
                     textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                    placeholder = {
+                        if (transaction.type == "ABSENCE") {
+                            Text("مثال: 1.50 أو 1.25 أو 1.45", color = LocalAppColors.current.textMuted)
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = typeColor,
@@ -4163,6 +4231,19 @@ fun EditTransactionDialog(
                         unfocusedTextColor = LocalAppColors.current.text
                     )
                 )
+
+                if (transaction.type == "ABSENCE" && amountInput.isNotBlank()) {
+                    val calcHrs = AbsenceUtils.parseAbsenceHours(amountInput)
+                    if (calcHrs > 0) {
+                        Text(
+                            text = "💡 المدة المحسوبة: ${AbsenceUtils.formatAbsenceHoursDescription(calcHrs)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = EmeraldGreen,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                    }
+                }
 
                 // Optional voice text / details
                 Text(
@@ -4196,7 +4277,11 @@ fun EditTransactionDialog(
                 // Save Button
                 Button(
                     onClick = {
-                        val parsedVal = amountInput.toDoubleOrNull() ?: transaction.amount
+                        val parsedVal = if (transaction.type == "ABSENCE") {
+                            AbsenceUtils.parseAbsenceHours(amountInput)
+                        } else {
+                            amountInput.toDoubleOrNull() ?: transaction.amount
+                        }
                         val updatedTx = transaction.copy(
                             amount = parsedVal,
                             voiceText = voiceTextInput.ifBlank { null }
@@ -6915,6 +7000,228 @@ fun DeveloperInfoDialog(
                     Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun SalaryHistoryDialog(
+    salaryHistories: List<SalaryHistory>,
+    currency: String,
+    onAddHistory: (monthlySalary: Double, effectiveStartDate: Long, note: String) -> Unit,
+    onDeleteHistory: (id: Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var monthlySalaryInput by remember { mutableStateOf("") }
+    var noteInput by remember { mutableStateOf("") }
+    var showDatePicker by remember { mutableStateOf(false) }
+    var selectedDateMs by remember { mutableStateOf(System.currentTimeMillis()) }
+
+    val sdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = "📅 سجل تحديثات وفئات الراتب",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    text = "أضف تحديثات للراتب بحيث يتم حساب الأيام السابقة بالراتب القديم والأيام الجديدة بالراتب الجديد دون تغيير الماضي.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalAppColors.current.textSub,
+                    textAlign = TextAlign.Center
+                )
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Input section for new rate
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(LocalAppColors.current.bg, RoundedCornerShape(16.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalAlignment = Alignment.End
+                ) {
+                    Text(
+                        text = "إضافة راتب/فئة جديدة:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = EmeraldGreen
+                    )
+
+                    OutlinedTextField(
+                        value = monthlySalaryInput,
+                        onValueChange = { monthlySalaryInput = it },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        placeholder = { Text("الراتب الشهري (مثلاً 120000 أو 150000)", color = Color.Gray) },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = EmeraldGreen,
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
+                        )
+                    )
+
+                    // Date selector button
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = { showDatePicker = true },
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, LocalAppColors.current.border)
+                        ) {
+                            Text("📅 بداية التطبيق: ${sdf.format(Date(selectedDateMs))}", color = LocalAppColors.current.text)
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = noteInput,
+                        onValueChange = { noteInput = it },
+                        placeholder = { Text("ملاحظة (مثلاً: راتب شهر 8)", color = Color.Gray) },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = EmeraldGreen,
+                            unfocusedBorderColor = LocalAppColors.current.border,
+                            focusedTextColor = LocalAppColors.current.text,
+                            unfocusedTextColor = LocalAppColors.current.text
+                        )
+                    )
+
+                    Button(
+                        onClick = {
+                            val sal = monthlySalaryInput.toDoubleOrNull()
+                            if (sal != null && sal > 0) {
+                                onAddHistory(sal, selectedDateMs, noteInput)
+                                monthlySalaryInput = ""
+                                noteInput = ""
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("➕ حفظ وتطبيق الراتب", fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // List of existing histories
+                Text(
+                    text = "السجلات المسجلة حالياً (${salaryHistories.size}):",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Right
+                )
+
+                val sortedHistories = salaryHistories.sortedByDescending { it.effectiveStartDate }
+                if (sortedHistories.isEmpty()) {
+                    Text(
+                        text = "لا توجد سجلات راتب سابقة.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalAppColors.current.textSub
+                    )
+                } else {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        sortedHistories.forEach { hist ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, LocalAppColors.current.border)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (salaryHistories.size > 1) {
+                                        IconButton(onClick = { onDeleteHistory(hist.id) }) {
+                                            Text("🗑️")
+                                        }
+                                    }
+                                    Column(horizontalAlignment = Alignment.End) {
+                                        Text(
+                                            text = "الراتب: ${hist.monthlySalary.toInt()} $currency (اليومي: ${hist.dailyRate.toInt()} $currency)",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = EmeraldGreen
+                                        )
+                                        Text(
+                                            text = "ابتداءً من: ${sdf.format(Date(hist.effectiveStartDate))}${if (hist.note.isNotBlank()) " - ${hist.note}" else ""}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = LocalAppColors.current.textSub
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+
+    if (showDatePicker) {
+        val cal = Calendar.getInstance().apply { timeInMillis = selectedDateMs }
+        val context = LocalContext.current
+        android.app.DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                val newCal = Calendar.getInstance().apply {
+                    set(year, month, dayOfMonth, 0, 0, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                selectedDateMs = newCal.timeInMillis
+                showDatePicker = false
+            },
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH),
+            cal.get(Calendar.DAY_OF_MONTH)
+        ).apply {
+            setOnCancelListener { showDatePicker = false }
+            show()
         }
     }
 }

@@ -7,7 +7,8 @@ import kotlinx.coroutines.flow.catch
 class SalaryRepository(
     private val salaryDao: SalaryDao,
     private val transactionDao: TransactionDao,
-    private val currencyDao: CurrencyDao
+    private val currencyDao: CurrencyDao,
+    private val salaryHistoryDao: SalaryHistoryDao
 ) {
     val salarySettings: Flow<SalarySettings?> = salaryDao.getSalarySettings()
         .catch { e ->
@@ -26,6 +27,76 @@ class SalaryRepository(
             Log.e("SalaryRepository", "Error reading currencies", e)
             emit(emptyList())
         }
+
+    val salaryHistories: Flow<List<SalaryHistory>> = salaryHistoryDao.getAllSalaryHistories()
+        .catch { e ->
+            Log.e("SalaryRepository", "Error reading salary histories", e)
+            emit(emptyList())
+        }
+
+    suspend fun getAllSalaryHistoriesDirect(): List<SalaryHistory> {
+        val list = salaryHistoryDao.getAllSalaryHistoriesDirect()
+        if (list.isEmpty()) {
+            seedInitialSalaryHistoryIfEmpty()
+            return salaryHistoryDao.getAllSalaryHistoriesDirect()
+        }
+        return list
+    }
+
+    suspend fun insertSalaryHistory(history: SalaryHistory) {
+        salaryHistoryDao.insertSalaryHistory(history)
+    }
+
+    suspend fun deleteSalaryHistoryById(id: Int) {
+        salaryHistoryDao.deleteSalaryHistoryById(id)
+    }
+
+    suspend fun seedInitialSalaryHistoryIfEmpty() {
+        try {
+            if (salaryHistoryDao.getAllSalaryHistoriesDirect().isNotEmpty()) return
+            val settings = salaryDao.getSalarySettingsDirect() ?: SalarySettings()
+            val txs = transactionDao.getAllTransactionsDirect()
+
+            val calAug1 = java.util.Calendar.getInstance().apply {
+                set(2026, java.util.Calendar.AUGUST, 1, 0, 0, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            val calJul1 = java.util.Calendar.getInstance().apply {
+                set(2026, java.util.Calendar.JULY, 1, 0, 0, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+
+            val hasJulTxs = txs.any { it.timestamp < calAug1.timeInMillis }
+
+            if (hasJulTxs || settings.monthlySalary == 120000.0) {
+                // User has month 7 (July) data with 150,000 rate and month 8 (August) with 120,000 rate
+                val julHistory = SalaryHistory(
+                    monthlySalary = 150000.0,
+                    dailyRate = 5000.0,
+                    effectiveStartDate = calJul1.timeInMillis,
+                    note = "الراتب الشهري الأساسي (شهر 7)"
+                )
+                val augHistory = SalaryHistory(
+                    monthlySalary = settings.monthlySalary,
+                    dailyRate = settings.monthlySalary / 30.0,
+                    effectiveStartDate = calAug1.timeInMillis,
+                    note = "تحديث الراتب (شهر 8)"
+                )
+                salaryHistoryDao.insertSalaryHistory(julHistory)
+                salaryHistoryDao.insertSalaryHistory(augHistory)
+            } else {
+                val defaultHistory = SalaryHistory(
+                    monthlySalary = settings.monthlySalary,
+                    dailyRate = settings.monthlySalary / 30.0,
+                    effectiveStartDate = settings.startWorkDate,
+                    note = "الراتب الأساسي الأولي"
+                )
+                salaryHistoryDao.insertSalaryHistory(defaultHistory)
+            }
+        } catch (e: Exception) {
+            Log.e("SalaryRepository", "Error seeding initial salary history", e)
+        }
+    }
 
     suspend fun seedDefaultCurrenciesIfEmpty() {
         try {

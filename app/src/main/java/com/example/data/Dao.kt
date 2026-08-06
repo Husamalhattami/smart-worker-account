@@ -56,3 +56,21 @@ interface CurrencyDao {
     @Query("SELECT COUNT(*) FROM currencies")
     suspend fun getCurrencyCount(): Int
 }
+
+@Dao
+interface SalaryHistoryDao {
+    @Query("SELECT * FROM salary_histories ORDER BY effectiveStartDate ASC")
+    fun getAllSalaryHistories(): Flow<List<SalaryHistory>>
+
+    @Query("SELECT * FROM salary_histories ORDER BY effectiveStartDate ASC")
+    suspend fun getAllSalaryHistoriesDirect(): List<SalaryHistory>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSalaryHistory(history: SalaryHistory)
+
+    @Query("DELETE FROM salary_histories WHERE id = :id")
+    suspend fun deleteSalaryHistoryById(id: Int)
+
+    @Query("DELETE FROM salary_histories")
+    suspend fun deleteAllSalaryHistories()
+}
