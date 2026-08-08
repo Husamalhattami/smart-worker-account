@@ -180,6 +180,13 @@ object PdfPrintHelper {
             set(Calendar.MILLISECOND, 0)
         }.timeInMillis
 
+        val todayMidnight = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
         val effectiveWorkStop = settings.stopWorkDate?.let { stopMs ->
             Calendar.getInstance().apply {
                 timeInMillis = stopMs
@@ -229,7 +236,9 @@ object PdfPrintHelper {
 
             val dayDailyWage = activeHist?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
 
-            val isWorkDay = dayMidnight >= effectiveWorkStart && (effectiveWorkStop == null || dayMidnight <= effectiveWorkStop)
+            val isWorkDay = dayMidnight >= effectiveWorkStart &&
+                    (effectiveWorkStop == null || dayMidnight <= effectiveWorkStop) &&
+                    (dayMidnight < todayMidnight || settings.stopWorkDate != null)
             if (isWorkDay) {
                 workedDaysInPeriod++
                 totalEarnedSalaryInPeriod += dayDailyWage
@@ -659,7 +668,9 @@ object PdfPrintHelper {
                         txCal.timeInMillis == dayMidnight
                     }
 
-                    val isWorkDay = dayMidnight >= effectiveWorkStart && (effectiveWorkStop == null || dayMidnight <= effectiveWorkStop)
+                    val isWorkDay = dayMidnight >= effectiveWorkStart &&
+                            (effectiveWorkStop == null || dayMidnight <= effectiveWorkStop) &&
+                            (dayMidnight < todayMidnight || settings.stopWorkDate != null)
 
                     if (dayTxList.isEmpty()) {
                         if (isWorkDay) {
@@ -742,7 +753,6 @@ object PdfPrintHelper {
                                     monthAbsences += absDed
 
                                     if (!dailyWageCredited && isWorkDay) {
-                                        // Standard daily wage earned, minus absence deduction
                                         runningBalance += (dayDailyWage - absDed)
                                         monthEarned += dayDailyWage
                                         earnedCell = "<span style='color: #047857; font-weight: bold;'>+${dayDailyWage.toInt()} $currency</span>"

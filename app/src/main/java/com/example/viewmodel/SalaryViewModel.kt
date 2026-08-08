@@ -346,7 +346,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         
         val diffInMillis = calNowMidnight.timeInMillis - calStartMidnight.timeInMillis
         val diffInDays = (diffInMillis / (1000 * 60 * 60 * 24)).toInt()
-        val elapsedDays = maxOf(0, diffInDays + 1)
+        val elapsedDays = if (settings.stopWorkDate != null) maxOf(0, diffInDays + 1) else maxOf(0, diffInDays)
 
         // Calculate gross earned day-by-day based on active SalaryHistory for each day
         var grossEarned = 0.0
