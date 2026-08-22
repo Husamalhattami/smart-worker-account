@@ -55,14 +55,14 @@ import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
  */
 object AdMobIds {
     // المعرفات الحقيقية الرسمية الخاصة بحسابك في Google AdMob
-    const val APP_ID = "ca-app-pub-1241288532566123~7520011293"
-    const val BANNER_ID = "ca-app-pub-1241288532566123/9891143904"
-    const val INTERSTITIAL_ID = "ca-app-pub-1241288532566123/3936109640"
+    const val APP_ID = "ca-app-pub-1241288532566123~1975675615"
+    const val BANNER_ID = "ca-app-pub-3940256099942544/9214589741"
+    const val INTERSTITIAL_ID = "ca-app-pub-3940256099942544/1033173712"
     const val REWARDED_ID = "ca-app-pub-3940256099942544/5224354917"
 
     // معرفات الاختبار الاحتياطية (Google Test IDs)
     const val TEST_APP_ID = "ca-app-pub-3940256099942544~3347511713"
-    const val TEST_BANNER_ID = "ca-app-pub-3940256099942544/6300978111"
+    const val TEST_BANNER_ID = "ca-app-pub-3940256099942544/9214589741"
     const val TEST_INTERSTITIAL_ID = "ca-app-pub-3940256099942544/1033173712"
 }
 
@@ -101,38 +101,45 @@ object AdMobManager {
      * يحتوي على دالة إعادة المحاولة التلقائية باستخدام معرف الاختبار الرسمي في حال فشل المعرف الحقيقي.
      */
     fun loadInterstitial(context: Context, useTestIdFallback: Boolean = false) {
-        if (interstitialAd != null || isLoadingInterstitial) {
-            return
-        }
-        isLoadingInterstitial = true
+        try {
+            if (interstitialAd != null || isLoadingInterstitial) {
+                return
+            }
+            isLoadingInterstitial = true
+            Log.d("AdMobManager", "INTERSTITIAL_LOAD_STARTED")
 
-        val adUnitToUse = if (useTestIdFallback) AdMobIds.TEST_INTERSTITIAL_ID else AdMobIds.INTERSTITIAL_ID
-        val adRequest = AdRequest.Builder().build()
-        
-        InterstitialAd.load(
-            context,
-            adUnitToUse,
-            adRequest,
-            object : InterstitialAdLoadCallback() {
-                override fun onAdLoaded(ad: InterstitialAd) {
-                    Log.d("AdMobManager", "Interstitial Ad Loaded successfully with unit: $adUnitToUse")
-                    interstitialAd = ad
-                    isLoadingInterstitial = false
-                }
+            val adUnitToUse = if (useTestIdFallback) AdMobIds.TEST_INTERSTITIAL_ID else AdMobIds.INTERSTITIAL_ID
+            val adRequest = AdRequest.Builder().build()
+            
+            InterstitialAd.load(
+                context.applicationContext,
+                adUnitToUse,
+                adRequest,
+                object : InterstitialAdLoadCallback() {
+                    override fun onAdLoaded(ad: InterstitialAd) {
+                        Log.d("AdMobManager", "INTERSTITIAL_LOADED")
+                        Log.d("AdMobManager", "Interstitial Ad Loaded successfully with unit: $adUnitToUse")
+                        interstitialAd = ad
+                        isLoadingInterstitial = false
+                    }
 
-                override fun onAdFailedToLoad(error: LoadAdError) {
-                    Log.e("AdMobManager", "Interstitial Ad Failed to load with unit $adUnitToUse: ${error.message} (Code: ${error.code})")
-                    interstitialAd = null
-                    isLoadingInterstitial = false
-                    
-                    // إذا فشل الإعلان الحقيقي (مثلاً بسبب الحساب غير المكتمل أو وضع المعاينة)، نحاول فوراً باستخدام معرف الاختبار
-                    if (!useTestIdFallback) {
-                        Log.d("AdMobManager", "Retrying Interstitial load with Google Test ID...")
-                        loadInterstitial(context, useTestIdFallback = true)
+                    override fun onAdFailedToLoad(error: LoadAdError) {
+                        Log.e("AdMobManager", "INTERSTITIAL_LOAD_FAILED Code: ${error.code}, Message: ${error.message}")
+                        interstitialAd = null
+                        isLoadingInterstitial = false
+                        
+                        // إذا فشل الإعلان، نحاول باستخدام معرف الاختبار الإضافي إذا لم نكن نستخدمه
+                        if (!useTestIdFallback) {
+                            Log.d("AdMobManager", "Retrying Interstitial load with Google Test ID...")
+                            loadInterstitial(context, useTestIdFallback = true)
+                        }
                     }
                 }
-            }
-        )
+            )
+        } catch (e: Exception) {
+            Log.e("AdMobManager", "INTERSTITIAL_LOAD_FAILED Exception: ${e.message}", e)
+            isLoadingInterstitial = false
+        }
     }
 
     /**
@@ -143,36 +150,51 @@ object AdMobManager {
     }
 
     /**
-     * عرض الإعلان البيني (Interstitial) بأمان عند الانتقال بين الشاشات أو الضغط على الأزرار.
+     * عرض الإعلان البيني (Interstitial) بأمان عند الانتقال بين الشاشات أو نجاح العمليات.
      * @param activity شاشة التطبيق الحالية (Activity).
-     * @param onAdClosed دالة يتم تنفيذها بمجرد إغلاق الإعلان (أو فوراً إذا لم يكن الإعلان جاهزاً) لمتابعة التنقل.
+     * @param onAdClosed دالة يتم تنفيذها بمجرد إغلاق الإعلان (أو فوراً إذا لم يكن الإعلان جاهزاً) لمتابعة العمليات.
      */
     fun showInterstitial(activity: Activity?, onAdClosed: () -> Unit = {}) {
-        val ad = interstitialAd
-        if (ad != null && activity != null) {
-            ad.fullScreenContentCallback = object : FullScreenContentCallback() {
-                override fun onAdDismissedFullScreenContent() {
-                    Log.d("AdMobManager", "Interstitial Ad Dismissed.")
-                    interstitialAd = null
-                    // تحميل الإعلان التالي فوراً في الخلفية ليكون جاهزاً للانتقال القادم
-                    loadInterstitial(activity)
-                    onAdClosed()
-                }
+        try {
+            val ad = interstitialAd
+            if (ad != null && activity != null && !activity.isFinishing && !activity.isDestroyed) {
+                Log.d("AdMobManager", "INTERSTITIAL_SHOW")
+                ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                    override fun onAdDismissedFullScreenContent() {
+                        Log.d("AdMobManager", "INTERSTITIAL_DISMISSED")
+                        interstitialAd = null
+                        // تحميل الإعلان التالي فوراً في الخلفية ليكون جاهزاً للاستخدام القادم
+                        loadInterstitial(activity)
+                        onAdClosed()
+                    }
 
-                override fun onAdFailedToShowFullScreenContent(error: AdError) {
-                    Log.e("AdMobManager", "Interstitial Ad Failed to show: ${error.message}")
-                    interstitialAd = null
-                    loadInterstitial(activity)
-                    onAdClosed()
+                    override fun onAdFailedToShowFullScreenContent(error: AdError) {
+                        Log.e("AdMobManager", "INTERSTITIAL_LOAD_FAILED Code: ${error.code}, Message: ${error.message}")
+                        Log.d("AdMobManager", "INTERSTITIAL_DISMISSED")
+                        interstitialAd = null
+                        loadInterstitial(activity)
+                        onAdClosed()
+                    }
                 }
+                ad.show(activity)
+            } else {
+                Log.d("AdMobManager", "INTERSTITIAL_NOT_READY")
+                if (activity != null) {
+                    loadInterstitial(activity)
+                }
+                onAdClosed()
             }
-            ad.show(activity)
-        } else {
-            if (activity != null) {
-                loadInterstitial(activity)
-            }
+        } catch (e: Exception) {
+            Log.e("AdMobManager", "INTERSTITIAL_NOT_READY - Exception: ${e.message}", e)
             onAdClosed()
         }
+    }
+
+    /**
+     * دالة عامة مثل showInterstitialAd حسب طلب المطور.
+     */
+    fun showInterstitialAd(activity: Activity?, onAdClosed: () -> Unit = {}) {
+        showInterstitial(activity, onAdClosed)
     }
 }
 

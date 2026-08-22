@@ -32,6 +32,21 @@ data class SalaryMetrics(
     val openingBalance: Double = 0.0
 )
 
+data class AppSecurityState(
+    val isEnabled: Boolean = false,
+    val pin: String = "",
+    val isBiometricEnabled: Boolean = false
+)
+
+data class WorkerBalanceItem(
+    val workerName: String,
+    val currency: String,
+    val monthlySalary: Double,
+    val startWorkDate: Long,
+    val netBalance: Double,
+    val statusText: String
+)
+
 data class UpdateInfo(
     val hasUpdate: Boolean = false,
     val versionName: String = "",
@@ -43,6 +58,29 @@ data class UpdateInfo(
 class SalaryViewModel(application: Application) : AndroidViewModel(application) {
 
     private val sharedPrefs = application.getSharedPreferences("salary_app_prefs", android.content.Context.MODE_PRIVATE)
+    private val securityPrefs = application.getSharedPreferences("app_security_prefs", android.content.Context.MODE_PRIVATE)
+
+    private val _appSecurityState = MutableStateFlow(
+        AppSecurityState(
+            isEnabled = securityPrefs.getBoolean("security_enabled", false),
+            pin = securityPrefs.getString("security_pin", "") ?: "",
+            isBiometricEnabled = securityPrefs.getBoolean("biometric_enabled", false)
+        )
+    )
+    val appSecurityState: StateFlow<AppSecurityState> = _appSecurityState.asStateFlow()
+
+    fun updateAppSecurity(enabled: Boolean, pin: String, biometricEnabled: Boolean) {
+        securityPrefs.edit()
+            .putBoolean("security_enabled", enabled)
+            .putString("security_pin", pin)
+            .putBoolean("biometric_enabled", biometricEnabled)
+            .apply()
+        _appSecurityState.value = AppSecurityState(
+            isEnabled = enabled,
+            pin = pin,
+            isBiometricEnabled = biometricEnabled
+        )
+    }
 
     val activeUser = MutableStateFlow<String?>(null)
     val registeredUsers = MutableStateFlow<List<String>>(emptyList())
@@ -129,6 +167,38 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         loginUser(existingName)
                     }
                 }
+
+                // Check for legacy security settings migration to global app security
+                if (!securityPrefs.contains("security_enabled")) {
+                    if (current != null && current.securityEnabled && current.securityPin.isNotBlank()) {
+                        updateAppSecurity(
+                            enabled = true,
+                            pin = current.securityPin,
+                            biometricEnabled = current.biometricEnabled
+                        )
+                        Log.d("SalaryViewModel", "Migrated legacy PIN from active worker to global app security.")
+                    } else {
+                        // Scan other registered users if needed
+                        for (uName in usersSet) {
+                            try {
+                                val uDb = AppDatabase.getDatabaseForUser(getApplication(), uName)
+                                val uSettings = uDb.salaryDao().getSalarySettingsDirect()
+                                if (uSettings != null && uSettings.securityEnabled && uSettings.securityPin.isNotBlank()) {
+                                    updateAppSecurity(
+                                        enabled = true,
+                                        pin = uSettings.securityPin,
+                                        biometricEnabled = uSettings.biometricEnabled
+                                    )
+                                    Log.d("SalaryViewModel", "Migrated legacy PIN from user $uName to global app security.")
+                                    break
+                                }
+                            } catch (e: Exception) {
+                                Log.w("SalaryViewModel", "Failed to check legacy security for $uName", e)
+                            }
+                        }
+                    }
+                }
+
                 repairSettlementBalancesIfNeeded(repository)
             } catch (e: Exception) {
                 Log.e("SalaryViewModel", "Error checking/initializing default settings", e)
@@ -292,7 +362,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val trimmedName = name.trim()
         val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
         usersSet.remove(trimmedName)
-        sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
+        sharedPrefs.edit().putStringSet("registered_users", usersSet)
+            .remove("deleted_spending_dates_$trimmedName").apply()
         
         registeredUsers.value = usersSet.toList().sorted()
         
@@ -313,6 +384,47 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 logoutUser()
             }
         }
+    }
+
+    suspend fun getAllWorkersBalances(): List<WorkerBalanceItem> = withContext(Dispatchers.IO) {
+        val users = registeredUsers.value
+        val userList = if (users.isEmpty()) {
+            activeUser.value?.let { listOf(it) } ?: emptyList()
+        } else {
+            users
+        }
+
+        val result = mutableListOf<WorkerBalanceItem>()
+        for (userName in userList) {
+            try {
+                val uDb = AppDatabase.getDatabaseForUser(getApplication(), userName)
+                val uSettings = uDb.salaryDao().getSalarySettingsDirect() ?: SalarySettings(employeeName = userName)
+                val txList = uDb.transactionDao().getAllTransactionsDirect()
+                val histories = uDb.salaryHistoryDao().getAllSalaryHistoriesDirect()
+                val m = calculateSalaryMetrics(uSettings, txList, histories)
+                val curr = if (uSettings.currency.isBlank()) "ريال" else uSettings.currency
+                val balance = m.netBalance
+                val status = when {
+                    balance > 0.001 -> "له: + " + String.format(Locale.US, "%,d", balance.toInt()) + " " + curr
+                    balance < -0.001 -> "عليه: - " + String.format(Locale.US, "%,d", Math.abs(balance).toInt()) + " " + curr
+                    else -> "لا يوجد رصيد"
+                }
+                val displayName = if (uSettings.employeeName.isNotBlank()) uSettings.employeeName else userName
+                result.add(
+                    WorkerBalanceItem(
+                        workerName = displayName,
+                        currency = curr,
+                        monthlySalary = uSettings.monthlySalary,
+                        startWorkDate = uSettings.startWorkDate,
+                        netBalance = balance,
+                        statusText = status
+                    )
+                )
+            } catch (e: Exception) {
+                Log.e("SalaryViewModel", "Error calculating balance for user $userName", e)
+            }
+        }
+        result
     }
 
     private fun calculateSalaryMetrics(
@@ -996,8 +1108,30 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    private fun getDeletedSpendingDates(user: String?): MutableSet<String> {
+        val key = "deleted_spending_dates_${user ?: "default"}"
+        val set = sharedPrefs.getStringSet(key, null)
+        return set?.toMutableSet() ?: mutableSetOf()
+    }
+
+    private fun saveDeletedSpendingDate(user: String?, dateStr: String) {
+        val key = "deleted_spending_dates_${user ?: "default"}"
+        val current = getDeletedSpendingDates(user)
+        current.add(dateStr)
+        sharedPrefs.edit().putStringSet(key, current).apply()
+    }
+
     fun deleteTransaction(tx: Transaction) {
         viewModelScope.launch {
+            if (tx.type == "SPENDING") {
+                val cal = Calendar.getInstance().apply {
+                    timeInMillis = tx.timestamp
+                }
+                val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+                val dateStr = sdf.format(cal.time)
+                saveDeletedSpendingDate(activeUser.value, dateStr)
+            }
+
             repository.deleteTransaction(tx)
             
             val currentSettings = repository.getSalarySettingsDirect()
@@ -1041,6 +1175,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     fun resetAllData() {
         viewModelScope.launch {
+            val user = activeUser.value
+            sharedPrefs.edit().remove("deleted_spending_dates_${user ?: "default"}").apply()
             repository.deleteAllTransactions()
             repository.insertOrUpdateSalarySettings(SalarySettings())
             speakOutText("تم تصفير جميع البيانات والبدء من جديد")
@@ -1099,6 +1235,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             autoAddMutex.withLock {
                 try {
                     val txList = repository.getAllTransactionsDirect()
+                    val currentUser = activeUser.value
+                    val deletedDatesSet = getDeletedSpendingDates(currentUser)
+                    val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
                     
                     val calStart = Calendar.getInstance().apply {
                         timeInMillis = settings.startWorkDate
@@ -1131,7 +1270,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     
                     while (!calStart.after(calToday) && daysAdded < daysLimit) {
                         val dayMidnight = calStart.timeInMillis
-                        if (!existingSpendingDays.contains(dayMidnight)) {
+                        val dateStr = dateFormat.format(calStart.time)
+                        if (!existingSpendingDays.contains(dayMidnight) && !deletedDatesSet.contains(dateStr)) {
                             listToInsert.add(
                                 Transaction(
                                     type = "SPENDING",

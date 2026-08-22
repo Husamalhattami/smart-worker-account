@@ -83,6 +83,7 @@ import com.example.util.LanguageStrings
 import com.example.util.PdfPrintHelper
 import com.example.viewmodel.SalaryMetrics
 import com.example.viewmodel.SalaryViewModel
+import com.example.viewmodel.AppSecurityState
 import androidx.biometric.BiometricPrompt
 import androidx.biometric.BiometricManager
 import androidx.fragment.app.FragmentActivity
@@ -109,6 +110,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val settingsState by viewModel.settings.collectAsState()
+    val appSecurityState by viewModel.appSecurityState.collectAsStateWithLifecycle()
     val transactionsState by viewModel.transactions.collectAsState()
     val metricsState by viewModel.metrics.collectAsState()
     val activeUser by viewModel.activeUser.collectAsState()
@@ -143,6 +145,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     var showWorkerAccountsDialog by remember { mutableStateOf(false) }
     var editingTransaction by remember { mutableStateOf<Transaction?>(null) }
     var isAppUnlocked by remember { mutableStateOf(false) }
+    var userRequestedAccountSwitch by remember { mutableStateOf(false) }
     var hasRecordPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -178,7 +181,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         }
     }
 
-    val activity = context as? Activity
+    val activity = context.findActivity() ?: (context as? Activity)
 
     fun requestPermissionsSafely(permissions: Array<String>) {
         if (activity != null && permissions.isNotEmpty()) {
@@ -395,6 +398,12 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         }
     }
 
+    LaunchedEffect(registeredUsers, activeUser) {
+        if (registeredUsers.size == 1 && (activeUser.isNullOrBlank() || settingsState?.employeeName.isNullOrBlank()) && !userRequestedAccountSwitch) {
+            viewModel.loginUser(registeredUsers.first())
+        }
+    }
+
     val systemInDark = isSystemInDarkTheme()
     val isDark = when (settingsState?.themeMode) {
         "LIGHT" -> false
@@ -420,7 +429,13 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         LocalAppColors provides appColors,
         LocalLayoutDirection provides layoutDirection
     ) {
-    if (settingsState == null) {
+    if (appSecurityState.isEnabled && !isAppUnlocked) {
+        AppLockScreen(
+            correctPin = appSecurityState.pin,
+            biometricEnabled = appSecurityState.isBiometricEnabled,
+            onUnlockSuccess = { isAppUnlocked = true }
+        )
+    } else if (settingsState == null && activeUser != null) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -429,14 +444,16 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         ) {
             CircularProgressIndicator(color = EmeraldGreen)
         }
-    } else if (settingsState?.employeeName.isNullOrBlank()) {
+    } else if (userRequestedAccountSwitch || settingsState?.employeeName.isNullOrBlank() || registeredUsers.isEmpty()) {
         WelcomeLoginScreen(
             registeredUsers = registeredUsers,
             onLogin = { userName ->
+                userRequestedAccountSwitch = false
                 hasGreeted = false
                 viewModel.loginUser(userName)
             },
             onRegister = { name, salary, startDate, currency, standardSpending, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, openingBalance ->
+                userRequestedAccountSwitch = false
                 hasGreeted = false
                 viewModel.registerNewUserAccount(
                     name = name,
@@ -452,13 +469,24 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             },
             onDeleteUser = { userName ->
                 viewModel.deleteUser(userName)
+            },
+            onPrintBalancesReport = {
+                coroutineScope.launch {
+                    val balances = viewModel.getAllWorkersBalances()
+                    if (balances.isEmpty()) {
+                        Toast.makeText(context, "لا توجد بيانات عمال لطباعتها", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val act = context.findActivity()
+                        if (act != null) {
+                            AdMobManager.showInterstitialAd(act) {
+                                PdfPrintHelper.printWorkerBalancesReport(context, balances)
+                            }
+                        } else {
+                            PdfPrintHelper.printWorkerBalancesReport(context, balances)
+                        }
+                    }
+                }
             }
-        )
-    } else if (settingsState?.securityEnabled == true && !isAppUnlocked) {
-        AppLockScreen(
-            correctPin = settingsState?.securityPin ?: "",
-            biometricEnabled = settingsState?.biometricEnabled ?: false,
-            onUnlockSuccess = { isAppUnlocked = true }
         )
     } else {
         Scaffold(
@@ -494,6 +522,17 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     }
                 },
                 actions = {
+                    // Switch Worker / Accounts Button
+                    IconButton(
+                        onClick = { showWorkerAccountsDialog = true }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Group,
+                            contentDescription = "تبديل العامل / الحسابات",
+                            tint = EarnedBlue,
+                            modifier = Modifier.size(26.dp)
+                        )
+                    }
                     // PDF Print / Export Report Button
                     IconButton(
                         onClick = { showPdfOptionsDialog = true },
@@ -723,23 +762,24 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             onDismiss = { showPdfOptionsDialog = false },
             onPrint = { startDate, endDate, showSummary, balanceMode, typeFilter ->
                 showPdfOptionsDialog = false
-                AdMobManager.showInterstitial(activity) {
-                    val settings = settingsState ?: SalarySettings()
-                    val txList = transactionsState
-                    val metrics = metricsState
-                    PdfPrintHelper.printSalaryReport(
-                        context = context,
-                        settings = settings,
-                        transactions = txList,
-                        metrics = metrics,
-                        startDateFilter = startDate,
-                        endDateFilter = endDate,
-                        showTotalSummary = showSummary,
-                        balanceDisplayMode = balanceMode,
-                        transactionTypeFilter = typeFilter,
-                        salaryHistories = salaryHistoriesState
-                    )
-                }
+                val settings = settingsState ?: SalarySettings()
+                val txList = transactionsState
+                val metrics = metricsState
+                PdfPrintHelper.printSalaryReport(
+                    context = context,
+                    settings = settings,
+                    transactions = txList,
+                    metrics = metrics,
+                    startDateFilter = startDate,
+                    endDateFilter = endDate,
+                    showTotalSummary = showSummary,
+                    balanceDisplayMode = balanceMode,
+                    transactionTypeFilter = typeFilter,
+                    salaryHistories = salaryHistoriesState,
+                    onSuccess = {
+                        AdMobManager.showInterstitialAd(activity)
+                    }
+                )
             }
         )
     }
@@ -790,6 +830,24 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     showWorkerAccountsDialog = true
                 }
             },
+            onPrintBalancesReport = {
+                showMainMenuDialog = false
+                coroutineScope.launch {
+                    val balances = viewModel.getAllWorkersBalances()
+                    if (balances.isEmpty()) {
+                        Toast.makeText(context, "لا توجد بيانات عمال لطباعتها", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val act = context.findActivity()
+                        if (act != null) {
+                            AdMobManager.showInterstitialAd(act) {
+                                PdfPrintHelper.printWorkerBalancesReport(context, balances)
+                            }
+                        } else {
+                            PdfPrintHelper.printWorkerBalancesReport(context, balances)
+                        }
+                    }
+                }
+            },
             onSettleAccount = {
                 showMainMenuDialog = false
                 showSettleConfirmDialog = true
@@ -825,6 +883,23 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             },
             onDeleteUser = { userName ->
                 viewModel.deleteUser(userName)
+            },
+            onPrintBalancesReport = {
+                coroutineScope.launch {
+                    val balances = viewModel.getAllWorkersBalances()
+                    if (balances.isEmpty()) {
+                        Toast.makeText(context, "لا توجد بيانات عمال لطباعتها", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val act = context.findActivity()
+                        if (act != null) {
+                            AdMobManager.showInterstitialAd(act) {
+                                PdfPrintHelper.printWorkerBalancesReport(context, balances)
+                            }
+                        } else {
+                            PdfPrintHelper.printWorkerBalancesReport(context, balances)
+                        }
+                    }
+                }
             }
         )
     }
@@ -976,12 +1051,18 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                         fileOpNotification = Pair(success, msg)
+                        if (success) {
+                            AdMobManager.showInterstitialAd(activity)
+                        }
                     }
                 }
             },
             onShareBackup = {
                 exportAndShareBackup(context, viewModel, coroutineScope) { success, msg ->
                     fileOpNotification = Pair(success, msg)
+                    if (success) {
+                        AdMobManager.showInterstitialAd(activity)
+                    }
                 }
             },
             onRestoreFromFile = { file ->
@@ -1130,9 +1211,11 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     if (showSettingsDialog) {
         SettingsDialog(
             currentSettings = settingsState ?: SalarySettings(),
+            currentAppSecurity = appSecurityState,
             onDismiss = { showSettingsDialog = false },
             onSave = { voiceEnabled, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, securityEnabled, securityPin, biometricEnabled, themeMode, appLanguage ->
                 AdMobManager.showInterstitial(activity) {
+                    viewModel.updateAppSecurity(securityEnabled, securityPin, biometricEnabled)
                     val curr = settingsState ?: SalarySettings()
                     viewModel.updateSalarySettings(
                         salary = curr.monthlySalary,
@@ -2469,6 +2552,7 @@ fun AddTransactionDialog(
 @Composable
 fun SettingsDialog(
     currentSettings: SalarySettings,
+    currentAppSecurity: AppSecurityState,
     onDismiss: () -> Unit,
     onSave: (
         voiceEnabled: Boolean,
@@ -2492,10 +2576,10 @@ fun SettingsDialog(
     var dailyReminderHour by remember { mutableStateOf(currentSettings.dailyReminderHour) }
     var dailyReminderMinute by remember { mutableStateOf(currentSettings.dailyReminderMinute) }
 
-    // Security States
-    var securityEnabled by remember { mutableStateOf(currentSettings.securityEnabled) }
-    var securityPinInput by remember { mutableStateOf(currentSettings.securityPin) }
-    var biometricEnabled by remember { mutableStateOf(currentSettings.biometricEnabled) }
+    // Security States (Global App-Level Security)
+    var securityEnabled by remember { mutableStateOf(currentAppSecurity.isEnabled) }
+    var securityPinInput by remember { mutableStateOf(currentAppSecurity.pin) }
+    var biometricEnabled by remember { mutableStateOf(currentAppSecurity.isBiometricEnabled) }
 
     // Theme & Language Modes State
     var themeMode by remember { mutableStateOf(currentSettings.themeMode) }
@@ -4563,7 +4647,8 @@ fun WorkerAccountsDialog(
     onDismiss: () -> Unit,
     onLogin: (String) -> Unit,
     onRegister: (String, Double, Long, String, Double, Boolean, Int, Int, Double) -> Unit,
-    onDeleteUser: (String) -> Unit
+    onDeleteUser: (String) -> Unit,
+    onPrintBalancesReport: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showCreateForm by remember { mutableStateOf(registeredUsers.isEmpty()) }
@@ -4834,6 +4919,27 @@ fun WorkerAccountsDialog(
                     }
                 }
 
+                if (registeredUsers.isNotEmpty()) {
+                    Button(
+                        onClick = onPrintBalancesReport,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Print,
+                            contentDescription = null,
+                            tint = Color.White
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "📄 طباعة كشف أرصدة جميع العمال (PDF)",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
                 Button(
                     onClick = { showCreateForm = !showCreateForm },
                     colors = ButtonDefaults.buttonColors(
@@ -5048,7 +5154,8 @@ fun WelcomeLoginScreen(
     registeredUsers: List<String>,
     onLogin: (String) -> Unit,
     onRegister: (String, Double, Long, String, Double, Boolean, Int, Int, Double) -> Unit,
-    onDeleteUser: (String) -> Unit
+    onDeleteUser: (String) -> Unit,
+    onPrintBalancesReport: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     var nameInput by remember { mutableStateOf("") }
@@ -5186,6 +5293,19 @@ fun WelcomeLoginScreen(
                                         Icon(imageVector = Icons.Default.Delete, contentDescription = "حذف العامل", tint = CrimsonRed)
                                     }
                                 }
+                            }
+                        }
+
+                        if (onPrintBalancesReport != null) {
+                            Button(
+                                onClick = onPrintBalancesReport,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                            ) {
+                                Icon(imageVector = Icons.Default.Print, contentDescription = null, tint = Color.White)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("📄 طباعة كشف أرصدة جميع العمال (PDF)", color = Color.White, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -5588,6 +5708,7 @@ private fun saveBackupToSmartWorkerFolder(context: Context, viewModel: SalaryVie
         }
 
         if (saved) {
+            Log.d("SalaryApp", "BACKUP_SUCCESS")
             return Pair(
                 true,
                 "✅ تم حفظ النسخة الاحتياطية بنجاح في مجلد (SmartWorker) داخل المستندات باسم:\n\n$backupFileName\n\n💡 ملاحظة: تم إنشاء ملف واحد فقط في المستندات لتجنب التكرار."
@@ -5710,6 +5831,7 @@ private fun exportAndShareBackup(
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                Log.d("SalaryApp", "BACKUP_SUCCESS")
                 val msg = "✅ تم تجهيز ملف قاعدة البيانات (.db) للتصدير والمشاركة بنجاح!"
                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                 onResult(true, msg)
@@ -5737,6 +5859,7 @@ fun MainMenuDialog(
     onOpenGuide: () -> Unit,
     onOpenDeveloperInfo: () -> Unit,
     onSwitchWorker: () -> Unit = {},
+    onPrintBalancesReport: () -> Unit = {},
     onSettleAccount: () -> Unit = {}
 ) {
     val appLang = AppLanguage.fromCode(appLanguage)
@@ -5908,7 +6031,15 @@ fun MainMenuDialog(
                         }
 
                         // Section 2: Data & Updates
-                        MenuSectionGroup(title = "البيانات والتحديثات") {
+                        MenuSectionGroup(title = "البيانات والتقارير والتحديثات") {
+                            MenuOptionCard(
+                                title = "📄 طباعة كشف أرصدة جميع العمال (PDF)",
+                                subtitle = "تصدير كشف شامل لجميع العمال المسجلين وأرصدتهم الحالية",
+                                icon = Icons.Default.Print,
+                                color = EmeraldGreen,
+                                onClick = { dismissWithAnimation(); onPrintBalancesReport() }
+                            )
+                            HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
                             MenuOptionCard(
                                 title = "النسخ الاحتياطي والاستعادة",
                                 subtitle = "حفظ واسترجاع ملف قاعدة البيانات بأمان",

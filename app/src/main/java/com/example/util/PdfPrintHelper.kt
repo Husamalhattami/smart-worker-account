@@ -8,6 +8,7 @@ import android.print.PrintManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import android.util.Log
 import com.example.data.SalaryHistory
 import com.example.data.SalarySettings
 import com.example.data.Transaction
@@ -34,7 +35,8 @@ object PdfPrintHelper {
         showTotalSummary: Boolean = true,
         balanceDisplayMode: String = "AFTER_EACH_TX", // "AFTER_EACH_TX", "END_OF_MONTH", "END_OF_REPORT"
         transactionTypeFilter: String = "ALL", // "ALL", "SPENDING", "DRAW", "ABSENCE", "SETTLEMENT"
-        salaryHistories: List<SalaryHistory> = emptyList()
+        salaryHistories: List<SalaryHistory> = emptyList(),
+        onSuccess: (() -> Unit)? = null
     ) {
         val sdf = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("ar"))
         val dateString = sdf.format(Date())
@@ -915,7 +917,239 @@ object PdfPrintHelper {
                         printAdapter,
                         PrintAttributes.Builder().build()
                     )
+                    Log.d("PdfPrintHelper", "PDF_SUCCESS")
                     Toast.makeText(context, "جاري فتح كشف الحساب ونظام الطباعة / PDF...", Toast.LENGTH_SHORT).show()
+                    onSuccess?.invoke()
+                }
+            }
+
+            webView.loadDataWithBaseURL(null, htmlContent, "text/html", "utf-8", null)
+        }
+    }
+
+    fun printWorkerBalancesReport(
+        context: Context,
+        workerBalances: List<com.example.viewmodel.WorkerBalanceItem>,
+        onSuccess: (() -> Unit)? = null
+    ) {
+        val sdf = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("ar"))
+        val dateString = sdf.format(Date())
+        val dateSdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+
+        val htmlContent = buildString {
+            append("""
+                <!DOCTYPE html>
+                <html dir="rtl" lang="ar">
+                <head>
+                    <meta charset="UTF-8">
+                    <title>كشف أرصدة العمال والموظفين</title>
+                    <style>
+                        @page {
+                            size: A4;
+                            margin: 8mm;
+                        }
+                        body {
+                            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+                            color: #0f172a;
+                            background-color: #ffffff;
+                            margin: 0;
+                            padding: 6px;
+                            direction: rtl;
+                            font-size: 11px;
+                            line-height: 1.35;
+                        }
+                        .header-container {
+                            border-bottom: 2px solid #059669;
+                            padding-bottom: 6px;
+                            margin-bottom: 12px;
+                            display: flex;
+                            justify-content: space-between;
+                            align-items: center;
+                        }
+                        .app-title {
+                            font-size: 18px;
+                            font-weight: bold;
+                            color: #059669;
+                            margin: 0;
+                        }
+                        .report-subtitle {
+                            font-size: 11px;
+                            color: #475569;
+                            margin: 3px 0 0 0;
+                        }
+                        .summary-box {
+                            background-color: #f8fafc;
+                            border: 1px solid #cbd5e1;
+                            border-radius: 8px;
+                            padding: 8px 12px;
+                            margin-bottom: 12px;
+                            display: flex;
+                            justify-content: space-between;
+                            align-items: center;
+                        }
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                            margin-top: 4px;
+                            margin-bottom: 16px;
+                        }
+                        th {
+                            background-color: #059669;
+                            color: #ffffff;
+                            font-weight: bold;
+                            padding: 8px 6px;
+                            border: 1px solid #047857;
+                            text-align: center;
+                            font-size: 11px;
+                        }
+                        td {
+                            padding: 8px 6px;
+                            border: 1px solid #e2e8f0;
+                            text-align: center;
+                            font-size: 11px;
+                        }
+                        tr:nth-child(even) {
+                            background-color: #f8fafc;
+                        }
+                        .footer-container {
+                            margin-top: 24px;
+                            border-top: 1px dashed #cbd5e1;
+                            padding-top: 8px;
+                            display: flex;
+                            justify-content: space-between;
+                            font-size: 10px;
+                            color: #64748b;
+                        }
+                        .badge-positive {
+                            color: #047857;
+                            background-color: #ecfdf5;
+                            border: 1px solid #a7f3d0;
+                            padding: 4px 10px;
+                            border-radius: 6px;
+                            font-weight: bold;
+                            display: inline-block;
+                        }
+                        .badge-negative {
+                            color: #b91c1c;
+                            background-color: #fef2f2;
+                            border: 1px solid #fecaca;
+                            padding: 4px 10px;
+                            border-radius: 6px;
+                            font-weight: bold;
+                            display: inline-block;
+                        }
+                        .badge-zero {
+                            color: #4b5563;
+                            background-color: #f3f4f6;
+                            border: 1px solid #e5e7eb;
+                            padding: 4px 10px;
+                            border-radius: 6px;
+                            font-weight: bold;
+                            display: inline-block;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="header-container">
+                        <div>
+                            <h1 class="app-title">حساب العامل الذكي 📱</h1>
+                            <p class="report-subtitle">كشف أرصدة وحسابات العمال والموظفين</p>
+                        </div>
+                        <div style="text-align: left; font-size: 10px; color: #475569;">
+                            <div>📅 تاريخ الطباعة: $dateString</div>
+                            <div>👥 عدد العمال: ${workerBalances.size}</div>
+                        </div>
+                    </div>
+
+                    <div class="summary-box">
+                        <span style="font-weight: bold; color: #1e293b;">📋 كشف تفصيلي بالأرصدة المستحقة لكل عامل على حِدة:</span>
+                        <span style="font-size: 10px; color: #64748b;">(مستند مالي رسمي)</span>
+                    </div>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width: 35px;">م</th>
+                                <th>اسم العامل / الموظف</th>
+                                <th style="width: 100px;">الراتب الشهري</th>
+                                <th style="width: 100px;">تاريخ بدء الحساب</th>
+                                <th style="width: 160px;">صافي الرصيد والحالة</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            """.trimIndent())
+
+            if (workerBalances.isEmpty()) {
+                append("""
+                    <tr>
+                        <td colspan="5" style="padding: 16px; color: #64748b;">لا توجد حسابات عمال مسجلة حالياً.</td>
+                    </tr>
+                """.trimIndent())
+            } else {
+                workerBalances.forEachIndexed { index, worker ->
+                    val startDateStr = dateSdf.format(Date(worker.startWorkDate))
+                    val salaryStr = if (worker.monthlySalary > 0) "${worker.monthlySalary.toInt()} ${worker.currency}" else "غير محدد"
+                    val balanceHtml = when {
+                        worker.netBalance > 0.001 -> {
+                            val amt = String.format(Locale("ar"), "%,d", worker.netBalance.toInt())
+                            """<span class="badge-positive">له: +$amt ${worker.currency}</span>"""
+                        }
+                        worker.netBalance < -0.001 -> {
+                            val amt = String.format(Locale("ar"), "%,d", Math.abs(worker.netBalance).toInt())
+                            """<span class="badge-negative">عليه: -$amt ${worker.currency}</span>"""
+                        }
+                        else -> {
+                            """<span class="badge-zero">لا يوجد رصيد</span>"""
+                        }
+                    }
+
+                    append("""
+                        <tr>
+                            <td>${index + 1}</td>
+                            <td style="font-weight: bold; text-align: right; padding-right: 10px; color: #0f172a;">${worker.workerName}</td>
+                            <td>$salaryStr</td>
+                            <td>$startDateStr</td>
+                            <td>$balanceHtml</td>
+                        </tr>
+                    """.trimIndent())
+                }
+            }
+
+            append("""
+                        </tbody>
+                    </table>
+
+                    <div class="footer-container">
+                        <span>مستند كشف أرصدة مالي رسمي صادر من تطبيق (حساب العامل الذكي 📱)</span>
+                        <span>توقيع المحاسب / الإدارة: ............................</span>
+                    </div>
+                </body>
+                </html>
+            """.trimIndent())
+        }
+
+        (context as? Activity)?.runOnUiThread {
+            val webView = WebView(context)
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    val printManager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                    val jobName = "كشف_أرصدة_العمال"
+
+                    val printAdapter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        webView.createPrintDocumentAdapter(jobName)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        webView.createPrintDocumentAdapter()
+                    }
+
+                    printManager.print(
+                        jobName,
+                        printAdapter,
+                        PrintAttributes.Builder().build()
+                    )
+                    Log.d("PdfPrintHelper", "PDF_SUCCESS")
+                    Toast.makeText(context, "جاري فتح كشف أرصدة العمال ونظام الطباعة / PDF...", Toast.LENGTH_SHORT).show()
+                    onSuccess?.invoke()
                 }
             }
 
