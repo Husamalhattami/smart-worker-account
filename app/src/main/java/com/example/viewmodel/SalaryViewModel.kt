@@ -1453,9 +1453,11 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         val root = JSONObject().apply {
-            put("version", 1)
+            put("version", 2)
             put("appName", "SmartWorkerAccount")
             put("exportDate", System.currentTimeMillis())
+            // Store the owner explicitly so restore is independent of the selected UI account.
+            put("accountName", s.employeeName.ifBlank { activeUser.value.orEmpty() })
             put("settings", settingsObj)
             put("transactions", txArray)
         }
@@ -1466,10 +1468,28 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     suspend fun restoreBackupJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val root = JSONObject(jsonString)
-            if (root.has("settings")) {
-                val sObj = root.getJSONObject("settings")
-                val activeName = activeUser.value
-                val targetName = if (!activeName.isNullOrBlank()) activeName else sObj.optString("employeeName", "")
+            val sObj = root.optJSONObject("settings")
+                ?: throw IllegalArgumentException("Backup is missing settings")
+                // v2 stores accountName at the root. Older backups fall back to employeeName.
+                // Never use the active account when the backup identifies its owner.
+                val backupOwner = root.optString("accountName", "").trim()
+                    .ifBlank { sObj.optString("employeeName", "").trim() }
+                val activeName = activeUser.value?.trim().orEmpty()
+                val targetName = backupOwner.ifBlank { activeName }
+                val targetRepository = getRepoForUser(targetName.ifBlank { null })
+                val switchedAccount = targetName.isNotBlank() && targetName != activeName
+                if (switchedAccount) {
+                    val users = sharedPrefs.getStringSet("registered_users", emptySet())
+                        ?.toMutableSet() ?: mutableSetOf()
+                    users.add(targetName)
+                    sharedPrefs.edit()
+                        .putStringSet("registered_users", users)
+                        .putString("active_user", targetName)
+                        .apply()
+                    registeredUsers.value = users.toList().sorted()
+                    activeUser.value = targetName
+                    currentRepoFlow.value = targetRepository
+                }
                 val restoredSettings = SalarySettings(
                     id = 1,
                     monthlySalary = sObj.optDouble("monthlySalary", 150000.0),
@@ -1494,12 +1514,11 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     themeMode = sObj.optString("themeMode", "DARK"),
                     appLanguage = sObj.optString("appLanguage", "ar")
                 )
-                repository.insertOrUpdateSalarySettings(restoredSettings)
-            }
+            targetRepository.insertOrUpdateSalarySettings(restoredSettings)
 
             if (root.has("transactions")) {
                 val txArray = root.getJSONArray("transactions")
-                repository.deleteAllTransactions()
+                targetRepository.deleteAllTransactions()
                 for (i in 0 until txArray.length()) {
                     val obj = txArray.getJSONObject(i)
                     val vNote = obj.optString("voiceNotePath", obj.optString("audioNotePath", ""))
@@ -1512,10 +1531,15 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         voiceNotePath = if (vNote.isBlank()) null else vNote,
                         voiceText = if (vText.isBlank()) null else vText
                     )
-                    repository.insertTransaction(tx)
+                    targetRepository.insertTransaction(tx)
                 }
             }
-            _userNotice.tryEmit("✅ تم استعادة النسخة الاحتياطية بنجاح!")
+            val notice = if (switchedAccount) {
+                "✅ تمت الاستعادة داخل حساب «$targetName» وتم الانتقال إليه حفاظاً على عزل البيانات."
+            } else {
+                "✅ تم استعادة النسخة الاحتياطية بنجاح داخل الحساب الصحيح."
+            }
+            _userNotice.tryEmit(notice)
             true
         } catch (e: Exception) {
             Log.e("SalaryViewModel", "Error restoring backup JSON", e)
