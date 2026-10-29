@@ -27,6 +27,7 @@ data class SalaryMetrics(
     val workedDays: Double = 0.0,
     val totalSpendings: Double = 0.0,
     val totalDraws: Double = 0.0,
+    val totalDeposits: Double = 0.0,
     val earnedSalary: Double = 0.0,
     val netBalance: Double = 0.0,
     val openingBalance: Double = 0.0
@@ -84,13 +85,43 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     val activeUser = MutableStateFlow<String?>(null)
     val registeredUsers = MutableStateFlow<List<String>>(emptyList())
+    val alwaysOpenDefaultAccount = MutableStateFlow(sharedPrefs.getBoolean("always_open_default_account", false))
+    val defaultAccountName = MutableStateFlow<String?>(sharedPrefs.getString("default_account_name", null))
+
+    fun setAlwaysOpenDefaultAccount(enabled: Boolean, targetUser: String? = null) {
+        val editor = sharedPrefs.edit().putBoolean("always_open_default_account", enabled)
+        if (enabled) {
+            val userToSet = targetUser?.trim() ?: activeUser.value?.trim()
+            if (!userToSet.isNullOrBlank()) {
+                editor.putString("default_account_name", userToSet)
+                defaultAccountName.value = userToSet
+            }
+        } else {
+            editor.remove("default_account_name")
+            defaultAccountName.value = null
+        }
+        editor.apply()
+        alwaysOpenDefaultAccount.value = enabled
+    }
 
     private fun getRepoForUser(userName: String?): SalaryRepository {
         val userDb = AppDatabase.getDatabaseForUser(getApplication(), userName)
-        return SalaryRepository(userDb.salaryDao(), userDb.transactionDao(), userDb.currencyDao(), userDb.salaryHistoryDao())
+        return SalaryRepository(userDb.salaryDao(), userDb.transactionDao(), userDb.currencyDao(), userDb.salaryHistoryDao(), userDb.leaveDao())
     }
 
-    private val currentRepoFlow = MutableStateFlow<SalaryRepository>(getRepoForUser(sharedPrefs.getString("active_user", null)))
+    private val currentRepoFlow = MutableStateFlow<SalaryRepository>(
+        getRepoForUser(
+            run {
+                val uSet = sharedPrefs.getStringSet("registered_users", emptySet()) ?: emptySet()
+                val isAlways = sharedPrefs.getBoolean("always_open_default_account", false)
+                when {
+                    uSet.size == 1 -> uSet.firstOrNull() ?: sharedPrefs.getString("active_user", null)
+                    uSet.size > 1 && isAlways -> sharedPrefs.getString("default_account_name", null) ?: sharedPrefs.getString("active_user", null)
+                    else -> null
+                }
+            }
+        )
+    )
     private val repository: SalaryRepository get() = currentRepoFlow.value
     private val ttsHelper: ArabicTtsHelper = ArabicTtsHelper(application)
     private val recorderHelper: VoiceRecorderHelper = VoiceRecorderHelper(application)
@@ -110,6 +141,10 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     val salaryHistoriesState: StateFlow<List<SalaryHistory>> = currentRepoFlow
         .flatMapLatest { it.salaryHistories }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val leavesState: StateFlow<List<LeaveRecord>> = currentRepoFlow
+        .flatMapLatest { it.allLeaves }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val metrics: StateFlow<SalaryMetrics>
@@ -145,7 +180,17 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         if (!initialActive.isNullOrBlank()) {
             usersSet.add(initialActive.trim())
         }
-        activeUser.value = initialActive
+        val isAlwaysOpen = sharedPrefs.getBoolean("always_open_default_account", false)
+        val defaultSavedUser = sharedPrefs.getString("default_account_name", null)
+
+        val targetStartupUser = when {
+            usersSet.size == 1 -> usersSet.first()
+            usersSet.size > 1 && isAlwaysOpen && !defaultSavedUser.isNullOrBlank() && usersSet.contains(defaultSavedUser.trim()) -> defaultSavedUser.trim()
+            usersSet.size > 1 && isAlwaysOpen && !initialActive.isNullOrBlank() && usersSet.contains(initialActive.trim()) -> initialActive.trim()
+            else -> null
+        }
+
+        activeUser.value = targetStartupUser
         registeredUsers.value = usersSet.toList().sorted()
 
         // Ensure default settings and currencies exist in the database if empty
@@ -154,16 +199,16 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 repository.seedDefaultCurrenciesIfEmpty()
                 val current = repository.getSalarySettingsDirect()
                 if (current == null) {
-                    repository.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = initialActive ?: ""))
+                    repository.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = targetStartupUser ?: initialActive ?: ""))
                     Log.d("SalaryViewModel", "Initialized default empty salary settings row in database.")
-                } else if (current.employeeName.isNotBlank()) {
-                    val existingName = current.employeeName.trim()
-                    if (!usersSet.contains(existingName)) {
+                } else {
+                    if (!targetStartupUser.isNullOrBlank() && current.employeeName != targetStartupUser) {
+                        repository.insertOrUpdateSalarySettings(current.copy(employeeName = targetStartupUser))
+                    } else if (targetStartupUser.isNullOrBlank() && usersSet.isEmpty() && current.employeeName.isNotBlank()) {
+                        val existingName = current.employeeName.trim()
                         usersSet.add(existingName)
                         sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
                         registeredUsers.value = usersSet.toList().sorted()
-                    }
-                    if (initialActive.isNull_or_blank_check()) {
                         loginUser(existingName)
                     }
                 }
@@ -205,10 +250,10 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // Combine settings, transactions, and salaryHistories to compute metrics in real-time
-        metrics = combine(settings, transactions, salaryHistoriesState) { settingsVal, txList, historiesList ->
+        // Combine settings, transactions, salaryHistories, and leaves to compute metrics in real-time
+        metrics = combine(settings, transactions, salaryHistoriesState, leavesState) { settingsVal, txList, historiesList, leavesList ->
             val actualSettings = settingsVal ?: SalarySettings()
-            calculateSalaryMetrics(actualSettings, txList, historiesList)
+            calculateSalaryMetrics(actualSettings, txList, historiesList, leavesList)
         }.stateIn(viewModelScope, SharingStarted.Eagerly, SalaryMetrics())
 
         // Collect changes to settings to initialize user database if needed & schedule reminder
@@ -321,14 +366,13 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     fun loginUser(name: String) {
         val trimmedName = name.trim()
         if (trimmedName.isBlank()) return
-        sharedPrefs.edit().putString("active_user", trimmedName).apply()
         
         val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
         usersSet.add(trimmedName)
-        activeUser.value?.let { curr ->
-            if (curr.isNotBlank()) usersSet.add(curr.trim())
-        }
-        sharedPrefs.edit().putStringSet("registered_users", usersSet).apply()
+        sharedPrefs.edit()
+            .putStringSet("registered_users", usersSet)
+            .putString("active_user", trimmedName)
+            .apply()
         
         registeredUsers.value = usersSet.toList().sorted()
         activeUser.value = trimmedName
@@ -342,7 +386,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 val current = newRepo.getSalarySettingsDirect()
                 if (current == null) {
                     newRepo.insertOrUpdateSalarySettings(SalarySettings(id = 1, employeeName = trimmedName))
-                } else if (current.employeeName.isBlank()) {
+                } else if (current.employeeName != trimmedName) {
                     newRepo.insertOrUpdateSalarySettings(current.copy(employeeName = trimmedName))
                 }
             } catch (e: Exception) {
@@ -367,11 +411,21 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         
         registeredUsers.value = usersSet.toList().sorted()
         
+        if (sharedPrefs.getString("default_account_name", null) == trimmedName) {
+            sharedPrefs.edit().remove("default_account_name").putBoolean("always_open_default_account", false).apply()
+            alwaysOpenDefaultAccount.value = false
+            defaultAccountName.value = null
+        }
+        
         AppDatabase.closeDatabaseForUser(trimmedName)
         
         try {
             val dbName = AppDatabase.getDatabaseNameForUser(trimmedName)
             getApplication<Application>().deleteDatabase(dbName)
+            val dbFile = getApplication<Application>().getDatabasePath(dbName)
+            File(dbFile.path + "-wal").delete()
+            File(dbFile.path + "-shm").delete()
+            File(dbFile.path + "-journal").delete()
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -386,12 +440,20 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    suspend fun getAllWorkersBalances(): List<WorkerBalanceItem> = withContext(Dispatchers.IO) {
+    suspend fun getAllWorkersBalances(
+        cutoffDateMs: Long? = null,
+        selectedWorkerNames: Set<String>? = null
+    ): List<WorkerBalanceItem> = withContext(Dispatchers.IO) {
         val users = registeredUsers.value
-        val userList = if (users.isEmpty()) {
+        val allUsers = if (users.isEmpty()) {
             activeUser.value?.let { listOf(it) } ?: emptyList()
         } else {
             users
+        }
+        val userList = if (selectedWorkerNames != null) {
+            allUsers.filter { selectedWorkerNames.contains(it) }
+        } else {
+            allUsers
         }
 
         val result = mutableListOf<WorkerBalanceItem>()
@@ -399,20 +461,32 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             try {
                 val uDb = AppDatabase.getDatabaseForUser(getApplication(), userName)
                 val uSettings = uDb.salaryDao().getSalarySettingsDirect() ?: SalarySettings(employeeName = userName)
+                // Keep worker setting employeeName strictly in sync with userName
+                if (uSettings.employeeName != userName) {
+                    try {
+                        uDb.salaryDao().insertOrUpdateSalarySettings(uSettings.copy(employeeName = userName))
+                    } catch (_: Exception) {}
+                }
                 val txList = uDb.transactionDao().getAllTransactionsDirect()
                 val histories = uDb.salaryHistoryDao().getAllSalaryHistoriesDirect()
-                val m = calculateSalaryMetrics(uSettings, txList, histories)
+                val leaves = uDb.leaveDao().getAllLeavesDirect()
+
+                val balance = if (cutoffDateMs == null) {
+                    val m = calculateSalaryMetrics(uSettings, txList, histories, leaves)
+                    m.netBalance
+                } else {
+                    calculateWorkerBalanceAtCutoff(uSettings, txList, histories, leaves, cutoffDateMs)
+                }
+
                 val curr = if (uSettings.currency.isBlank()) "ريال" else uSettings.currency
-                val balance = m.netBalance
                 val status = when {
-                    balance > 0.001 -> "له: + " + String.format(Locale.US, "%,d", balance.toInt()) + " " + curr
-                    balance < -0.001 -> "عليه: - " + String.format(Locale.US, "%,d", Math.abs(balance).toInt()) + " " + curr
+                    balance > 0.001 -> "له: " + String.format(Locale.US, "%,d", balance.toInt()) + " " + curr
+                    balance < -0.001 -> "عليه: " + String.format(Locale.US, "%,d", Math.abs(balance).toInt()) + " " + curr
                     else -> "لا يوجد رصيد"
                 }
-                val displayName = if (uSettings.employeeName.isNotBlank()) uSettings.employeeName else userName
                 result.add(
                     WorkerBalanceItem(
-                        workerName = displayName,
+                        workerName = userName,
                         currency = curr,
                         monthlySalary = uSettings.monthlySalary,
                         startWorkDate = uSettings.startWorkDate,
@@ -427,10 +501,152 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         result
     }
 
+    private fun calculateWorkerBalanceAtCutoff(
+        settings: SalarySettings,
+        txList: List<Transaction>,
+        salaryHistories: List<SalaryHistory>,
+        leaves: List<LeaveRecord> = emptyList(),
+        cutoffDateMs: Long
+    ): Double {
+        val calCutoffMidnight = Calendar.getInstance().apply {
+            timeInMillis = cutoffDateMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val cutoffMidnightMs = calCutoffMidnight.timeInMillis
+        val cutoffEndOfDayMs = Calendar.getInstance().apply {
+            timeInMillis = cutoffDateMs
+            set(Calendar.HOUR_OF_DAY, 23)
+            set(Calendar.MINUTE, 59)
+            set(Calendar.SECOND, 59)
+            set(Calendar.MILLISECOND, 999)
+        }.timeInMillis
+
+        val openingTx = txList.firstOrNull { it.type == "OPENING_BALANCE" }
+        val initialOpeningAmount = openingTx?.amount ?: settings.openingBalance
+        val initialStartDateMs = openingTx?.timestamp ?: settings.startWorkDate
+
+        // Did any SETTLEMENT happen on or before cutoffEndOfDayMs?
+        val priorSettlement = txList.filter { it.type == "SETTLEMENT" && it.timestamp <= cutoffEndOfDayMs }
+            .maxByOrNull { it.timestamp }
+
+        val (baseOpening, baseStartMs) = if (priorSettlement != null) {
+            val nextDayMs = Calendar.getInstance().apply {
+                timeInMillis = priorSettlement.timestamp
+                add(Calendar.DAY_OF_YEAR, 1)
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+            Pair(priorSettlement.amount, nextDayMs)
+        } else {
+            val firstTxMs = txList.minOfOrNull { it.timestamp } ?: settings.startWorkDate
+            val workStartMs = minOf(settings.startWorkDate, firstTxMs, initialStartDateMs)
+            val startCal = Calendar.getInstance().apply {
+                timeInMillis = workStartMs
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+            Pair(initialOpeningAmount, startCal)
+        }
+
+        if (baseStartMs > cutoffEndOfDayMs) {
+            return baseOpening
+        }
+
+        val effectiveWorkStop = settings.stopWorkDate?.let { stopMs ->
+            Calendar.getInstance().apply {
+                timeInMillis = stopMs
+                set(Calendar.HOUR_OF_DAY, 23)
+                set(Calendar.MINUTE, 59)
+                set(Calendar.SECOND, 59)
+                set(Calendar.MILLISECOND, 999)
+            }.timeInMillis
+        }
+
+        val calcCal = Calendar.getInstance().apply {
+            timeInMillis = baseStartMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+
+        val activeTxs = txList.filter {
+            it.timestamp >= baseStartMs && it.timestamp <= cutoffEndOfDayMs &&
+            it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE"
+        }
+
+        var totalEarned = 0.0
+        var absenceDeduction = 0.0
+
+        while (calcCal.timeInMillis <= cutoffMidnightMs) {
+            val dayMs = calcCal.timeInMillis
+            val inLeave = LeaveUtils.isDayInLeave(dayMs, leaves)
+
+            if (!inLeave && (effectiveWorkStop == null || dayMs <= effectiveWorkStop)) {
+                val activeHist = salaryHistories.filter { hist ->
+                    val hMidnight = Calendar.getInstance().apply {
+                        timeInMillis = hist.effectiveStartDate
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                    hMidnight <= dayMs
+                }.maxByOrNull { it.effectiveStartDate }
+
+                val dayDailyRate = activeHist?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
+                totalEarned += dayDailyRate
+
+                val dayAbsTxs = activeTxs.filter { tx ->
+                    val txCal = Calendar.getInstance().apply {
+                        timeInMillis = tx.timestamp
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    txCal.timeInMillis == dayMs && tx.type == "ABSENCE"
+                }
+                for (tx in dayAbsTxs) {
+                    val absHours = if (tx.amount <= 0.0) 12.0 else tx.amount
+                    absenceDeduction += absHours * (dayDailyRate / 12.0)
+                }
+            }
+            calcCal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+
+        if (priorSettlement == null && settings.priorAbsenceCount > 0) {
+            val currentDailyRate = if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0
+            absenceDeduction += settings.priorAbsenceCount * 12.0 * (currentDailyRate / 12.0)
+        }
+
+        val priorSpendings = if (priorSettlement == null) settings.priorSpendingsAmount else 0.0
+        val priorDraws = if (priorSettlement == null) settings.priorDrawsAmount else 0.0
+
+        val totalSpendings = activeTxs.filter { it.type == "SPENDING" }.sumOf { it.amount } + priorSpendings
+        val totalDraws = activeTxs.filter { it.type == "DRAW" }.sumOf { it.amount } + priorDraws
+        val totalDeposits = activeTxs.filter { it.type == "DEPOSIT" }.sumOf { it.amount }
+
+        val earnedSalary = maxOf(0.0, totalEarned - absenceDeduction)
+        return if (settings.isSpendingDeductedFromSalary) {
+            baseOpening + earnedSalary + totalDeposits - totalSpendings - totalDraws
+        } else {
+            baseOpening + earnedSalary + totalDeposits - totalDraws
+        }
+    }
+
     private fun calculateSalaryMetrics(
         settings: SalarySettings,
         txList: List<Transaction>,
-        salaryHistories: List<SalaryHistory> = emptyList()
+        salaryHistories: List<SalaryHistory> = emptyList(),
+        leaves: List<LeaveRecord> = emptyList()
     ): SalaryMetrics {
         val calendarNow = Calendar.getInstance()
         
@@ -460,14 +676,19 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val diffInDays = (diffInMillis / (1000 * 60 * 60 * 24)).toInt()
         val elapsedDays = if (settings.stopWorkDate != null) maxOf(0, diffInDays + 1) else maxOf(0, diffInDays)
 
-        // Calculate gross earned day-by-day based on active SalaryHistory for each day
+        // Calculate gross earned day-by-day based on active SalaryHistory for each day, excluding leave days
         var grossEarned = 0.0
+        var totalLeaveDays = 0
         for (d in 0 until elapsedDays) {
             val dayMs = calStartMidnight.timeInMillis + (d * 86400000L)
-            val activeHist = salaryHistories.filter { it.effectiveStartDate <= dayMs }
-                .maxByOrNull { it.effectiveStartDate }
-            val dayRate = activeHist?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
-            grossEarned += dayRate
+            if (LeaveUtils.isDayInLeave(dayMs, leaves)) {
+                totalLeaveDays++
+            } else {
+                val activeHist = salaryHistories.filter { it.effectiveStartDate <= dayMs }
+                    .maxByOrNull { it.effectiveStartDate }
+                val dayRate = activeHist?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
+                grossEarned += dayRate
+            }
         }
 
         val activeTxList = txList.filter { it.timestamp >= activePeriodStart && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE" }
@@ -491,14 +712,15 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val absenceCount = totalAbsenceHours / 12.0
         val totalSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount } + settings.priorSpendingsAmount
         val totalDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount } + settings.priorDrawsAmount
-        val workedDays = maxOf(0.0, elapsedDays.toDouble() - absenceCount)
+        val totalDeposits = activeTxList.filter { it.type == "DEPOSIT" }.sumOf { it.amount }
+        val workedDays = maxOf(0.0, elapsedDays.toDouble() - totalLeaveDays.toDouble() - absenceCount)
         
         val earnedSalary = maxOf(0.0, grossEarned - absenceDeduction)
         
         val netBalance = if (settings.isSpendingDeductedFromSalary) {
-            earnedSalary + settings.openingBalance - totalSpendings - totalDraws
+            earnedSalary + settings.openingBalance + totalDeposits - totalSpendings - totalDraws
         } else {
-            earnedSalary + settings.openingBalance - totalDraws
+            earnedSalary + settings.openingBalance + totalDeposits - totalDraws
         }
 
         return SalaryMetrics(
@@ -509,6 +731,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             workedDays = workedDays,
             totalSpendings = totalSpendings,
             totalDraws = totalDraws,
+            totalDeposits = totalDeposits,
             earnedSalary = earnedSalary,
             netBalance = netBalance,
             openingBalance = settings.openingBalance
@@ -527,6 +750,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val txTime = newTx?.timestamp ?: oldTx?.timestamp ?: return currentSettings
         if (txTime < currentSettings.startWorkDate) {
             val oldEffect = when (oldTx?.type) {
+                "DEPOSIT" -> + (oldTx.amount)
                 "SPENDING", "DRAW" -> - (oldTx.amount)
                 "ABSENCE" -> {
                     val hrs = if (oldTx.amount <= 0.0) 12.0 else oldTx.amount
@@ -536,6 +760,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             val newEffect = when (newTx?.type) {
+                "DEPOSIT" -> + (newTx.amount)
                 "SPENDING", "DRAW" -> - (newTx.amount)
                 "ABSENCE" -> {
                     val hrs = if (newTx.amount <= 0.0) 12.0 else newTx.amount
@@ -592,6 +817,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             var absenceDeduction = 0.0
 
             val salaryHistories = repository.getAllSalaryHistoriesDirect()
+            val leaves = repository.getAllLeavesDirect()
 
             val activeTxList = txList.filter { 
                 it.timestamp >= calStartMidnight.timeInMillis && it.timestamp <= effectiveCutoffMs && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE"
@@ -610,6 +836,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             // Iterate day by day to calculate gross earned salary and absence deductions accurately using salaryHistories
             while (calcCal.timeInMillis <= cutoffMidnightMs) {
                 val dayMs = calcCal.timeInMillis
+                val inLeave = LeaveUtils.isDayInLeave(dayMs, leaves)
                 val activeHist = salaryHistories.filter { hist ->
                     val hMidnight = Calendar.getInstance().apply {
                         timeInMillis = hist.effectiveStartDate
@@ -622,7 +849,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 }.maxByOrNull { it.effectiveStartDate }
 
                 val dayRate = activeHist?.dailyRate ?: (if (currentSettings.monthlySalary > 0) currentSettings.monthlySalary / 30.0 else 5000.0)
-                totalEarnedSalary += dayRate
+                if (!inLeave) {
+                    totalEarnedSalary += dayRate
+                }
 
                 val dayAbsTxs = activeTxList.filter { tx ->
                     val txCal = Calendar.getInstance().apply {
@@ -650,12 +879,13 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
             val totalSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount } + currentSettings.priorSpendingsAmount
             val totalDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount } + currentSettings.priorDrawsAmount
+            val totalDeposits = activeTxList.filter { it.type == "DEPOSIT" }.sumOf { it.amount }
 
             val netEarnedAfterAbsence = maxOf(0.0, totalEarnedSalary - absenceDeduction)
             val netSettlementBalance = if (currentSettings.isSpendingDeductedFromSalary) {
-                currentSettings.openingBalance + netEarnedAfterAbsence - totalSpendings - totalDraws
+                currentSettings.openingBalance + netEarnedAfterAbsence + totalDeposits - totalSpendings - totalDraws
             } else {
-                currentSettings.openingBalance + netEarnedAfterAbsence - totalDraws
+                currentSettings.openingBalance + netEarnedAfterAbsence + totalDeposits - totalDraws
             }
 
             // 1. Record chronological SETTLEMENT transaction into database with effective cutoff timestamp
@@ -781,12 +1011,13 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
             val periodSpendings = activeTxList.filter { it.type == "SPENDING" }.sumOf { it.amount }
             val periodDraws = activeTxList.filter { it.type == "DRAW" }.sumOf { it.amount }
+            val periodDeposits = activeTxList.filter { it.type == "DEPOSIT" }.sumOf { it.amount }
 
             val netEarned = maxOf(0.0, periodEarned - periodAbsenceDeduction)
             val calculatedNetBalance = if (currentSettings.isSpendingDeductedFromSalary) {
-                prevOpening + netEarned - periodSpendings - periodDraws
+                prevOpening + netEarned + periodDeposits - periodSpendings - periodDraws
             } else {
-                prevOpening + netEarned - periodDraws
+                prevOpening + netEarned + periodDeposits - periodDraws
             }
 
             if (Math.abs(sTx.amount - calculatedNetBalance) > 0.01) {
@@ -836,6 +1067,73 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                 _userNotice.tryEmit("▶️ تم استئناف احتساب العمل والأجر اليومي بنجاح")
                 speakOutText("تم استئناف احتساب العمل بنجاح")
             }
+        }
+    }
+
+    // Leave / Vacation Management Operations
+    fun addLeavePeriod(startDate: Long, endDate: Long?, reason: String = "إجازة") {
+        viewModelScope.launch {
+            val startMidnight = Calendar.getInstance().apply {
+                timeInMillis = startDate
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+
+            val endMidnight = endDate?.let {
+                Calendar.getInstance().apply {
+                    timeInMillis = it
+                    set(Calendar.HOUR_OF_DAY, 23)
+                    set(Calendar.MINUTE, 59)
+                    set(Calendar.SECOND, 59)
+                    set(Calendar.MILLISECOND, 999)
+                }.timeInMillis
+            }
+
+            val leave = LeaveRecord(
+                startDate = startMidnight,
+                endDate = endMidnight,
+                reason = reason.ifBlank { "إجازة" }
+            )
+            repository.insertLeave(leave)
+            _userNotice.tryEmit("🏖️ تم حفظ فترة الإجازة بنجاح")
+            speakOutText("تم تسجيل الإجازة بنجاح")
+        }
+    }
+
+    fun endOngoingLeave(leaveId: Int, endDate: Long = System.currentTimeMillis()) {
+        viewModelScope.launch {
+            val leaves = repository.getAllLeavesDirect()
+            val target = leaves.find { it.id == leaveId }
+            if (target != null) {
+                val endMidnight = Calendar.getInstance().apply {
+                    timeInMillis = endDate
+                    set(Calendar.HOUR_OF_DAY, 23)
+                    set(Calendar.MINUTE, 59)
+                    set(Calendar.SECOND, 59)
+                    set(Calendar.MILLISECOND, 999)
+                }.timeInMillis
+
+                val updated = target.copy(endDate = endMidnight)
+                repository.updateLeave(updated)
+                _userNotice.tryEmit("▶️ تم إنهاء الإجازة واعتماد تاريخ العودة")
+                speakOutText("تم إنهاء الإجازة واستئناف احتساب العمل")
+            }
+        }
+    }
+
+    fun deleteLeavePeriod(leaveId: Int) {
+        viewModelScope.launch {
+            repository.deleteLeaveById(leaveId)
+            _userNotice.tryEmit("🗑️ تم حذف فترة الإجازة")
+        }
+    }
+
+    fun updateLeavePeriod(leave: LeaveRecord) {
+        viewModelScope.launch {
+            repository.updateLeave(leave)
+            _userNotice.tryEmit("✏️ تم تحديث فترة الإجازة")
         }
     }
 
@@ -937,13 +1235,13 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             // Ensure initial OPENING_BALANCE transaction is recorded if non-zero and no prior settlement/opening exists
             val existingTx = repository.getAllTransactionsDirect()
             val hasOpeningOrSettlement = existingTx.any { it.type == "OPENING_BALANCE" || it.type == "SETTLEMENT" }
-            if (!hasOpeningOrSettlement && finalOpeningBalance > 0.0) {
+            if (!hasOpeningOrSettlement && Math.abs(finalOpeningBalance) > 0.001) {
                 repository.insertTransaction(
                     Transaction(
                         type = "OPENING_BALANCE",
                         amount = finalOpeningBalance,
                         timestamp = finalStartDate,
-                        voiceText = "رصيد افتتاحي سابق / أولي"
+                        voiceText = if (finalOpeningBalance >= 0) "رصيد افتتاحي سابق (له)" else "رصيد افتتاحي سابق (عليه سلف)"
                     )
                 )
             }
@@ -993,6 +1291,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             val announceText = when (type) {
                 "SPENDING" -> "تم تسجيل صرفة بقيمة $amountInWords $cur"
                 "DRAW" -> "تم تسجيل سحبية بقيمة $amountInWords $cur"
+                "DEPOSIT" -> "تم تسجيل إيداع للحساب بقيمة $amountInWords $cur"
                 "ABSENCE" -> {
                     if (amount >= 12.0 || amount <= 0.0) {
                         "تم تسجيل غياب يوم كامل"
@@ -1083,11 +1382,16 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         val earnedStr = ArabicNumbersToWords.convert(m.earnedSalary.toInt())
         val spendingsStr = ArabicNumbersToWords.convert(m.totalSpendings.toInt())
         val drawsStr = ArabicNumbersToWords.convert(m.totalDraws.toInt())
-        val balanceStr = ArabicNumbersToWords.convert(m.netBalance.toInt())
         
-        val openingStr = if (s.openingBalance != 0.0) {
-            val opWords = ArabicNumbersToWords.convert(s.openingBalance.toInt())
-            "برصيد افتتاحي قدره $opWords $cur. "
+        val balanceSpeech = when {
+            m.netBalance > 0.001 -> "لديك في حسابك صافي متبقي لك في ذمة صاحب العمل قدره ${ArabicNumbersToWords.convert(m.netBalance.toInt())} $cur"
+            m.netBalance < -0.001 -> "عليك سلف ومسحوبات مستحقة السداد قدرها ${ArabicNumbersToWords.convert(Math.abs(m.netBalance.toInt()))} $cur"
+            else -> "حسابك مصفر ومتطابق تماماً بدون أي متبقي"
+        }
+        
+        val openingStr = if (Math.abs(s.openingBalance) > 0.001) {
+            val opWords = ArabicNumbersToWords.convert(Math.abs(s.openingBalance.toInt()))
+            if (s.openingBalance > 0) "برصيد افتتاحي سابق لك قدره $opWords $cur. " else "برصيد افتتاحي سابق عليك كمسحوبات قدره $opWords $cur. "
         } else {
             ""
         }
@@ -1098,7 +1402,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             String.format(Locale.US, "%.1f", m.absenceCount) + " أيام"
         }
         
-        val text = "لديك في حسابك المتبقي $balanceStr $cur. ${openingStr}وراتبك المستحق حتى اليوم هو $earnedStr $cur. وإجمالي مصروفاتك هو $spendingsStr $cur. وإجمالي سحبياتك وسلفياتك هي $drawsStr $cur. وغبت $absenceCountText."
+        val text = "$balanceSpeech. ${openingStr}وراتبك المستحق حتى اليوم هو $earnedStr $cur. وإجمالي مصروفاتك هو $spendingsStr $cur. وإجمالي سحبياتك وسلفياتك هي $drawsStr $cur. وغبت $absenceCountText."
         speakOutText(text)
     }
 
@@ -1221,7 +1525,11 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             💸 متوسط السحبيات لليوم الواحد: ${avgDrawsPerDay.toInt()} $cur
             
             ========================
-            💵 *المبلغ المتبقي الصافي له: ${m.netBalance.toInt()} $cur*
+            ${when {
+                m.netBalance > 0.001 -> "💵 *المبلغ المتبقي الصافي له: ${m.netBalance.toInt()} $cur*"
+                m.netBalance < -0.001 -> "⚠️ *المبلغ المطلوب سداده عليه (سلف ومسحوبات فائضة): ${Math.abs(m.netBalance.toInt())} $cur*"
+                else -> "⚖️ *الحساب مصفر ومتطابق تماماً (0 $cur)*"
+            }}
             ========================
             
             تم التصدير بواسطة تطبيق حساب العامل الذكي 📱
@@ -1235,6 +1543,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             autoAddMutex.withLock {
                 try {
                     val txList = repository.getAllTransactionsDirect()
+                    val leaves = repository.getAllLeavesDirect()
                     val currentUser = activeUser.value
                     val deletedDatesSet = getDeletedSpendingDates(currentUser)
                     val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
@@ -1271,7 +1580,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     while (!calStart.after(calToday) && daysAdded < daysLimit) {
                         val dayMidnight = calStart.timeInMillis
                         val dateStr = dateFormat.format(calStart.time)
-                        if (!existingSpendingDays.contains(dayMidnight) && !deletedDatesSet.contains(dateStr)) {
+                        val inLeave = LeaveUtils.isDayInLeave(dayMidnight, leaves)
+                        if (!inLeave && !existingSpendingDays.contains(dayMidnight) && !deletedDatesSet.contains(dateStr)) {
                             listToInsert.add(
                                 Transaction(
                                     type = "SPENDING",
@@ -1453,11 +1763,9 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         val root = JSONObject().apply {
-            put("version", 2)
+            put("version", 1)
             put("appName", "SmartWorkerAccount")
             put("exportDate", System.currentTimeMillis())
-            // Store the owner explicitly so restore is independent of the selected UI account.
-            put("accountName", s.employeeName.ifBlank { activeUser.value.orEmpty() })
             put("settings", settingsObj)
             put("transactions", txArray)
         }
@@ -1468,28 +1776,30 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     suspend fun restoreBackupJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val root = JSONObject(jsonString)
-            val sObj = root.optJSONObject("settings")
-                ?: throw IllegalArgumentException("Backup is missing settings")
-                // v2 stores accountName at the root. Older backups fall back to employeeName.
-                // Never use the active account when the backup identifies its owner.
-                val backupOwner = root.optString("accountName", "").trim()
-                    .ifBlank { sObj.optString("employeeName", "").trim() }
-                val activeName = activeUser.value?.trim().orEmpty()
-                val targetName = backupOwner.ifBlank { activeName }
-                val targetRepository = getRepoForUser(targetName.ifBlank { null })
-                val switchedAccount = targetName.isNotBlank() && targetName != activeName
-                if (switchedAccount) {
-                    val users = sharedPrefs.getStringSet("registered_users", emptySet())
-                        ?.toMutableSet() ?: mutableSetOf()
-                    users.add(targetName)
-                    sharedPrefs.edit()
-                        .putStringSet("registered_users", users)
-                        .putString("active_user", targetName)
-                        .apply()
-                    registeredUsers.value = users.toList().sorted()
-                    activeUser.value = targetName
-                    currentRepoFlow.value = targetRepository
+            var targetName = activeUser.value ?: ""
+
+            if (root.has("settings")) {
+                val sObj = root.getJSONObject("settings")
+                val backupName = sObj.optString("employeeName", "").trim()
+                if (backupName.isNotBlank()) {
+                    targetName = backupName
+                } else if (targetName.isBlank()) {
+                    targetName = "حساب_افتراضي"
                 }
+
+                val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
+                usersSet.add(targetName)
+                sharedPrefs.edit()
+                    .putStringSet("registered_users", usersSet)
+                    .putString("active_user", targetName)
+                    .apply()
+
+                registeredUsers.value = usersSet.toList().sorted()
+                activeUser.value = targetName
+
+                val targetRepo = getRepoForUser(targetName)
+                currentRepoFlow.value = targetRepo
+
                 val restoredSettings = SalarySettings(
                     id = 1,
                     monthlySalary = sObj.optDouble("monthlySalary", 150000.0),
@@ -1514,32 +1824,29 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     themeMode = sObj.optString("themeMode", "DARK"),
                     appLanguage = sObj.optString("appLanguage", "ar")
                 )
-            targetRepository.insertOrUpdateSalarySettings(restoredSettings)
+                targetRepo.insertOrUpdateSalarySettings(restoredSettings)
 
-            if (root.has("transactions")) {
-                val txArray = root.getJSONArray("transactions")
-                targetRepository.deleteAllTransactions()
-                for (i in 0 until txArray.length()) {
-                    val obj = txArray.getJSONObject(i)
-                    val vNote = obj.optString("voiceNotePath", obj.optString("audioNotePath", ""))
-                    val vText = obj.optString("voiceText", obj.optString("note", ""))
-                    val tx = Transaction(
-                        id = obj.optInt("id", 0),
-                        type = obj.optString("type", "SPENDING"),
-                        amount = obj.optDouble("amount", 0.0),
-                        timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
-                        voiceNotePath = if (vNote.isBlank()) null else vNote,
-                        voiceText = if (vText.isBlank()) null else vText
-                    )
-                    targetRepository.insertTransaction(tx)
+                if (root.has("transactions")) {
+                    val txArray = root.getJSONArray("transactions")
+                    targetRepo.deleteAllTransactions()
+                    for (i in 0 until txArray.length()) {
+                        val obj = txArray.getJSONObject(i)
+                        val vNote = obj.optString("voiceNotePath", obj.optString("audioNotePath", ""))
+                        val vText = obj.optString("voiceText", obj.optString("note", ""))
+                        val tx = Transaction(
+                            id = 0,
+                            type = obj.optString("type", "SPENDING"),
+                            amount = obj.optDouble("amount", 0.0),
+                            timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
+                            voiceNotePath = if (vNote.isBlank()) null else vNote,
+                            voiceText = if (vText.isBlank()) null else vText
+                        )
+                        targetRepo.insertTransaction(tx)
+                    }
                 }
             }
-            val notice = if (switchedAccount) {
-                "✅ تمت الاستعادة داخل حساب «$targetName» وتم الانتقال إليه حفاظاً على عزل البيانات."
-            } else {
-                "✅ تم استعادة النسخة الاحتياطية بنجاح داخل الحساب الصحيح."
-            }
-            _userNotice.tryEmit(notice)
+
+            _userNotice.tryEmit("✅ تم استعادة النسخة الاحتياطية بنجاح لـ ($targetName)!")
             true
         } catch (e: Exception) {
             Log.e("SalaryViewModel", "Error restoring backup JSON", e)

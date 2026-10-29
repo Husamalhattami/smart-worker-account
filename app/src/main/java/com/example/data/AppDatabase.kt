@@ -8,12 +8,13 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [SalarySettings::class, Transaction::class, CurrencyItem::class, SalaryHistory::class], version = 12, exportSchema = false)
+@Database(entities = [SalarySettings::class, Transaction::class, CurrencyItem::class, SalaryHistory::class, LeaveRecord::class], version = 13, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun salaryDao(): SalaryDao
     abstract fun transactionDao(): TransactionDao
     abstract fun currencyDao(): CurrencyDao
     abstract fun salaryHistoryDao(): SalaryHistoryDao
+    abstract fun leaveDao(): LeaveDao
 
     companion object {
         @Volatile
@@ -24,6 +25,15 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL(sql)
             } catch (e: Exception) {
                 Log.w("AppDatabase", "SQL execution skipped or column already exists: $sql", e)
+            }
+        }
+
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                safeExecSQL(
+                    db,
+                    "CREATE TABLE IF NOT EXISTS `leave_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `startDate` INTEGER NOT NULL, `endDate` INTEGER, `reason` TEXT NOT NULL DEFAULT 'إجازة', `createdAt` INTEGER NOT NULL)"
+                )
             }
         }
 
@@ -112,7 +122,7 @@ abstract class AppDatabase : RoomDatabase() {
                 try {
                     val targetDb = context.getDatabasePath(key)
                     if (!targetDb.exists()) {
-                        val prefs = context.getSharedPreferences("salary_prefs", Context.MODE_PRIVATE)
+                        val prefs = context.getSharedPreferences("salary_app_prefs", Context.MODE_PRIVATE)
                         val legacyOwner = prefs.getString("legacy_db_owner", null)
                         val registeredUsers = prefs.getStringSet("registered_users", emptySet()) ?: emptySet()
                         val isFirstUser = legacyOwner == null && registeredUsers.size <= 1
@@ -126,6 +136,8 @@ abstract class AppDatabase : RoomDatabase() {
                                 if (defaultShm.exists()) defaultShm.copyTo(java.io.File(targetDb.path + "-shm"), overwrite = false)
                                 prefs.edit().putString("legacy_db_owner", userName.trim()).apply()
                                 Log.d("AppDatabase", "Migrated default salary_friend_database to $key for legacy owner $userName")
+                            } else {
+                                prefs.edit().putString("legacy_db_owner", userName.trim()).apply()
                             }
                         }
                     }
@@ -140,7 +152,7 @@ abstract class AppDatabase : RoomDatabase() {
                         AppDatabase::class.java,
                         key
                     )
-                    .addMigrations(MIGRATION_1_8, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
+                    .addMigrations(MIGRATION_1_8, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)
                     .fallbackToDestructiveMigration()
                     .fallbackToDestructiveMigrationOnDowngrade()
                     .build()

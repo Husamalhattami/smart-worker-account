@@ -33,7 +33,7 @@ data class SalarySettings(
 @Entity(tableName = "transactions")
 data class Transaction(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
-    val type: String, // "SPENDING" (صرفة), "DRAW" (سحبية), "ABSENCE" (غياب)
+    val type: String, // "SPENDING" (صرفة), "DRAW" (سحبية), "ABSENCE" (غياب), "DEPOSIT" (إيداع/دفعة للحساب)
     val amount: Double,
     val timestamp: Long = System.currentTimeMillis(),
     val voiceNotePath: String? = null,
@@ -56,4 +56,13 @@ data class SalaryHistory(
     val dailyRate: Double = monthlySalary / 30.0,
     val effectiveStartDate: Long,
     val note: String = ""
+)
+
+@Entity(tableName = "leave_records")
+data class LeaveRecord(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val startDate: Long,
+    val endDate: Long? = null, // null means ongoing/open leave (عدها لم تنتهي)
+    val reason: String = "إجازة",
+    val createdAt: Long = System.currentTimeMillis()
 )

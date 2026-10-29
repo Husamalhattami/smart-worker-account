@@ -113,7 +113,7 @@ object GeminiClient {
         val systemPrompt = """
             You are a transaction parsing engine for an Arabic salary tracking app.
             Your job is to read an Arabic voice transcription and return a JSON object with:
-            - "type": "SPENDING" (صرفة/مصروف يومي), "DRAW" (سحبية/سلفة من الراتب), or "ABSENCE" (غياب/لم يشتغل/غائب)
+            - "type": "SPENDING" (صرفة/مصروف يومي), "DRAW" (سحبية/سلفة من الراتب), "ABSENCE" (غياب/لم يشتغل/غائب), or "DEPOSIT" (إيداع/دفعة للحساب/سلمت العم/أعطيت العم فلوس للحساب)
             - "amount": The numeric amount parsed (default to 0.0 if not mentioned, e.g. for ABSENCE).
             - "note": The extracted reason, description, or purpose explaining why money was taken/spent or why absent.
 
@@ -121,6 +121,8 @@ object GeminiClient {
             "صرفت خمسين ريال لشراء علاج" -> {"type": "SPENDING", "amount": 50.0, "note": "شراء علاج"}
             "أخذت مبلغ 500 ريال وسلفت واحد" -> {"type": "DRAW", "amount": 500.0, "note": "سلفة لواحد"}
             "سحبت مية حق الغداء" -> {"type": "DRAW", "amount": 100.0, "note": "حق الغداء"}
+            "سلمت العم خمسة آلاف على الحساب" -> {"type": "DEPOSIT", "amount": 5000.0, "note": "دفعة للعم على الحساب"}
+            "إيداع للحساب عشرة آلاف" -> {"type": "DEPOSIT", "amount": 10000.0, "note": "إيداع للحساب"}
             "اليوم غايب بسبب المرض" -> {"type": "ABSENCE", "amount": 0.0, "note": "بسبب المرض"}
             "سجل غياب" -> {"type": "ABSENCE", "amount": 0.0, "note": null}
         """.trimIndent()
@@ -128,7 +130,7 @@ object GeminiClient {
         val schema = ResponseSchema(
             type = "OBJECT",
             properties = mapOf(
-                "type" to PropertySchema(type = "STRING", enum = listOf("SPENDING", "DRAW", "ABSENCE")),
+                "type" to PropertySchema(type = "STRING", enum = listOf("SPENDING", "DRAW", "ABSENCE", "DEPOSIT")),
                 "amount" to PropertySchema(type = "NUMBER"),
                 "note" to PropertySchema(type = "STRING", description = "Reason or note for transaction")
             ),
@@ -166,6 +168,7 @@ object LocalArabicParser {
         // Check transaction type
         val type = when {
             normalizedText.contains("غياب") || normalizedText.contains("غبت") || normalizedText.contains("غايب") || normalizedText.contains("غائب") || normalizedText.contains("ما اشتغلت") -> "ABSENCE"
+            normalizedText.contains("ايداع") || normalizedText.contains("إيداع") || normalizedText.contains("دفعه") || normalizedText.contains("دفعة") || normalizedText.contains("سلمت") || normalizedText.contains("اعطيت") || normalizedText.contains("أعطيت") || normalizedText.contains("فوق الحساب") || normalizedText.contains("على الحساب") -> "DEPOSIT"
             normalizedText.contains("سحب") || normalizedText.contains("سلفة") || normalizedText.contains("سلفه") || normalizedText.contains("سحبية") || normalizedText.contains("سحبيه") || normalizedText.contains("اخذت") || normalizedText.contains("دين") -> "DRAW"
             else -> "SPENDING" // Default is spending
         }

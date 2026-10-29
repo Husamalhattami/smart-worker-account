@@ -8,7 +8,8 @@ class SalaryRepository(
     private val salaryDao: SalaryDao,
     private val transactionDao: TransactionDao,
     private val currencyDao: CurrencyDao,
-    private val salaryHistoryDao: SalaryHistoryDao
+    private val salaryHistoryDao: SalaryHistoryDao,
+    private val leaveDao: LeaveDao
 ) {
     val salarySettings: Flow<SalarySettings?> = salaryDao.getSalarySettings()
         .catch { e ->
@@ -33,6 +34,37 @@ class SalaryRepository(
             Log.e("SalaryRepository", "Error reading salary histories", e)
             emit(emptyList())
         }
+
+    val allLeaves: Flow<List<LeaveRecord>> = leaveDao.getAllLeaves()
+        .catch { e ->
+            Log.e("SalaryRepository", "Error reading leaves", e)
+            emit(emptyList())
+        }
+
+    suspend fun getAllLeavesDirect(): List<LeaveRecord> {
+        return try {
+            leaveDao.getAllLeavesDirect()
+        } catch (e: Exception) {
+            Log.e("SalaryRepository", "Error getting leaves direct", e)
+            emptyList()
+        }
+    }
+
+    suspend fun insertLeave(leave: LeaveRecord) {
+        leaveDao.insertLeave(leave)
+    }
+
+    suspend fun updateLeave(leave: LeaveRecord) {
+        leaveDao.updateLeave(leave)
+    }
+
+    suspend fun deleteLeaveById(id: Int) {
+        leaveDao.deleteLeaveById(id)
+    }
+
+    suspend fun deleteAllLeaves() {
+        leaveDao.deleteAllLeaves()
+    }
 
     suspend fun getAllSalaryHistoriesDirect(): List<SalaryHistory> {
         val list = salaryHistoryDao.getAllSalaryHistoriesDirect()

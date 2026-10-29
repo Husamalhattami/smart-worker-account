@@ -9,6 +9,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import android.util.Log
+import com.example.data.LeaveRecord
 import com.example.data.SalaryHistory
 import com.example.data.SalarySettings
 import com.example.data.Transaction
@@ -25,6 +26,16 @@ object PdfPrintHelper {
                c1.get(Calendar.DAY_OF_YEAR) == c2.get(Calendar.DAY_OF_YEAR)
     }
 
+    private fun formatBalanceHtml(balance: Double, currency: String, balanceDisplayMode: String): String {
+        if (balanceDisplayMode == "END_OF_REPORT") return "-"
+        val bInt = balance.toInt()
+        return when {
+            balance > 0.001 -> """<span style="color: #047857; font-weight: bold; white-space: nowrap;">له: ${String.format(Locale("ar"), "%,d", bInt)} $currency</span>"""
+            balance < -0.001 -> """<span style="color: #b91c1c; font-weight: bold; white-space: nowrap;">عليه: ${String.format(Locale("ar"), "%,d", Math.abs(bInt))} $currency</span>"""
+            else -> """<span style="color: #64748b; font-weight: bold; white-space: nowrap;">0 $currency</span>"""
+        }
+    }
+
     fun printSalaryReport(
         context: Context,
         settings: SalarySettings,
@@ -36,6 +47,7 @@ object PdfPrintHelper {
         balanceDisplayMode: String = "AFTER_EACH_TX", // "AFTER_EACH_TX", "END_OF_MONTH", "END_OF_REPORT"
         transactionTypeFilter: String = "ALL", // "ALL", "SPENDING", "DRAW", "ABSENCE", "SETTLEMENT"
         salaryHistories: List<SalaryHistory> = emptyList(),
+        leaves: List<LeaveRecord> = emptyList(),
         onSuccess: (() -> Unit)? = null
     ) {
         val sdf = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("ar"))
@@ -48,11 +60,9 @@ object PdfPrintHelper {
 
         // Determine effective report start and end timestamps
         val nowMs = System.currentTimeMillis()
-        val effectiveStartMs = startDateFilter ?: settings.startWorkDate
-        val effectiveEndMs = if (endDateFilter != null) Math.min(endDateFilter + 86400000L - 1L, nowMs) else nowMs
 
         val startCal = Calendar.getInstance().apply {
-            timeInMillis = effectiveStartMs
+            timeInMillis = startDateFilter ?: settings.startWorkDate
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
@@ -60,23 +70,40 @@ object PdfPrintHelper {
         }
 
         val endCal = Calendar.getInstance().apply {
-            timeInMillis = effectiveEndMs
+            if (endDateFilter != null) {
+                timeInMillis = endDateFilter
+                set(Calendar.HOUR_OF_DAY, 23)
+                set(Calendar.MINUTE, 59)
+                set(Calendar.SECOND, 59)
+                set(Calendar.MILLISECOND, 999)
+            } else {
+                timeInMillis = nowMs
+            }
+        }
+
+        val effectiveStartMs = startCal.timeInMillis
+        val effectiveEndMs = endCal.timeInMillis
+
+        // The midnight timestamp of the last day to iterate through in loops
+        val lastDayMidnightMs = Calendar.getInstance().apply {
+            timeInMillis = endCal.timeInMillis
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
-        }
+        }.timeInMillis
 
         val dailyWage = if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0
 
         // Filter transactions based on date range & type filter
         val rawFilteredTransactions = transactions.filter { tx ->
             val matchStart = tx.timestamp >= startCal.timeInMillis
-            val matchEnd = tx.timestamp <= (endCal.timeInMillis + 86400000L - 1L)
+            val matchEnd = tx.timestamp <= endCal.timeInMillis
             val matchType = when (transactionTypeFilter) {
                 "SPENDING" -> tx.type == "SPENDING"
                 "DRAW" -> tx.type == "DRAW"
                 "ABSENCE" -> tx.type == "ABSENCE"
+                "DEPOSIT" -> tx.type == "DEPOSIT"
                 "SETTLEMENT" -> tx.type == "OPENING_BALANCE" || tx.type == "SETTLEMENT"
                 else -> true
             }
@@ -90,6 +117,7 @@ object PdfPrintHelper {
             "SPENDING" -> "كشف الصرفيات والمصروفات اليومية"
             "DRAW" -> "كشف السحبيات والسلف المالية"
             "ABSENCE" -> "كشف سجل الغيابات وخصم الساعات"
+            "DEPOSIT" -> "كشف الإيداعات والدفعات للحساب"
             "SETTLEMENT" -> "كشف التصفيات الأسبوعية والأرصدة"
             else -> "كشف حساب مالي شامل"
         }
@@ -116,11 +144,21 @@ object PdfPrintHelper {
             val priorSettlement = transactions.filter { it.type == "SETTLEMENT" && it.timestamp < startCal.timeInMillis }
                 .maxByOrNull { it.timestamp }
             val baseOpening = priorSettlement?.amount ?: initialOpeningAmount
-            val baseMs = priorSettlement?.let { it.timestamp + 1000L } ?: initialStartDateMs
+            val baseMs = priorSettlement?.let {
+                Calendar.getInstance().apply {
+                    timeInMillis = it.timestamp
+                    add(Calendar.DAY_OF_YEAR, 1)
+                    set(Calendar.HOUR_OF_DAY, 0)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }.timeInMillis
+            } ?: initialStartDateMs
 
             val priorTxs = transactions.filter { it.timestamp >= baseMs && it.timestamp < startCal.timeInMillis && it.type != "SETTLEMENT" && it.type != "OPENING_BALANCE" }
-            val priorSpendings = priorTxs.filter { it.type == "SPENDING" }.sumOf { it.amount }
-            val priorDraws = priorTxs.filter { it.type == "DRAW" }.sumOf { it.amount }
+            val priorSpendings = priorTxs.filter { it.type == "SPENDING" }.sumOf { it.amount } + (if (priorSettlement == null) settings.priorSpendingsAmount else 0.0)
+            val priorDraws = priorTxs.filter { it.type == "DRAW" }.sumOf { it.amount } + (if (priorSettlement == null) settings.priorDrawsAmount else 0.0)
+            val priorDeposits = priorTxs.filter { it.type == "DEPOSIT" }.sumOf { it.amount }
             val priorAbsenceTx = priorTxs.filter { it.type == "ABSENCE" }
             
             var priorEarnedSalary = 0.0
@@ -167,7 +205,15 @@ object PdfPrintHelper {
                 priorCal.add(Calendar.DAY_OF_YEAR, 1)
             }
 
-            val computedOpening = baseOpening + priorEarnedSalary - priorSpendings - priorDraws - priorAbsenceDeduction
+            if (priorSettlement == null && settings.priorAbsenceCount > 0) {
+                priorAbsenceDeduction += settings.priorAbsenceCount * 12.0 * (dailyWage / 12.0)
+            }
+
+            val computedOpening = if (settings.isSpendingDeductedFromSalary) {
+                baseOpening + priorEarnedSalary + priorDeposits - priorSpendings - priorDraws - priorAbsenceDeduction
+            } else {
+                baseOpening + priorEarnedSalary + priorDeposits - priorDraws - priorAbsenceDeduction
+            }
             Pair(computedOpening, startSdf.format(Date(startCal.timeInMillis)))
         }
 
@@ -204,6 +250,7 @@ object PdfPrintHelper {
         var totalEarnedSalaryInPeriod = 0.0
         var periodSpendings = 0.0
         var periodDraws = 0.0
+        var periodDeposits = 0.0
         var absenceHoursTotal = 0.0
         var absenceDeduction = 0.0
 
@@ -214,13 +261,7 @@ object PdfPrintHelper {
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }
-        val preCalcEndMs = Calendar.getInstance().apply {
-            timeInMillis = effectiveEndMs
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
+        val preCalcEndMs = lastDayMidnightMs
 
         while (preCalcCal.timeInMillis <= preCalcEndMs) {
             val dayMidnight = preCalcCal.timeInMillis
@@ -238,7 +279,8 @@ object PdfPrintHelper {
 
             val dayDailyWage = activeHist?.dailyRate ?: (if (settings.monthlySalary > 0) settings.monthlySalary / 30.0 else 5000.0)
 
-            val isWorkDay = dayMidnight >= effectiveWorkStart &&
+            val inLeave = LeaveUtils.isDayInLeave(dayMidnight, leaves)
+            val isWorkDay = !inLeave && dayMidnight >= effectiveWorkStart &&
                     (effectiveWorkStop == null || dayMidnight <= effectiveWorkStop) &&
                     (dayMidnight < todayMidnight || settings.stopWorkDate != null)
             if (isWorkDay) {
@@ -261,6 +303,7 @@ object PdfPrintHelper {
                 when (tx.type) {
                     "SPENDING" -> periodSpendings += tx.amount
                     "DRAW" -> periodDraws += tx.amount
+                    "DEPOSIT" -> periodDeposits += tx.amount
                     "ABSENCE" -> {
                         val absHours = if (tx.amount <= 0.0) 12.0 else tx.amount
                         absenceHoursTotal += absHours
@@ -275,8 +318,15 @@ object PdfPrintHelper {
 
         val absenceDaysCount = absenceHoursTotal / 12.0
         val hasOpeningOrSettlementTx = filteredTransactions.any { it.type == "OPENING_BALANCE" || it.type == "SETTLEMENT" }
-        val totalPeriodEntitlements = totalEarnedSalaryInPeriod + if (reportOpeningBalance != 0.0 && startDateFilter != null && !hasOpeningOrSettlementTx) reportOpeningBalance else if (reportOpeningBalance != 0.0 && startDateFilter == null) reportOpeningBalance else 0.0
-        val finalNetBalance = reportOpeningBalance + totalEarnedSalaryInPeriod - periodSpendings - periodDraws - absenceDeduction
+        val openingCreditToAdd = if (reportOpeningBalance > 0.0 && !hasOpeningOrSettlementTx) reportOpeningBalance else 0.0
+        val openingDebtToAdd = if (reportOpeningBalance < -0.001 && !hasOpeningOrSettlementTx) Math.abs(reportOpeningBalance) else 0.0
+        val totalPeriodEntitlements = totalEarnedSalaryInPeriod + openingCreditToAdd
+        val totalPeriodDrawsWithOpening = periodDraws + openingDebtToAdd
+        val finalNetBalance = if (settings.isSpendingDeductedFromSalary) {
+            reportOpeningBalance + totalEarnedSalaryInPeriod + periodDeposits - periodSpendings - periodDraws - absenceDeduction
+        } else {
+            reportOpeningBalance + totalEarnedSalaryInPeriod + periodDeposits - periodDraws - absenceDeduction
+        }
 
         val empName = if (settings.employeeName.isBlank()) "حسام الحطامي" else settings.employeeName
 
@@ -482,7 +532,7 @@ object PdfPrintHelper {
                             </div>
                             <div class="meta-item">
                                 <span class="meta-label">الرصيد الافتتاحي</span>
-                                <span class="meta-value" style="color: #1e40af;">${reportOpeningBalance.toInt()} $currency</span>
+                                <span class="meta-value">${formatBalanceHtml(reportOpeningBalance, currency, "AFTER_EACH_TX")}</span>
                             </div>
                         </div>
                     </div>
@@ -490,31 +540,67 @@ object PdfPrintHelper {
 
             // Header Accounting Calculation Summary Box
             if (showTotalSummary) {
+                val hasPriorBalance = Math.abs(reportOpeningBalance) > 0.001
+                val priorBalanceGridItem = if (hasPriorBalance) {
+                    if (reportOpeningBalance > 0) {
+                        """
+                        <div class="step-item" style="border-color: #a7f3d0; background-color: #f0fdf4; flex: 1; min-width: 75px;">
+                            <span style="color: #047857; display: block; font-size: 8.5px; font-weight: bold;">رصيد سابق له (+)</span>
+                            <span style="font-weight: bold; color: #047857;">+${String.format(Locale("ar"), "%,d", reportOpeningBalance.toInt())} $currency</span>
+                        </div>
+                        """.trimIndent()
+                    } else {
+                        """
+                        <div class="step-item" style="border-color: #fecaca; background-color: #fef2f2; flex: 1; min-width: 75px;">
+                            <span style="color: #b91c1c; display: block; font-size: 8.5px; font-weight: bold;">سلف وسحب سابق عليه (-)</span>
+                            <span style="font-weight: bold; color: #b91c1c;">-${String.format(Locale("ar"), "%,d", Math.abs(reportOpeningBalance.toInt()))} $currency</span>
+                        </div>
+                        """.trimIndent()
+                    }
+                } else ""
+
+                val finalRowBg = when {
+                    finalNetBalance > 0.001 -> "#059669"
+                    finalNetBalance < -0.001 -> "#dc2626"
+                    else -> "#475569"
+                }
+                val finalRowTitle = when {
+                    finalNetBalance > 0.001 -> "💰 إجمالي الصافي المتبقي المستحق (له في ذمة صاحب العمل):"
+                    finalNetBalance < -0.001 -> "⚠️ إجمالي الصافي المطلوب والمتبقي (عليه سلف ومسحوبات فائضة):"
+                    else -> "⚖️ إجمالي الصافي النهائي (الحساب مصفر ومتطابق تماماً):"
+                }
+                val finalRowAmount = when {
+                    finalNetBalance > 0.001 -> "له: ${String.format(Locale("ar"), "%,d", finalNetBalance.toInt())} $currency"
+                    finalNetBalance < -0.001 -> "عليه: ${String.format(Locale("ar"), "%,d", Math.abs(finalNetBalance.toInt()))} $currency"
+                    else -> "0 $currency"
+                }
+
                 append("""
-                    <div class="summary-box">
-                        <div class="summary-title">📊 الخلاصة المالية والتصفية للفترة الحالية ($workedDaysInPeriod يوم عمل):</div>
-                        <div class="summary-grid">
-                            <div class="step-item">
+                    <div class="summary-box" style="border-color: ${if (finalNetBalance >= 0) "#059669" else "#dc2626"}; background-color: ${if (finalNetBalance >= 0) "#ecfdf5" else "#fef2f2"};">
+                        <div class="summary-title" style="color: ${if (finalNetBalance >= 0) "#047857" else "#b91c1c"}; border-bottom-color: ${if (finalNetBalance >= 0) "#a7f3d0" else "#fecaca"};">📊 الخلاصة المالية والتصفية للفترة الحالية ($workedDaysInPeriod يوم عمل):</div>
+                        <div class="summary-grid" style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px;">
+                            $priorBalanceGridItem
+                            <div class="step-item" style="flex: 1; min-width: 75px;">
                                 <span style="color: #64748b; display: block; font-size: 8.5px;">إجمالي الصرفيات (-)</span>
                                 <span style="font-weight: bold; color: #1d4ed8;">-${periodSpendings.toInt()} $currency</span>
                             </div>
-                            <div class="step-item">
+                            <div class="step-item" style="flex: 1; min-width: 75px;">
                                 <span style="color: #64748b; display: block; font-size: 8.5px;">إجمالي السحبيات (-)</span>
                                 <span style="font-weight: bold; color: #b45309;">-${periodDraws.toInt()} $currency</span>
                             </div>
-                            <div class="step-item">
+                            <div class="step-item" style="flex: 1; min-width: 75px;">
                                 <span style="color: #64748b; display: block; font-size: 8.5px;">خصم الغياب (${absenceDaysCount} يوم) (-)</span>
                                 <span style="font-weight: bold; color: #b91c1c;">-${absenceDeduction.toInt()} $currency</span>
                             </div>
-                            <div class="step-item">
+                            <div class="step-item" style="flex: 1; min-width: 75px;">
                                 <span style="color: #64748b; display: block; font-size: 8.5px;">مستحق أجر العمل للفترة ($workedDaysInPeriod يوم) (+)</span>
                                 <span style="font-weight: bold; color: #047857;">+${totalEarnedSalaryInPeriod.toInt()} $currency</span>
                             </div>
                         </div>
 
-                        <div class="step-final-row">
-                            <span>💰 إجمالي الصافي المتبقي الكلي للعامل (شامل الرصيد السابق والأجر اليومي):</span>
-                            <span>${finalNetBalance.toInt()} $currency</span>
+                        <div class="step-final-row" style="background-color: $finalRowBg; color: #ffffff; padding: 6px 10px; border-radius: 5px; font-weight: bold; font-size: 11px; display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+                            <span>$finalRowTitle</span>
+                            <span style="font-size: 13px;">$finalRowAmount</span>
                         </div>
                     </div>
                 """.trimIndent())
@@ -543,16 +629,20 @@ object PdfPrintHelper {
             val hasOpeningOrSettlementTx = filteredTransactions.any { it.type == "OPENING_BALANCE" || it.type == "SETTLEMENT" }
 
             // Opening Balance Header Row
-            if (reportOpeningBalance != 0.0 && startDateFilter != null && !hasOpeningOrSettlementTx) {
+            if (reportOpeningBalance != 0.0 && !hasOpeningOrSettlementTx) {
+                val isCredit = reportOpeningBalance > 0
+                val note = if (isCredit) "رصيد سابق مترحل دائن (مستحق له)" else "رصيد سابق مترحل مدين (سلف ومسحوبات سابقة عليه)"
+                val earnedCell = if (isCredit) "<span style='color: #047857; font-weight: bold;'>+${reportOpeningBalance.toInt()} $currency</span>" else "-"
+                val drawCell = if (!isCredit) "<span style='color: #b45309; font-weight: bold;'>${Math.abs(reportOpeningBalance.toInt())} $currency</span>" else "-"
                 append("""
                     <tr style="background-color: #f1f5f9; font-weight: bold;">
                         <td>$reportStartDateStr</td>
-                        <td style="text-align: right; padding-right: 6px;">رصيد سابق مترحل حتى بداية الفترة</td>
+                        <td style="text-align: right; padding-right: 6px;">$note</td>
                         <td>-</td>
+                        <td>$drawCell</td>
                         <td>-</td>
-                        <td>-</td>
-                        <td style="color: #059669;">+${reportOpeningBalance.toInt()} $currency</td>
-                        <td style="color: #1e40af; font-size: 10px;">${runningBalance.toInt()} $currency</td>
+                        <td>$earnedCell</td>
+                        <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, balanceDisplayMode)}</td>
                     </tr>
                 """.trimIndent())
             }
@@ -592,13 +682,7 @@ object PdfPrintHelper {
                     set(Calendar.SECOND, 0)
                     set(Calendar.MILLISECOND, 0)
                 }
-                val endLoopMs = Calendar.getInstance().apply {
-                    timeInMillis = effectiveEndMs
-                    set(Calendar.HOUR_OF_DAY, 0)
-                    set(Calendar.MINUTE, 0)
-                    set(Calendar.SECOND, 0)
-                    set(Calendar.MILLISECOND, 0)
-                }.timeInMillis
+                val endLoopMs = lastDayMidnightMs
 
                 var currentMonthKey = ""
                 var monthSpendings = 0.0
@@ -606,10 +690,85 @@ object PdfPrintHelper {
                 var monthAbsences = 0.0
                 var monthEarned = 0.0
 
+                val processedLeaveIds = mutableSetOf<Int>()
+
                 while (currLoopCal.timeInMillis <= endLoopMs) {
                     val dayMidnight = currLoopCal.timeInMillis
                     val formattedDate = itemSdf.format(Date(dayMidnight))
                     val mKey = monthKeySdf.format(Date(dayMidnight))
+
+                    // Check if current day is in a leave period
+                    val currentLeave = LeaveUtils.findLeaveForDay(dayMidnight, leaves)
+                    val inLeave = currentLeave != null
+
+                    // If entering a new leave period, handle consolidated banner or start banner
+                    if (currentLeave != null && !processedLeaveIds.contains(currentLeave.id)) {
+                        processedLeaveIds.add(currentLeave.id)
+
+                        val lStartMs = Calendar.getInstance().apply {
+                            timeInMillis = currentLeave.startDate
+                            set(Calendar.HOUR_OF_DAY, 0)
+                            set(Calendar.MINUTE, 0)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }.timeInMillis
+
+                        val lEndMs = currentLeave.endDate?.let { endMs ->
+                            Calendar.getInstance().apply {
+                                timeInMillis = endMs
+                                set(Calendar.HOUR_OF_DAY, 23)
+                                set(Calendar.MINUTE, 59)
+                                set(Calendar.SECOND, 59)
+                                set(Calendar.MILLISECOND, 999)
+                            }.timeInMillis
+                        } ?: endLoopMs
+
+                        val effectiveLeaveStartInReport = maxOf(startCal.timeInMillis, lStartMs)
+                        val effectiveLeaveEndInReport = minOf(endLoopMs, lEndMs)
+
+                        val leaveTxs = filteredTransactions.filter { tx ->
+                            tx.timestamp in effectiveLeaveStartInReport..effectiveLeaveEndInReport
+                        }
+
+                        if (leaveTxs.isEmpty()) {
+                            // Case 1: Leave with NO transactions -> Single consolidated ribbon row
+                            val lStartStr = LeaveUtils.formatLeaveDate(currentLeave.startDate)
+                            val lEndStr = if (currentLeave.endDate != null) LeaveUtils.formatLeaveDate(currentLeave.endDate) else "مستمرة حتى الآن"
+                            val daysCount = LeaveUtils.calculateLeaveDays(currentLeave)
+                            val reasonText = if (currentLeave.reason.isNotBlank()) "(${currentLeave.reason})" else ""
+                            append("""
+                                <tr style="background-color: #f1f5f9; border-top: 1.5px solid #cbd5e1; border-bottom: 1.5px solid #cbd5e1; font-weight: bold;">
+                                    <td style="color: #475569; font-size: 8.5px;">$lStartStr إلى $lEndStr</td>
+                                    <td colspan="5" style="text-align: right; padding-right: 8px; color: #475569; font-size: 9.5px;">
+                                        🏖️ فترة إجازة رسمية $reasonText ($daysCount يوم) - لا توجد مستحقات يومية أو مسحوبات
+                                    </td>
+                                    <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, balanceDisplayMode)}</td>
+                                </tr>
+                            """.trimIndent())
+
+                            // Fast forward loop to end of this leave
+                            currLoopCal.timeInMillis = effectiveLeaveEndInReport
+                            currLoopCal.set(Calendar.HOUR_OF_DAY, 0)
+                            currLoopCal.set(Calendar.MINUTE, 0)
+                            currLoopCal.set(Calendar.SECOND, 0)
+                            currLoopCal.set(Calendar.MILLISECOND, 0)
+                            currLoopCal.add(Calendar.DAY_OF_YEAR, 1)
+                            continue
+                        } else {
+                            // Case 2: Leave WITH transactions -> Header banner for leave start
+                            val lStartStr = LeaveUtils.formatLeaveDate(currentLeave.startDate)
+                            val lEndStr = if (currentLeave.endDate != null) LeaveUtils.formatLeaveDate(currentLeave.endDate) else "حتى الآن"
+                            val reasonText = if (currentLeave.reason.isNotBlank()) "(${currentLeave.reason})" else ""
+                            append("""
+                                <tr style="background-color: #f8fafc; border-top: 1.5px dashed #94a3b8; font-weight: bold;">
+                                    <td style="color: #64748b; font-size: 8.5px;">$lStartStr</td>
+                                    <td colspan="6" style="text-align: right; padding-right: 8px; color: #64748b; font-size: 9.5px;">
+                                        🏖️ بداية فترة إجازة $reasonText من $lStartStr إلى $lEndStr [الأجر اليومي والصرفيات التلقائية متوقفة]
+                                    </td>
+                                </tr>
+                            """.trimIndent())
+                        }
+                    }
 
                     // Determine daily wage rate for this specific day using salary history
                     val activeHist = salaryHistories.filter { hist ->
@@ -670,7 +829,7 @@ object PdfPrintHelper {
                         txCal.timeInMillis == dayMidnight
                     }
 
-                    val isWorkDay = dayMidnight >= effectiveWorkStart &&
+                    val isWorkDay = !inLeave && dayMidnight >= effectiveWorkStart &&
                             (effectiveWorkStop == null || dayMidnight <= effectiveWorkStop) &&
                             (dayMidnight < todayMidnight || settings.stopWorkDate != null)
 
@@ -680,8 +839,6 @@ object PdfPrintHelper {
                             runningBalance += dayDailyWage
                             monthEarned += dayDailyWage
 
-                            val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
-
                             append("""
                                 <tr>
                                     <td>$formattedDate</td>
@@ -690,7 +847,7 @@ object PdfPrintHelper {
                                     <td>-</td>
                                     <td>-</td>
                                     <td><span style="color: #047857; font-weight: bold;">+${dayDailyWage.toInt()} $currency</span></td>
-                                    <td style="font-weight: bold; color: #1e40af;">$showBal</td>
+                                    <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, balanceDisplayMode)}</td>
                                 </tr>
                             """.trimIndent())
                         }
@@ -707,19 +864,41 @@ object PdfPrintHelper {
 
                             when (tx.type) {
                                 "OPENING_BALANCE" -> {
-                                    noteLabel = if (noteText.isNotBlank()) noteText else "رصيد افتتاحي سابق / أولي"
-                                    earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                                    val isCredit = tx.amount >= 0
+                                    noteLabel = if (noteText.isNotBlank()) noteText else if (isCredit) "رصيد افتتاحي سابق دائن (له)" else "رصيد افتتاحي سابق مدين (سلف ومسحوبات عليه)"
+                                    if (isCredit) {
+                                        earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                                    } else {
+                                        drawCell = "<span style='color: #b45309; font-weight: bold;'>${Math.abs(tx.amount.toInt())} $currency</span>"
+                                    }
                                     runningBalance = tx.amount
-                                    // OPENING_BALANCE does not consume the daily wage credit for a work day
                                 }
                                 "SETTLEMENT" -> {
-                                    noteLabel = if (noteText.isNotBlank()) noteText else "🔒 تصفية وإقفال حساب وتدوير رصيد"
-                                    earnedCell = "<span style='color: #6b21a8; font-weight: bold;'>تدوير: ${tx.amount.toInt()} $currency</span>"
+                                    val isCredit = tx.amount >= 0
+                                    noteLabel = if (noteText.isNotBlank()) noteText else if (isCredit) "🔒 تصفية وإقفال حساب وتدوير رصيد دائن (له)" else "🔒 تصفية وإقفال حساب وتدوير رصيد مدين (عليه)"
+                                    if (isCredit) {
+                                        earnedCell = "<span style='color: #6b21a8; font-weight: bold;'>تدوير له: +${tx.amount.toInt()} $currency</span>"
+                                    } else {
+                                        drawCell = "<span style='color: #b45309; font-weight: bold;'>تدوير عليه: ${Math.abs(tx.amount.toInt())} $currency</span>"
+                                    }
                                     runningBalance = tx.amount
                                     dailyWageCredited = true
                                 }
+                                "DEPOSIT" -> {
+                                    noteLabel = if (inLeave) {
+                                        "🏖️ أثناء الإجازة: " + (if (noteText.isNotBlank()) noteText else "إيداع / دفعة للحساب")
+                                    } else {
+                                        if (noteText.isNotBlank()) noteText else "إيداع / دفعة للحساب"
+                                    }
+                                    earnedCell = "<span style='color: #0284c7; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                                    runningBalance += tx.amount
+                                }
                                 "SPENDING" -> {
-                                    noteLabel = if (noteText.isNotBlank()) noteText else "صرفة يومية"
+                                    noteLabel = if (inLeave) {
+                                        "🏖️ صرفة أثناء الإجازة/يوم السفر: " + (if (noteText.isNotBlank()) noteText else "صرفة يومية (بدون أجر يومي)")
+                                    } else {
+                                        if (noteText.isNotBlank()) noteText else "صرفة يومية"
+                                    }
                                     spendingCell = "<span style='color: #1d4ed8; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
                                     monthSpendings += tx.amount
 
@@ -733,7 +912,11 @@ object PdfPrintHelper {
                                     }
                                 }
                                 "DRAW" -> {
-                                    noteLabel = if (noteText.isNotBlank()) noteText else "سحبية / سلفة"
+                                    noteLabel = if (inLeave) {
+                                        "🏖️ سحبية/حوالة أثناء الإجازة: " + (if (noteText.isNotBlank()) noteText else "سحبية / سلفة")
+                                    } else {
+                                        if (noteText.isNotBlank()) noteText else "سحبية / سلفة"
+                                    }
                                     drawCell = "<span style='color: #b45309; font-weight: bold;'>${tx.amount.toInt()} $currency</span>"
                                     monthDraws += tx.amount
 
@@ -765,17 +948,17 @@ object PdfPrintHelper {
                                 }
                             }
 
-                            val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
+                            val rowStyle = if (inLeave) "background-color: #f8fafc; border-right: 3px solid #94a3b8;" else ""
 
                             append("""
-                                <tr>
+                                <tr style="$rowStyle">
                                     <td>$formattedDate</td>
                                     <td style="text-align: right; padding-right: 6px;">$noteLabel</td>
                                     <td>$spendingCell</td>
                                     <td>$drawCell</td>
                                     <td>$absenceCell</td>
                                     <td>$earnedCell</td>
-                                    <td style="font-weight: bold; color: #1e40af;">$showBal</td>
+                                    <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, balanceDisplayMode)}</td>
                                 </tr>
                             """.trimIndent())
                         }
@@ -785,8 +968,6 @@ object PdfPrintHelper {
                             monthEarned += dayDailyWage
                             dailyWageCredited = true
 
-                            val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
-
                             append("""
                                 <tr>
                                     <td>$formattedDate</td>
@@ -795,10 +976,22 @@ object PdfPrintHelper {
                                     <td>-</td>
                                     <td>-</td>
                                     <td><span style="color: #047857; font-weight: bold;">+${dayDailyWage.toInt()} $currency</span></td>
-                                    <td style="font-weight: bold; color: #1e40af;">$showBal</td>
+                                    <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, balanceDisplayMode)}</td>
                                 </tr>
                             """.trimIndent())
                         }
+                    }
+
+                    // If today is the ending day of an ongoing or completed leave, output end banner
+                    if (currentLeave != null && currentLeave.endDate != null && isSameDay(dayMidnight, currentLeave.endDate)) {
+                        append("""
+                            <tr style="background-color: #f8fafc; border-bottom: 1.5px dashed #94a3b8; font-weight: bold;">
+                                <td style="color: #64748b; font-size: 8.5px;">${LeaveUtils.formatLeaveDate(currentLeave.endDate)}</td>
+                                <td colspan="6" style="text-align: right; padding-right: 8px; color: #64748b; font-size: 9.5px;">
+                                    🏖️ نهاية فترة الإجازة - استئناف احتساب العمل والأجر اليومي
+                                </td>
+                            </tr>
+                        """.trimIndent())
                     }
 
                     currLoopCal.add(Calendar.DAY_OF_YEAR, 1)
@@ -813,7 +1006,7 @@ object PdfPrintHelper {
                             <td style="color: #b45309;">-${monthDraws.toInt()} $currency</td>
                             <td style="color: #b91c1c;">-${monthAbsences.toInt()} $currency</td>
                             <td style="color: #047857;">+${monthEarned.toInt()} $currency</td>
-                            <td style="color: #1e40af;">${runningBalance.toInt()} $currency</td>
+                            <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, "AFTER_EACH_TX")}</td>
                         </tr>
                     """.trimIndent())
                 }
@@ -848,14 +1041,27 @@ object PdfPrintHelper {
                             absenceCell = "<span style='color: #b91c1c; font-weight: bold;'>-${absDed.toInt()} $currency</span>"
                             runningBalance -= absDed
                         }
+                        "DEPOSIT" -> {
+                            noteLabel = if (noteText.isNotBlank()) noteText else "إيداع / دفعة للحساب"
+                            earnedCell = "<span style='color: #0284c7; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                            runningBalance += tx.amount
+                        }
                         else -> {
-                            noteLabel = if (noteText.isNotBlank()) noteText else "تصفية / رصيد"
-                            earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                            val isCredit = tx.amount >= 0
+                            val defaultLabel = when (tx.type) {
+                                "OPENING_BALANCE" -> if (isCredit) "رصيد افتتاحي سابق دائن (له)" else "رصيد افتتاحي سابق مدين (عليه)"
+                                "SETTLEMENT" -> if (isCredit) "تصفية وتدوير رصيد دائن (له)" else "تصفية وتدوير رصيد مدين (عليه)"
+                                else -> "تصفية / رصيد"
+                            }
+                            noteLabel = if (noteText.isNotBlank()) noteText else defaultLabel
+                            if (isCredit) {
+                                earnedCell = "<span style='color: #047857; font-weight: bold;'>+${tx.amount.toInt()} $currency</span>"
+                            } else {
+                                drawCell = "<span style='color: #b45309; font-weight: bold;'>${Math.abs(tx.amount.toInt())} $currency</span>"
+                            }
                             runningBalance = tx.amount
                         }
                     }
-
-                    val showBal = if (balanceDisplayMode == "END_OF_REPORT") "-" else "${runningBalance.toInt()} $currency"
 
                     append("""
                         <tr>
@@ -865,21 +1071,47 @@ object PdfPrintHelper {
                             <td>$drawCell</td>
                             <td>$absenceCell</td>
                             <td>$earnedCell</td>
-                            <td style="font-weight: bold; color: #1e40af;">$showBal</td>
+                            <td style="text-align: center;">${formatBalanceHtml(runningBalance, currency, balanceDisplayMode)}</td>
                         </tr>
                     """.trimIndent())
                 }
             }
 
             // Final Summary Row at Report End
+            val finalRowClass = if (finalNetBalance > 0.001) {
+                "background-color: #ecfdf5; border-top: 2.5px solid #059669;"
+            } else if (finalNetBalance < -0.001) {
+                "background-color: #fef2f2; border-top: 2.5px solid #dc2626;"
+            } else {
+                "background-color: #f8fafc; border-top: 2.5px solid #64748b;"
+            }
+
+            val finalRowTitle = if (finalNetBalance > 0.001) {
+                "💰 إجمالي الصافي المتبقي المستحق (له في ذمة صاحب العمل):"
+            } else if (finalNetBalance < -0.001) {
+                "⚠️ إجمالي الصافي المطلوب والمتبقي (عليه سلف ومسحوبات فائضة):"
+            } else {
+                "⚖️ إجمالي الصافي النهائي (الحساب مصفر ومتطابق تماماً):"
+            }
+
+            val finalRowTitleColor = if (finalNetBalance > 0.001) "#065f46" else if (finalNetBalance < -0.001) "#991b1b" else "#334155"
+
+            val finalBalanceCell = if (finalNetBalance > 0.001) {
+                """<td style="color: #047857; font-size: 11px; font-weight: bold; background-color: #d1fae5; white-space: nowrap;">له: ${String.format(Locale("ar"), "%,d", finalNetBalance.toInt())} $currency</td>"""
+            } else if (finalNetBalance < -0.001) {
+                """<td style="color: #b91c1c; font-size: 11px; font-weight: bold; background-color: #fee2e2; white-space: nowrap;">عليه: ${String.format(Locale("ar"), "%,d", Math.abs(finalNetBalance.toInt()))} $currency</td>"""
+            } else {
+                """<td style="color: #475569; font-size: 11px; font-weight: bold; background-color: #f1f5f9; white-space: nowrap;">0 $currency</td>"""
+            }
+
             append("""
-                <tr style="background-color: #ecfdf5; font-size: 10.5px; font-weight: bold; border-top: 2.5px solid #059669;">
-                    <td colspan="2" style="text-align: right; color: #065f46; padding: 6px;">إجمالي المستحق والصافي النهائي المتبقي للعامل:</td>
+                <tr style="$finalRowClass font-size: 10.5px; font-weight: bold;">
+                    <td colspan="2" style="text-align: right; color: $finalRowTitleColor; padding: 6px;">$finalRowTitle</td>
                     <td style="color: #1d4ed8;">-${periodSpendings.toInt()} $currency</td>
-                    <td style="color: #b45309;">-${periodDraws.toInt()} $currency</td>
+                    <td style="color: #b45309;">-${totalPeriodDrawsWithOpening.toInt()} $currency</td>
                     <td style="color: #b91c1c;">-${absenceDeduction.toInt()} $currency</td>
                     <td style="color: #047857;">+${totalPeriodEntitlements.toInt()} $currency</td>
-                    <td style="color: #1e40af; font-size: 11px; background-color: #d1fae5;">${finalNetBalance.toInt()} $currency</td>
+                    $finalBalanceCell
                 </tr>
             """.trimIndent())
 
@@ -930,11 +1162,13 @@ object PdfPrintHelper {
     fun printWorkerBalancesReport(
         context: Context,
         workerBalances: List<com.example.viewmodel.WorkerBalanceItem>,
+        cutoffDateMs: Long? = null,
         onSuccess: (() -> Unit)? = null
     ) {
         val sdf = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("ar"))
         val dateString = sdf.format(Date())
         val dateSdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+        val cutoffDateStr = cutoffDateMs?.let { dateSdf.format(Date(it)) }
 
         val htmlContent = buildString {
             append("""
@@ -1056,13 +1290,14 @@ object PdfPrintHelper {
                             <p class="report-subtitle">كشف أرصدة وحسابات العمال والموظفين</p>
                         </div>
                         <div style="text-align: left; font-size: 10px; color: #475569;">
-                            <div>📅 تاريخ الطباعة: $dateString</div>
-                            <div>👥 عدد العمال: ${workerBalances.size}</div>
+                            <div>📅 تاريخ إصدار الكشف: $dateString</div>
+                            ${if (cutoffDateStr != null) """<div style="color: #059669; font-weight: bold; margin-top: 2px;">⏳ الأرصدة محسوبة حتى: $cutoffDateStr</div>""" else """<div>⏳ الأرصدة: حتى تاريخ اليوم</div>"""}
+                            <div>👥 عدد العمال المشمولين: ${workerBalances.size}</div>
                         </div>
                     </div>
 
                     <div class="summary-box">
-                        <span style="font-weight: bold; color: #1e293b;">📋 كشف تفصيلي بالأرصدة المستحقة لكل عامل على حِدة:</span>
+                        <span style="font-weight: bold; color: #1e293b;">📋 كشف تفصيلي بالأرصدة المستحقة ${if (cutoffDateStr != null) "حتى نهاية ($cutoffDateStr)" else "لكل عامل على حِدة"}:</span>
                         <span style="font-size: 10px; color: #64748b;">(مستند مالي رسمي)</span>
                     </div>
 
@@ -1073,7 +1308,7 @@ object PdfPrintHelper {
                                 <th>اسم العامل / الموظف</th>
                                 <th style="width: 100px;">الراتب الشهري</th>
                                 <th style="width: 100px;">تاريخ بدء الحساب</th>
-                                <th style="width: 160px;">صافي الرصيد والحالة</th>
+                                <th style="width: 160px;">${if (cutoffDateStr != null) "صافي الرصيد حتى $cutoffDateStr" else "صافي الرصيد والحالة"}</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1092,11 +1327,11 @@ object PdfPrintHelper {
                     val balanceHtml = when {
                         worker.netBalance > 0.001 -> {
                             val amt = String.format(Locale("ar"), "%,d", worker.netBalance.toInt())
-                            """<span class="badge-positive">له: +$amt ${worker.currency}</span>"""
+                            """<span class="badge-positive">له: $amt ${worker.currency}</span>"""
                         }
                         worker.netBalance < -0.001 -> {
                             val amt = String.format(Locale("ar"), "%,d", Math.abs(worker.netBalance).toInt())
-                            """<span class="badge-negative">عليه: -$amt ${worker.currency}</span>"""
+                            """<span class="badge-negative">عليه: $amt ${worker.currency}</span>"""
                         }
                         else -> {
                             """<span class="badge-zero">لا يوجد رصيد</span>"""
@@ -1120,7 +1355,7 @@ object PdfPrintHelper {
                     </table>
 
                     <div class="footer-container">
-                        <span>مستند كشف أرصدة مالي رسمي صادر من تطبيق (حساب العامل الذكي 📱)</span>
+                        <span>مستند كشف أرصدة مالي رسمي صادر من تطبيق (حساب العامل الذكي 📱)${if (cutoffDateStr != null) " - حتى تاريخ $cutoffDateStr" else ""}</span>
                         <span>توقيع المحاسب / الإدارة: ............................</span>
                     </div>
                 </body>
@@ -1133,7 +1368,7 @@ object PdfPrintHelper {
             webView.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     val printManager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                    val jobName = "كشف_أرصدة_العمال"
+                    val jobName = if (cutoffDateStr != null) "كشف_أرصدة_العمال_حتى_${cutoffDateStr.replace("/", "-")}" else "كشف_أرصدة_العمال"
 
                     val printAdapter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         webView.createPrintDocumentAdapter(jobName)

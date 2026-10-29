@@ -20,6 +20,9 @@ val CrimsonRedDark = Color(0xFF991B1B)
 val AmberOrange = Color(0xFFF59E0B)
 val AmberOrangeDark = Color(0xFF92400E)
 
+val DepositBlue = Color(0xFF0284C7)
+val DepositBlueDark = Color(0xFF0369A1)
+
 val EarnedBlue = Color(0xFF3B82F6)
 val EarnedBlueDark = Color(0xFF1E3A8A)
 

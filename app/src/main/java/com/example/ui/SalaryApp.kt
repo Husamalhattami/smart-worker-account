@@ -1,6 +1,8 @@
 package com.example.ui
 
 import com.example.util.AbsenceUtils
+import com.example.util.LeaveUtils
+import com.example.data.LeaveRecord
 
 import android.Manifest
 import android.content.Context
@@ -115,6 +117,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     val metricsState by viewModel.metrics.collectAsState()
     val activeUser by viewModel.activeUser.collectAsState()
     val registeredUsers by viewModel.registeredUsers.collectAsState()
+    val alwaysOpenDefaultAccount by viewModel.alwaysOpenDefaultAccount.collectAsState()
     val currenciesState by viewModel.currenciesState.collectAsStateWithLifecycle()
 
     val isListening by viewModel.isListening.collectAsState()
@@ -124,6 +127,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     val speechInputText by viewModel.speechInputText.collectAsState()
     val updateInfoState by viewModel.updateInfo.collectAsState()
     val salaryHistoriesState by viewModel.salaryHistoriesState.collectAsState()
+    val leavesState by viewModel.leavesState.collectAsState()
     LaunchedEffect(Unit) {
         viewModel.userNotice.collect { notice ->
             Toast.makeText(context, notice, Toast.LENGTH_SHORT).show()
@@ -137,12 +141,14 @@ fun SalaryApp(viewModel: SalaryViewModel) {
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showUserSettingsDialog by remember { mutableStateOf(false) }
     var showSalaryHistoryDialog by remember { mutableStateOf(false) }
+    var showLeaveManagementDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showGuideDialog by remember { mutableStateOf(false) }
     var showAddTxDialog by remember { mutableStateOf(false) }
     var showPdfOptionsDialog by remember { mutableStateOf(false) }
     var showSettleConfirmDialog by remember { mutableStateOf(false) }
     var showWorkerAccountsDialog by remember { mutableStateOf(false) }
+    var showPrintWorkersOptionsDialog by remember { mutableStateOf(false) }
     var editingTransaction by remember { mutableStateOf<Transaction?>(null) }
     var isAppUnlocked by remember { mutableStateOf(false) }
     var userRequestedAccountSwitch by remember { mutableStateOf(false) }
@@ -269,9 +275,38 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     Toast.makeText(context, "⏳ جاري استعادة قاعدة البيانات وإعادة تشغيل التطبيق...", Toast.LENGTH_SHORT).show()
                 }
 
+                // Copy incoming stream to a temporary cache file to read metadata safely
+                val tempDbFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}.db")
+                streamProvider()?.use { input ->
+                    FileOutputStream(tempDbFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                var backupWorkerName: String? = null
+                try {
+                    val sqliteDb = android.database.sqlite.SQLiteDatabase.openDatabase(tempDbFile.path, null, android.database.sqlite.SQLiteDatabase.OPEN_READONLY)
+                    val cursor = sqliteDb.rawQuery("SELECT employeeName FROM salary_settings WHERE id = 1 LIMIT 1", null)
+                    if (cursor.moveToFirst()) {
+                        val nameCol = cursor.getColumnIndex("employeeName")
+                        if (nameCol >= 0) {
+                            val nameVal = cursor.getString(nameCol)
+                            if (!nameVal.isNullOrBlank()) {
+                                backupWorkerName = nameVal.trim()
+                            }
+                        }
+                    }
+                    cursor.close()
+                    sqliteDb.close()
+                } catch (e: Exception) {
+                    Log.w("RestoreBackup", "Could not read employeeName from temp restored DB", e)
+                }
+
                 val currentActiveUser = viewModel.activeUser.value
-                val dbName = AppDatabase.getDatabaseNameForUser(currentActiveUser)
-                AppDatabase.closeDatabaseForUser(currentActiveUser)
+                val targetWorkerName = if (!backupWorkerName.isNullOrBlank()) backupWorkerName else (currentActiveUser ?: "حساب_افتراضي")
+                val dbName = AppDatabase.getDatabaseNameForUser(targetWorkerName)
+                
+                AppDatabase.closeDatabaseForUser(targetWorkerName)
                 AppDatabase.closeDatabase()
 
                 val dbFile = context.getDatabasePath(dbName)
@@ -283,25 +318,30 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 if (shmFile.exists()) shmFile.delete()
                 if (journalFile.exists()) journalFile.delete()
 
-                streamProvider()?.use { input ->
-                    FileOutputStream(dbFile).use { output ->
-                        input.copyTo(output)
-                    }
+                tempDbFile.copyTo(dbFile, overwrite = true)
+                tempDbFile.delete()
+
+                // Ensure employeeName in restored DB matches the target worker
+                try {
+                    val sqliteDb = android.database.sqlite.SQLiteDatabase.openDatabase(dbFile.path, null, android.database.sqlite.SQLiteDatabase.OPEN_READWRITE)
+                    sqliteDb.execSQL("UPDATE salary_settings SET employeeName = ? WHERE id = 1", arrayOf(targetWorkerName))
+                    sqliteDb.close()
+                } catch (e: Exception) {
+                    Log.e("RestoreBackup", "Failed to update employeeName in restored DB", e)
                 }
 
-                if (!currentActiveUser.isNullOrBlank()) {
-                    try {
-                        val sqliteDb = android.database.sqlite.SQLiteDatabase.openDatabase(dbFile.path, null, android.database.sqlite.SQLiteDatabase.OPEN_READWRITE)
-                        sqliteDb.execSQL("UPDATE salary_settings SET employeeName = ? WHERE id = 1", arrayOf(currentActiveUser))
-                        sqliteDb.close()
-                    } catch (e: Exception) {
-                        Log.e("RestoreBackup", "Failed to update employeeName in restored DB", e)
-                    }
-                }
+                // Register worker account and set as active user
+                val sharedPrefs = context.getSharedPreferences("salary_app_prefs", Context.MODE_PRIVATE)
+                val usersSet = sharedPrefs.getStringSet("registered_users", emptySet())?.toMutableSet() ?: mutableSetOf()
+                usersSet.add(targetWorkerName)
+                sharedPrefs.edit()
+                    .putStringSet("registered_users", usersSet)
+                    .putString("active_user", targetWorkerName)
+                    .apply()
 
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                     showBackupDialog = false
-                    val msg = "✅ تم استعادة قاعدة البيانات ($sourceName) بنجاح! يتم الآن تحديث التطبيق."
+                    val msg = "✅ تم استعادة قاعدة بيانات العامل ($targetWorkerName) بنجاح! يتم الآن تحديث التطبيق."
                     Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                     fileOpNotification = Pair(true, msg)
 
@@ -444,17 +484,31 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         ) {
             CircularProgressIndicator(color = EmeraldGreen)
         }
-    } else if (userRequestedAccountSwitch || settingsState?.employeeName.isNullOrBlank() || registeredUsers.isEmpty()) {
+    } else if (userRequestedAccountSwitch || activeUser.isNullOrBlank() || settingsState?.employeeName.isNullOrBlank() || registeredUsers.isEmpty()) {
         WelcomeLoginScreen(
             registeredUsers = registeredUsers,
-            onLogin = { userName ->
+            alwaysOpenDefaultAccount = alwaysOpenDefaultAccount,
+            onToggleAlwaysOpen = { enabled, targetUser ->
+                viewModel.setAlwaysOpenDefaultAccount(enabled, targetUser)
+            },
+            onLogin = { userName, rememberAlways ->
                 userRequestedAccountSwitch = false
                 hasGreeted = false
+                if (rememberAlways) {
+                    viewModel.setAlwaysOpenDefaultAccount(true, userName)
+                } else {
+                    viewModel.setAlwaysOpenDefaultAccount(false)
+                }
                 viewModel.loginUser(userName)
             },
-            onRegister = { name, salary, startDate, currency, standardSpending, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, openingBalance ->
+            onRegister = { name, salary, startDate, currency, standardSpending, dailyReminderEnabled, dailyReminderHour, dailyReminderMinute, openingBalance, rememberAlways ->
                 userRequestedAccountSwitch = false
                 hasGreeted = false
+                if (rememberAlways) {
+                    viewModel.setAlwaysOpenDefaultAccount(true, name)
+                } else {
+                    viewModel.setAlwaysOpenDefaultAccount(false)
+                }
                 viewModel.registerNewUserAccount(
                     name = name,
                     salary = salary,
@@ -471,21 +525,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 viewModel.deleteUser(userName)
             },
             onPrintBalancesReport = {
-                coroutineScope.launch {
-                    val balances = viewModel.getAllWorkersBalances()
-                    if (balances.isEmpty()) {
-                        Toast.makeText(context, "لا توجد بيانات عمال لطباعتها", Toast.LENGTH_SHORT).show()
-                    } else {
-                        val act = context.findActivity()
-                        if (act != null) {
-                            AdMobManager.showInterstitialAd(act) {
-                                PdfPrintHelper.printWorkerBalancesReport(context, balances)
-                            }
-                        } else {
-                            PdfPrintHelper.printWorkerBalancesReport(context, balances)
-                        }
-                    }
-                }
+                showPrintWorkersOptionsDialog = true
             }
         )
     } else {
@@ -511,7 +551,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                                 color = LocalAppColors.current.text
                             )
                         }
-                        val empName = settingsState?.employeeName?.trim()
+                        val empName = if (!activeUser.isNullOrBlank()) activeUser?.trim() else settingsState?.employeeName?.trim()
                         val greetingText = if (!empName.isNullOrEmpty()) "مرحباً بك $empName" else "مرحباً بك"
                         Text(
                             text = greetingText,
@@ -609,11 +649,90 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             // --- HEADER: Welcome & Date info ---
             WelcomeSection(
                 settings = settingsState ?: SalarySettings(),
-                onPrintPdfClick = { showPdfOptionsDialog = true }
+                onPrintPdfClick = { showPdfOptionsDialog = true },
+                onManageLeavesClick = { showLeaveManagementDialog = true }
             )
 
-            // --- WORK PAUSED / LEAVE BANNER ---
-            if (settingsState?.isWorkPaused == true) {
+            // --- ACTIVE LEAVE / WORK PAUSED BANNER ---
+            val activeLeave = LeaveUtils.getCurrentlyActiveLeave(leavesState)
+            if (activeLeave != null) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = AmberOrange.copy(alpha = 0.15f)),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.2.dp, AmberOrange)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(42.dp)
+                                    .background(AmberOrange.copy(alpha = 0.2f), shape = CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.BeachAccess,
+                                    contentDescription = null,
+                                    tint = AmberOrange,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "🏖️ العامل في فترة إجازة حالياً",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = LocalAppColors.current.text
+                                )
+                                val endTxt = if (activeLeave.endDate != null) "حتى ${LeaveUtils.formatLeaveDate(activeLeave.endDate)}" else "مفتوحة حتى الآن"
+                                Text(
+                                    text = "بدأت من: ${LeaveUtils.formatLeaveDate(activeLeave.startDate)} ($endTxt) - ${activeLeave.reason}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = LocalAppColors.current.textSub,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                        Text(
+                            text = "💡 الأجر اليومي والصرفيات التلقائية متوقفة خلال الإجازة. يمكنك تسجيل السحبيات أو الحوالات أو صرفة يوم السفر بصورة طبيعية.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalAppColors.current.textMuted
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (activeLeave.endDate == null) {
+                                Button(
+                                    onClick = { viewModel.endOngoingLeave(activeLeave.id, System.currentTimeMillis()) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                    modifier = Modifier.weight(1.2f)
+                                ) {
+                                    Text("إنهاء الإجازة والعودة ◀️", color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { showLeaveManagementDialog = true },
+                                shape = RoundedCornerShape(10.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("إدارة الإجازات ⚙️", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            } else if (settingsState?.isWorkPaused == true) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = AmberOrange.copy(alpha = 0.15f)),
@@ -642,13 +761,13 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                         }
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "⏸️ احتساب العمل متوقف مؤقتاً (إجازة)",
+                                text = "⏸️ احتساب العمل متوقف مؤقتاً",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = LocalAppColors.current.text
                             )
                             Text(
-                                text = "تراكم الأجر اليومي متوقف حالياً. يمكنك الاستئناف عند العودة للعمل.",
+                                text = "تراكم الأجر اليومي متوقف حالياً.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = LocalAppColors.current.textSub
                             )
@@ -776,6 +895,7 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                     balanceDisplayMode = balanceMode,
                     transactionTypeFilter = typeFilter,
                     salaryHistories = salaryHistoriesState,
+                    leaves = leavesState,
                     onSuccess = {
                         AdMobManager.showInterstitialAd(activity)
                     }
@@ -832,25 +952,33 @@ fun SalaryApp(viewModel: SalaryViewModel) {
             },
             onPrintBalancesReport = {
                 showMainMenuDialog = false
-                coroutineScope.launch {
-                    val balances = viewModel.getAllWorkersBalances()
-                    if (balances.isEmpty()) {
-                        Toast.makeText(context, "لا توجد بيانات عمال لطباعتها", Toast.LENGTH_SHORT).show()
-                    } else {
-                        val act = context.findActivity()
-                        if (act != null) {
-                            AdMobManager.showInterstitialAd(act) {
-                                PdfPrintHelper.printWorkerBalancesReport(context, balances)
-                            }
-                        } else {
-                            PdfPrintHelper.printWorkerBalancesReport(context, balances)
-                        }
-                    }
-                }
+                showPrintWorkersOptionsDialog = true
             },
             onSettleAccount = {
                 showMainMenuDialog = false
                 showSettleConfirmDialog = true
+            },
+            onManageLeaves = {
+                showMainMenuDialog = false
+                showLeaveManagementDialog = true
+            }
+        )
+    }
+
+    // --- LEAVE MANAGEMENT DIALOG ---
+    if (showLeaveManagementDialog) {
+        LeaveManagementDialog(
+            leaves = leavesState,
+            currency = (settingsState ?: SalarySettings()).currency,
+            onDismiss = { showLeaveManagementDialog = false },
+            onAddLeave = { startDate, endDate, reason ->
+                viewModel.addLeavePeriod(startDate, endDate, reason)
+            },
+            onEndOngoingLeave = { leaveId, endDate ->
+                viewModel.endOngoingLeave(leaveId, endDate)
+            },
+            onDeleteLeave = { leaveId ->
+                viewModel.deleteLeavePeriod(leaveId)
             }
         )
     }
@@ -860,6 +988,10 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         WorkerAccountsDialog(
             currentActiveUser = activeUser,
             registeredUsers = registeredUsers,
+            alwaysOpenDefaultAccount = alwaysOpenDefaultAccount,
+            onToggleAlwaysOpen = { enabled ->
+                viewModel.setAlwaysOpenDefaultAccount(enabled, activeUser)
+            },
             onDismiss = { showWorkerAccountsDialog = false },
             onLogin = { userName ->
                 showWorkerAccountsDialog = false
@@ -885,21 +1017,8 @@ fun SalaryApp(viewModel: SalaryViewModel) {
                 viewModel.deleteUser(userName)
             },
             onPrintBalancesReport = {
-                coroutineScope.launch {
-                    val balances = viewModel.getAllWorkersBalances()
-                    if (balances.isEmpty()) {
-                        Toast.makeText(context, "لا توجد بيانات عمال لطباعتها", Toast.LENGTH_SHORT).show()
-                    } else {
-                        val act = context.findActivity()
-                        if (act != null) {
-                            AdMobManager.showInterstitialAd(act) {
-                                PdfPrintHelper.printWorkerBalancesReport(context, balances)
-                            }
-                        } else {
-                            PdfPrintHelper.printWorkerBalancesReport(context, balances)
-                        }
-                    }
-                }
+                showWorkerAccountsDialog = false
+                showPrintWorkersOptionsDialog = true
             }
         )
     }
@@ -1278,12 +1397,48 @@ fun SalaryApp(viewModel: SalaryViewModel) {
         )
     }
     }
+
+    // --- PRINT WORKERS OPTIONS DIALOG (DATE & PERSON SELECTION) ---
+    if (showPrintWorkersOptionsDialog) {
+        val usersList = if (registeredUsers.isEmpty()) {
+            activeUser?.let { listOf(it) } ?: emptyList()
+        } else {
+            registeredUsers
+        }
+        PrintWorkersOptionsDialog(
+            registeredUsers = usersList,
+            activeUser = activeUser,
+            onDismiss = { showPrintWorkersOptionsDialog = false },
+            onConfirmPrint = { cutoffDateMs, selectedWorkers ->
+                showPrintWorkersOptionsDialog = false
+                coroutineScope.launch {
+                    val balances = viewModel.getAllWorkersBalances(
+                        cutoffDateMs = cutoffDateMs,
+                        selectedWorkerNames = selectedWorkers
+                    )
+                    if (balances.isEmpty()) {
+                        Toast.makeText(context, "لم يتم العثور على بيانات للعمال المحددين", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val act = context.findActivity()
+                        if (act != null) {
+                            AdMobManager.showInterstitialAd(act) {
+                                PdfPrintHelper.printWorkerBalancesReport(context, balances, cutoffDateMs)
+                            }
+                        } else {
+                            PdfPrintHelper.printWorkerBalancesReport(context, balances, cutoffDateMs)
+                        }
+                    }
+                }
+            }
+        )
+    }
 }
 
 @Composable
 fun WelcomeSection(
     settings: SalarySettings,
-    onPrintPdfClick: () -> Unit = {}
+    onPrintPdfClick: () -> Unit = {},
+    onManageLeavesClick: () -> Unit = {}
 ) {
     val sdf = SimpleDateFormat("EEEE, d MMMM yyyy", Locale("ar"))
     val dateString = sdf.format(Date())
@@ -1295,37 +1450,73 @@ fun WelcomeSection(
         border = BorderStroke(1.dp, LocalAppColors.current.border),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Icon(
-                    imageVector = Icons.Default.CalendarToday,
-                    contentDescription = null,
-                    tint = EmeraldGreen,
-                    modifier = Modifier.size(18.dp)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CalendarToday,
+                        contentDescription = null,
+                        tint = EmeraldGreen,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "تاريخ اليوم:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalAppColors.current.textSub,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
                 Text(
-                    text = "تاريخ اليوم:",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = LocalAppColors.current.textSub,
-                    fontWeight = FontWeight.Bold
+                    text = dateString,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = LocalAppColors.current.text
                 )
             }
 
-            Text(
-                text = dateString,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                color = LocalAppColors.current.text
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onManageLeavesClick,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberOrange),
+                    border = BorderStroke(1.dp, AmberOrange.copy(alpha = 0.5f)),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.BeachAccess, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("سجل الإجازات 🏖️", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                }
+
+                OutlinedButton(
+                    onClick = onPrintPdfClick,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = EmeraldGreen),
+                    border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.5f)),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.Print, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("طباعة الكشف 📋", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                }
+            }
         }
     }
 }
@@ -1467,22 +1658,39 @@ fun BalanceDial(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
+            val isPositive = metrics.netBalance > 0.001
+            val isNegative = metrics.netBalance < -0.001
+            val balanceColor = when {
+                isPositive -> EmeraldGreen
+                isNegative -> CrimsonRed
+                else -> Color.Gray
+            }
+            val balanceTitle = when {
+                isPositive -> "المتبقي لك (له)"
+                isNegative -> "المطلوب عليك (سلف)"
+                else -> "الحساب مصفر"
+            }
+            val balanceValueStr = when {
+                isPositive -> "${metrics.netBalance.toInt()}"
+                isNegative -> "${Math.abs(metrics.netBalance.toInt())}-"
+                else -> "0"
+            }
             Text(
-                text = "المتبقي لك",
+                text = balanceTitle,
                 style = MaterialTheme.typography.titleMedium,
-                color = textSubColor
+                color = balanceColor
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "${metrics.netBalance.toInt()}",
+                text = balanceValueStr,
                 style = MaterialTheme.typography.displayMedium,
-                color = EmeraldGreen,
+                color = balanceColor,
                 fontWeight = FontWeight.Bold
             )
             Text(
                 text = currency,
                 style = MaterialTheme.typography.titleMedium,
-                color = EmeraldGreen,
+                color = balanceColor,
                 fontWeight = FontWeight.Bold
             )
             Spacer(modifier = Modifier.height(8.dp))
@@ -1569,6 +1777,22 @@ fun StatsSection(metrics: SalaryMetrics, currency: String) {
                 icon = Icons.Default.ArrowDownward,
                 modifier = Modifier.weight(1f)
             )
+        }
+
+        if (metrics.totalDeposits > 0) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                StatCard(
+                    title = "إيداعات ودفعات للحساب",
+                    value = "+${metrics.totalDeposits.toInt()}",
+                    unit = currency,
+                    color = DepositBlue,
+                    icon = Icons.Default.Paid,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
     }
 }
@@ -1906,8 +2130,9 @@ fun TransactionItem(
         "SPENDING" -> CrimsonRed
         "DRAW" -> AmberOrange
         "ABSENCE" -> Color.Gray
-        "OPENING_BALANCE" -> EmeraldGreen
-        "SETTLEMENT" -> EarnedBlue
+        "DEPOSIT" -> DepositBlue
+        "OPENING_BALANCE" -> if (transaction.amount >= 0) EmeraldGreen else CrimsonRed
+        "SETTLEMENT" -> if (transaction.amount >= 0) EmeraldGreen else CrimsonRed
         else -> EarnedBlue
     }
 
@@ -1915,6 +2140,7 @@ fun TransactionItem(
         "SPENDING" -> Icons.Default.ReceiptLong
         "DRAW" -> Icons.Default.AccountBalanceWallet
         "ABSENCE" -> Icons.Default.EventBusy
+        "DEPOSIT" -> Icons.Default.Paid
         "OPENING_BALANCE" -> Icons.Default.AccountBalance
         "SETTLEMENT" -> Icons.Default.Lock
         else -> Icons.Default.CheckCircle
@@ -1924,8 +2150,9 @@ fun TransactionItem(
         "SPENDING" -> "صرفة"
         "DRAW" -> "سحبية"
         "ABSENCE" -> "تسجيل غياب"
-        "OPENING_BALANCE" -> "رصيد افتتاحي"
-        "SETTLEMENT" -> "تصفية وإقفال حساب"
+        "DEPOSIT" -> "إيداع للحساب"
+        "OPENING_BALANCE" -> if (transaction.amount >= 0) "رصيد افتتاحي (له)" else "رصيد افتتاحي (عليه سلف)"
+        "SETTLEMENT" -> if (transaction.amount >= 0) "تصفية حساب (تدوير له)" else "تصفية حساب (تدوير عليه)"
         else -> "عملية"
     }
 
@@ -1936,8 +2163,9 @@ fun TransactionItem(
         }
         "SPENDING" -> "-${transaction.amount.toInt()} $currency"
         "DRAW" -> "-${transaction.amount.toInt()} $currency"
-        "OPENING_BALANCE" -> "+${transaction.amount.toInt()} $currency"
-        "SETTLEMENT" -> "تدوير: ${transaction.amount.toInt()} $currency"
+        "DEPOSIT" -> "+${transaction.amount.toInt()} $currency"
+        "OPENING_BALANCE" -> if (transaction.amount >= 0) "+${transaction.amount.toInt()} $currency" else "-${Math.abs(transaction.amount.toInt())} $currency"
+        "SETTLEMENT" -> if (transaction.amount >= 0) "تدوير له: +${transaction.amount.toInt()} $currency" else "تدوير عليه: -${Math.abs(transaction.amount.toInt())} $currency"
         else -> "${transaction.amount.toInt()} $currency"
     }
 
@@ -2107,7 +2335,7 @@ fun AddTransactionDialog(
     onDismiss: () -> Unit,
     onSave: (type: String, amount: Double, note: String, timestamp: Long) -> Unit
 ) {
-    var selectedType by remember { mutableStateOf("DRAW") } // DRAW, SPENDING, ABSENCE
+    var selectedType by remember { mutableStateOf("DRAW") } // DRAW, SPENDING, ABSENCE, DEPOSIT
     var amountInput by remember(selectedType) { 
         mutableStateOf(
             if (selectedType == "SPENDING") settings.standardSpendingAmount.toInt().toString() else ""
@@ -2115,10 +2343,12 @@ fun AddTransactionDialog(
     }
     var noteInput by remember { mutableStateOf("") }
     
-    // Auto-fill spending note to "صرفة" as requested
+    // Auto-fill note depending on type
     LaunchedEffect(selectedType) {
         if (selectedType == "SPENDING") {
             noteInput = "صرفة"
+        } else if (selectedType == "DEPOSIT") {
+            noteInput = "إيداع للحساب"
         } else {
             noteInput = ""
         }
@@ -2209,12 +2439,13 @@ fun AddTransactionDialog(
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     val types = listOf(
+                        Triple("DEPOSIT", "إيداع للحساب", DepositBlue),
                         Triple("ABSENCE", "غياب", Color.Gray),
                         Triple("SPENDING", "صرفة", CrimsonRed),
-                        Triple("DRAW", "سحبية / سلفة", AmberOrange)
+                        Triple("DRAW", "سحبية", AmberOrange)
                     )
                     types.forEach { (type, label, color) ->
                         val isSelected = selectedType == type
@@ -2238,9 +2469,11 @@ fun AddTransactionDialog(
                         ) {
                             Text(
                                 text = label,
-                                style = MaterialTheme.typography.bodyMedium,
+                                style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = if (isSelected) Color.White else color
+                                color = if (isSelected) Color.White else color,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1
                             )
                         }
                     }
@@ -2251,7 +2484,11 @@ fun AddTransactionDialog(
                 if (selectedType != "ABSENCE") {
                     // Amount Field
                     Text(
-                        text = if (selectedType == "DRAW") "مبلغ السحبية / السلفة (${settings.currency}):" else "مبلغ الصرفة (${settings.currency}):",
+                        text = when (selectedType) {
+                            "DRAW" -> "مبلغ السحبية / السلفة (${settings.currency}):"
+                            "DEPOSIT" -> "مبلغ الإيداع / الدفعة للحساب (${settings.currency}):"
+                            else -> "مبلغ الصرفة (${settings.currency}):"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = LocalAppColors.current.textSub
                     )
@@ -2262,14 +2499,23 @@ fun AddTransactionDialog(
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         placeholder = {
                             Text(
-                                text = if (selectedType == "SPENDING") "${settings.standardSpendingAmount.toInt()}" else "أدخل المبلغ هنا...",
+                                text = when (selectedType) {
+                                    "SPENDING" -> "${settings.standardSpendingAmount.toInt()}"
+                                    "DEPOSIT" -> "أدخل المبلغ المودع للحساب..."
+                                    else -> "أدخل المبلغ هنا..."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = LocalAppColors.current.textMuted
                             )
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = if (selectedType == "SPENDING") CrimsonRed else AmberOrange,
+                            focusedBorderColor = when (selectedType) {
+                                "SPENDING" -> CrimsonRed
+                                "DRAW" -> AmberOrange
+                                "DEPOSIT" -> DepositBlue
+                                else -> Color.Gray
+                            },
                             unfocusedBorderColor = LocalAppColors.current.border,
                             focusedTextColor = LocalAppColors.current.text,
                             unfocusedTextColor = LocalAppColors.current.text
@@ -2278,7 +2524,10 @@ fun AddTransactionDialog(
 
                     // Note Field
                     Text(
-                        text = "ملاحظة وبيان العملية (اختياري - لأيش):",
+                        text = when (selectedType) {
+                            "DEPOSIT" -> "بيان وملاحظة الإيداع (اختياري - تفاصيل الدفعة):"
+                            else -> "ملاحظة وبيان العملية (اختياري - لأيش):"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = LocalAppColors.current.textSub
                     )
@@ -2288,7 +2537,11 @@ fun AddTransactionDialog(
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                         placeholder = {
                             Text(
-                                text = if (selectedType == "SPENDING") "مثال: صرفة غداء، باص..." else "مثال: سلفة لمصاريف العيد...",
+                                text = when (selectedType) {
+                                    "SPENDING" -> "مثال: صرفة غداء، باص..."
+                                    "DEPOSIT" -> "مثال: تسليم دفعة للعم، فوق الحساب..."
+                                    else -> "مثال: سلفة لمصاريف العيد..."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = LocalAppColors.current.textMuted
                             )
@@ -2525,7 +2778,12 @@ fun AddTransactionDialog(
                                 }
                             } else {
                                 val amt = amountInput.toDoubleOrNull() ?: if (selectedType == "SPENDING") settings.standardSpendingAmount else 0.0
-                                val defaultNote = if (selectedType == "SPENDING") "صرفة" else "سحبية / سلفة"
+                                val defaultNote = when (selectedType) {
+                                    "SPENDING" -> "صرفة"
+                                    "DRAW" -> "سحبية / سلفة"
+                                    "DEPOSIT" -> "إيداع للحساب"
+                                    else -> "عملية"
+                                }
                                 val note = if (noteInput.isBlank()) defaultNote else noteInput
                                 if (amt > 0.0) {
                                     onSave(selectedType, amt, note, transactionDate)
@@ -2536,6 +2794,7 @@ fun AddTransactionDialog(
                             containerColor = when (selectedType) {
                                 "SPENDING" -> CrimsonRed
                                 "DRAW" -> AmberOrange
+                                "DEPOSIT" -> DepositBlue
                                 else -> Color.Gray
                             }
                         ),
@@ -3070,6 +3329,7 @@ fun PdfOptionsDialog(
                     "ALL" to "📋 جميع العمليات (شامل)",
                     "SPENDING" to "🛒 الصرفيات والمصروفات فقط",
                     "DRAW" to "💰 السحبيات (السلف المالية) فقط",
+                    "DEPOSIT" to "💳 الإيداعات والدفعات للحساب فقط",
                     "ABSENCE" to "📅 سجل الغيابات والخصومات فقط",
                     "SETTLEMENT" to "🔒 التصفيات والأرصدة الافتتاحية فقط"
                 )
@@ -3239,8 +3499,10 @@ fun PdfOptionsDialog(
         android.app.DatePickerDialog(
             LocalContext.current,
             { _, year, month, dayOfMonth ->
-                val c = Calendar.getInstance()
-                c.set(year, month, dayOfMonth, 0, 0, 0)
+                val c = Calendar.getInstance().apply {
+                    set(year, month, dayOfMonth, 0, 0, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
                 startDateFilter = c.timeInMillis
                 showStartDatePicker = false
             },
@@ -3259,8 +3521,10 @@ fun PdfOptionsDialog(
         android.app.DatePickerDialog(
             LocalContext.current,
             { _, year, month, dayOfMonth ->
-                val c = Calendar.getInstance()
-                c.set(year, month, dayOfMonth, 23, 59, 59)
+                val c = Calendar.getInstance().apply {
+                    set(year, month, dayOfMonth, 23, 59, 59)
+                    set(Calendar.MILLISECOND, 999)
+                }
                 endDateFilter = c.timeInMillis
                 showEndDatePicker = false
             },
@@ -3305,7 +3569,8 @@ fun UserSettingsDialog(
     var autoAddDailySpending by remember { mutableStateOf(currentSettings.autoAddDailySpending) }
     var isSpendingDeductedFromSalary by remember { mutableStateOf(currentSettings.isSpendingDeductedFromSalary) }
     var isWorkPaused by remember { mutableStateOf(currentSettings.isWorkPaused) }
-    var openingBalanceInput by remember { mutableStateOf(currentSettings.openingBalance.toInt().toString()) }
+    var isOpeningBalanceCredit by remember { mutableStateOf(currentSettings.openingBalance >= 0) }
+    var openingBalanceInput by remember { mutableStateOf(Math.abs(currentSettings.openingBalance.toInt()).toString()) }
     var priorAbsencesInput by remember { mutableStateOf(currentSettings.priorAbsenceCount.toString()) }
     var priorSpendingsInput by remember { mutableStateOf(currentSettings.priorSpendingsAmount.toInt().toString()) }
     var priorDrawsInput by remember { mutableStateOf(currentSettings.priorDrawsAmount.toInt().toString()) }
@@ -3642,10 +3907,35 @@ fun UserSettingsDialog(
 
                 // Opening Balance / Previous Balance
                 Text(
-                    text = "رصيد سابق / حساب مستحق لك (رصيد افتتاحي):",
+                    text = "رصيد سابق / حساب افتتاحي (حالة الرصيد القديم):",
                     style = MaterialTheme.typography.bodyMedium,
                     color = LocalAppColors.current.textSub
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = isOpeningBalanceCredit,
+                        onClick = { isOpeningBalanceCredit = true },
+                        label = { Text("له دائن (+)", fontWeight = if (isOpeningBalanceCredit) FontWeight.Bold else FontWeight.Normal) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = EmeraldGreen,
+                            selectedLabelColor = Color.White
+                        ),
+                        modifier = Modifier.weight(1f)
+                    )
+                    FilterChip(
+                        selected = !isOpeningBalanceCredit,
+                        onClick = { isOpeningBalanceCredit = false },
+                        label = { Text("عليه سلف/مدين (-)", fontWeight = if (!isOpeningBalanceCredit) FontWeight.Bold else FontWeight.Normal) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = CrimsonRed,
+                            selectedLabelColor = Color.White
+                        ),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
                 OutlinedTextField(
                     value = openingBalanceInput,
                     onValueChange = { openingBalanceInput = it },
@@ -3654,7 +3944,7 @@ fun UserSettingsDialog(
                     textStyle = MaterialTheme.typography.bodyMedium.copy(color = LocalAppColors.current.text),
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = EmeraldGreen,
+                        focusedBorderColor = if (isOpeningBalanceCredit) EmeraldGreen else CrimsonRed,
                         unfocusedBorderColor = LocalAppColors.current.border,
                         focusedTextColor = LocalAppColors.current.text,
                         unfocusedTextColor = LocalAppColors.current.text
@@ -3744,7 +4034,8 @@ fun UserSettingsDialog(
                             val priorDraws = priorDrawsInput.toDoubleOrNull() ?: 0.0
                             val currencyVal = if (currencyInput.isBlank()) "ريال يمني" else currencyInput.trim()
                             val employeeNameVal = if (employeeNameInput.isBlank()) "حسام الحطامي" else employeeNameInput.trim()
-                            val openingBalance = openingBalanceInput.toDoubleOrNull() ?: 0.0
+                            val rawOpBal = openingBalanceInput.toDoubleOrNull() ?: 0.0
+                            val openingBalance = if (isOpeningBalanceCredit) Math.abs(rawOpBal) else -Math.abs(rawOpBal)
 
                             onSave(
                                 employeeNameVal,
@@ -4200,8 +4491,9 @@ fun EditTransactionDialog(
         "SPENDING" -> "صرفة مصروف"
         "DRAW" -> "سحبية / سلفة"
         "ABSENCE" -> "تسجيل غياب"
-        "OPENING_BALANCE" -> "رصيد افتتاحي سابق"
-        "SETTLEMENT" -> "تصفية وإقفال حساب وتدوير رصيد"
+        "DEPOSIT" -> "إيداع / دفعة للحساب"
+        "OPENING_BALANCE" -> if (transaction.amount >= 0) "رصيد افتتاحي سابق (له)" else "رصيد افتتاحي سابق (عليه سلف)"
+        "SETTLEMENT" -> if (transaction.amount >= 0) "تصفية وإقفال حساب (تدوير له)" else "تصفية وإقفال حساب (تدوير عليه)"
         else -> "عملية"
     }
 
@@ -4209,8 +4501,9 @@ fun EditTransactionDialog(
         "SPENDING" -> CrimsonRed
         "DRAW" -> AmberOrange
         "ABSENCE" -> Color.Gray
-        "OPENING_BALANCE" -> EmeraldGreen
-        "SETTLEMENT" -> EarnedBlue
+        "DEPOSIT" -> DepositBlue
+        "OPENING_BALANCE" -> if (transaction.amount >= 0) EmeraldGreen else CrimsonRed
+        "SETTLEMENT" -> if (transaction.amount >= 0) EmeraldGreen else CrimsonRed
         else -> EarnedBlue
     }
 
@@ -4286,6 +4579,7 @@ fun EditTransactionDialog(
                 // Input label
                 val inputLabel = when (transaction.type) {
                     "ABSENCE" -> "مدة الغياب بالساعات والدقائق (مثال: 1.50 = ساعه ونص، 1.25 = ساعه وربع، 1.45 = ساعه و45 دقيقة):"
+                    "DEPOSIT" -> "مبلغ الإيداع / الدفعة للحساب ($currency):"
                     else -> "المبلغ ($currency):"
                 }
 
@@ -4644,6 +4938,8 @@ fun AppLockScreen(
 fun WorkerAccountsDialog(
     currentActiveUser: String?,
     registeredUsers: List<String>,
+    alwaysOpenDefaultAccount: Boolean = false,
+    onToggleAlwaysOpen: (Boolean) -> Unit = {},
     onDismiss: () -> Unit,
     onLogin: (String) -> Unit,
     onRegister: (String, Double, Long, String, Double, Boolean, Int, Int, Double) -> Unit,
@@ -4658,6 +4954,7 @@ fun WorkerAccountsDialog(
     var salaryInput by remember { mutableStateOf("") }
     var currencyInput by remember { mutableStateOf("ريال يمني") }
     var standardSpendingInput by remember { mutableStateOf("2000") }
+    var isOpeningBalanceCredit by remember { mutableStateOf(true) }
     var openingBalanceInput by remember { mutableStateOf("0") }
     
     var dailyReminderEnabled by remember { mutableStateOf(true) }
@@ -4920,6 +5217,60 @@ fun WorkerAccountsDialog(
                 }
 
                 if (registeredUsers.isNotEmpty()) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onToggleAlwaysOpen(!alwaysOpenDefaultAccount) },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (alwaysOpenDefaultAccount) EmeraldGreen.copy(alpha = 0.12f) else LocalAppColors.current.bg
+                        ),
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, if (alwaysOpenDefaultAccount) EmeraldGreen else LocalAppColors.current.border)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.VpnKey,
+                                    contentDescription = null,
+                                    tint = if (alwaysOpenDefaultAccount) EmeraldGreen else LocalAppColors.current.textMuted
+                                )
+                                Column {
+                                    Text(
+                                        text = "الدخول التلقائي دائماً بهذا الحساب عند الفتح",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = LocalAppColors.current.text
+                                    )
+                                    Text(
+                                        text = if (alwaysOpenDefaultAccount)
+                                            "مفعل: يتم فتح حساب (${currentActiveUser ?: ""}) مباشرة عند تشغيل التطبيق."
+                                            else "معطل: تظهر قائمة اختيار الحسابات في كل مرة تفتح فيها التطبيق.",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (alwaysOpenDefaultAccount) EmeraldGreen else LocalAppColors.current.textMuted
+                                    )
+                                }
+                            }
+                            Switch(
+                                checked = alwaysOpenDefaultAccount,
+                                onCheckedChange = { onToggleAlwaysOpen(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = EmeraldGreen
+                                )
+                            )
+                        }
+                    }
+
                     Button(
                         onClick = onPrintBalancesReport,
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
@@ -4955,7 +5306,7 @@ fun WorkerAccountsDialog(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (showCreateForm) "إخفاء نموذج الإضافة" else "➕ عمل / إضافة حساب عامل جديد",
+                        text = if (showCreateForm) "إخفاء نموذج الإضافة" else "عمل / إضافة حساب عامل جديد",
                         color = Color.White,
                         fontWeight = FontWeight.Bold
                     )
@@ -5050,7 +5401,32 @@ fun WorkerAccountsDialog(
                                 }
                             }
 
-                            Text("رصيد افتتاحي سابق (له أو عليه):", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                            Text("رصيد سابق / افتتاحي (حالة الرصيد القديم):", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                FilterChip(
+                                    selected = isOpeningBalanceCredit,
+                                    onClick = { isOpeningBalanceCredit = true },
+                                    label = { Text("له دائن (+)", fontWeight = if (isOpeningBalanceCredit) FontWeight.Bold else FontWeight.Normal) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = EmeraldGreen,
+                                        selectedLabelColor = Color.White
+                                    ),
+                                    modifier = Modifier.weight(1f)
+                                )
+                                FilterChip(
+                                    selected = !isOpeningBalanceCredit,
+                                    onClick = { isOpeningBalanceCredit = false },
+                                    label = { Text("عليه سلف/مدين (-)", fontWeight = if (!isOpeningBalanceCredit) FontWeight.Bold else FontWeight.Normal) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = CrimsonRed,
+                                        selectedLabelColor = Color.White
+                                    ),
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                             OutlinedTextField(
                                 value = openingBalanceInput,
                                 onValueChange = { openingBalanceInput = it },
@@ -5060,7 +5436,7 @@ fun WorkerAccountsDialog(
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = EmeraldGreen,
+                                    focusedBorderColor = if (isOpeningBalanceCredit) EmeraldGreen else CrimsonRed,
                                     unfocusedBorderColor = LocalAppColors.current.border
                                 )
                             )
@@ -5108,7 +5484,8 @@ fun WorkerAccountsDialog(
                                     }
                                     val sal = salaryInput.toDoubleOrNull() ?: 0.0
                                     val stdSpend = standardSpendingInput.toDoubleOrNull() ?: 2000.0
-                                    val opBal = openingBalanceInput.toDoubleOrNull() ?: 0.0
+                                    val rawOpBal = openingBalanceInput.toDoubleOrNull() ?: 0.0
+                                    val opBal = if (isOpeningBalanceCredit) Math.abs(rawOpBal) else -Math.abs(rawOpBal)
                                     
                                     onRegister(
                                         nameInput.trim(),
@@ -5150,18 +5527,564 @@ fun WorkerAccountsDialog(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
+fun PrintWorkersOptionsDialog(
+    registeredUsers: List<String>,
+    activeUser: String?,
+    onDismiss: () -> Unit,
+    onConfirmPrint: (cutoffDateMs: Long?, selectedWorkers: Set<String>) -> Unit
+) {
+    val context = LocalContext.current
+    var selectedWorkers by remember(registeredUsers) { mutableStateOf(registeredUsers.toSet()) }
+
+    // Date selection mode:
+    // 0 = حتى اليوم (الرصيد الفعلي الحالي)
+    // 1 = نهاية الشهر السابق (تلقائياً)
+    // 2 = تاريخ مخصص
+    var dateMode by remember { mutableIntStateOf(0) }
+
+    // Calculate end of previous month (e.g., in September, gives August 31st at 23:59:59)
+    val lastDayOfPreviousMonthMs = remember {
+        Calendar.getInstance().apply {
+            set(Calendar.DAY_OF_MONTH, 1)
+            add(Calendar.DAY_OF_MONTH, -1)
+            set(Calendar.HOUR_OF_DAY, 23)
+            set(Calendar.MINUTE, 59)
+            set(Calendar.SECOND, 59)
+            set(Calendar.MILLISECOND, 999)
+        }.timeInMillis
+    }
+
+    val prevMonthName = remember {
+        val cal = Calendar.getInstance().apply { timeInMillis = lastDayOfPreviousMonthMs }
+        SimpleDateFormat("MMMM", Locale("ar")).format(cal.time)
+    }
+    val prevMonthDateStr = remember {
+        SimpleDateFormat("yyyy/MM/dd", Locale("ar")).format(Date(lastDayOfPreviousMonthMs))
+    }
+
+    var customDateMs by remember { mutableStateOf(lastDayOfPreviousMonthMs) }
+    var showCustomDatePicker by remember { mutableStateOf(false) }
+
+    val dateSdf = remember { SimpleDateFormat("yyyy/MM/dd", Locale("ar")) }
+
+    val effectiveCutoffMs: Long? = when (dateMode) {
+        0 -> null
+        1 -> lastDayOfPreviousMonthMs
+        2 -> customDateMs
+        else -> null
+    }
+
+    if (showCustomDatePicker) {
+        val cal = Calendar.getInstance().apply { timeInMillis = customDateMs }
+        android.app.DatePickerDialog(
+            context,
+            { _, yr, mo, dy ->
+                val chosenCal = Calendar.getInstance().apply {
+                    set(Calendar.YEAR, yr)
+                    set(Calendar.MONTH, mo)
+                    set(Calendar.DAY_OF_MONTH, dy)
+                    set(Calendar.HOUR_OF_DAY, 23)
+                    set(Calendar.MINUTE, 59)
+                    set(Calendar.SECOND, 59)
+                    set(Calendar.MILLISECOND, 999)
+                }
+                customDateMs = chosenCal.timeInMillis
+                dateMode = 2
+                showCustomDatePicker = false
+            },
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH),
+            cal.get(Calendar.DAY_OF_MONTH)
+        ).apply {
+            setOnCancelListener { showCustomDatePicker = false }
+            show()
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.95f)
+                .fillMaxHeight(0.88f)
+                .padding(vertical = 12.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(20.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF2E7D32).copy(alpha = 0.15f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Print,
+                                contentDescription = null,
+                                tint = Color(0xFF2E7D32),
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                text = "خيارات طباعة كشف الأرصدة",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                            Text(
+                                text = "تخصيص تاريخ الاحتساب والعمال المشمولين",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.textMuted
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(LocalAppColors.current.surface)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "إغلاق",
+                            tint = LocalAppColors.current.textMuted
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+                HorizontalDivider(color = LocalAppColors.current.border)
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Scrollable Content
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    // --- SECTION 1: DATE SELECTION ---
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+                        border = BorderStroke(1.dp, LocalAppColors.current.border)
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CalendarToday,
+                                    contentDescription = null,
+                                    tint = EarnedBlue,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "تاريخ احتساب الأرصدة:",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = LocalAppColors.current.text
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // Option 0: حتى اليوم (الرصيد الفعلي الحالي)
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { dateMode = 0 },
+                                color = if (dateMode == 0) EarnedBlue.copy(alpha = 0.12f) else LocalAppColors.current.bg,
+                                border = BorderStroke(
+                                    width = if (dateMode == 0) 1.5.dp else 1.dp,
+                                    color = if (dateMode == 0) EarnedBlue else LocalAppColors.current.border
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    RadioButton(
+                                        selected = dateMode == 0,
+                                        onClick = { dateMode = 0 },
+                                        colors = RadioButtonDefaults.colors(selectedColor = EarnedBlue)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "حتى اليوم (الرصيد الفعلي الحالي)",
+                                            fontWeight = if (dateMode == 0) FontWeight.Bold else FontWeight.Normal,
+                                            color = LocalAppColors.current.text,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                        Text(
+                                            text = "احتساب جميع الساعات والأيام والعمليات حتى اللحظة",
+                                            color = LocalAppColors.current.textMuted,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Option 1: نهاية الشهر السابق (مثلاً 31/08 لنهاية شهر 8)
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { dateMode = 1 },
+                                color = if (dateMode == 1) Color(0xFF059669).copy(alpha = 0.12f) else LocalAppColors.current.bg,
+                                border = BorderStroke(
+                                    width = if (dateMode == 1) 1.5.dp else 1.dp,
+                                    color = if (dateMode == 1) Color(0xFF059669) else LocalAppColors.current.border
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    RadioButton(
+                                        selected = dateMode == 1,
+                                        onClick = { dateMode = 1 },
+                                        colors = RadioButtonDefaults.colors(selectedColor = Color(0xFF059669))
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "نهاية الشهر السابق ($prevMonthDateStr)",
+                                            fontWeight = if (dateMode == 1) FontWeight.Bold else FontWeight.Normal,
+                                            color = LocalAppColors.current.text,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                        Text(
+                                            text = "مطابقة كشف صاحب الشغل لنهاية شهر $prevMonthName",
+                                            color = LocalAppColors.current.textMuted,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Option 2: تاريخ مخصص يحدده المستخدم
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        dateMode = 2
+                                        showCustomDatePicker = true
+                                    },
+                                color = if (dateMode == 2) Color(0xFFD97706).copy(alpha = 0.12f) else LocalAppColors.current.bg,
+                                border = BorderStroke(
+                                    width = if (dateMode == 2) 1.5.dp else 1.dp,
+                                    color = if (dateMode == 2) Color(0xFFD97706) else LocalAppColors.current.border
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    RadioButton(
+                                        selected = dateMode == 2,
+                                        onClick = {
+                                            dateMode = 2
+                                            showCustomDatePicker = true
+                                        },
+                                        colors = RadioButtonDefaults.colors(selectedColor = Color(0xFFD97706))
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "تحديد تاريخ كشف مخصص 📅",
+                                            fontWeight = if (dateMode == 2) FontWeight.Bold else FontWeight.Normal,
+                                            color = LocalAppColors.current.text,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                        Text(
+                                            text = if (dateMode == 2) "التاريخ المعتمد: ${dateSdf.format(Date(customDateMs))}" else "اختر أي تاريخ كشف تريده (مثلاً 31/08)",
+                                            color = if (dateMode == 2) Color(0xFFD97706) else LocalAppColors.current.textMuted,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = if (dateMode == 2) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    }
+                                    FilledTonalButton(
+                                        onClick = {
+                                            dateMode = 2
+                                            showCustomDatePicker = true
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("تغيير 📅", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+
+                            // Notice Banner
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = LocalAppColors.current.bg,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Info,
+                                        contentDescription = null,
+                                        tint = if (effectiveCutoffMs != null) Color(0xFF059669) else EarnedBlue,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (effectiveCutoffMs != null) {
+                                            "⏳ سيتم احتساب الأرصدة وساعات العمل والمسحوبات حتى نهاية يوم ${dateSdf.format(Date(effectiveCutoffMs))} فقط."
+                                        } else {
+                                            "⏳ سيتم احتساب الأرصدة الفعلية حتى تاريخ ولحظة اليوم."
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = LocalAppColors.current.text
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // --- SECTION 2: WORKERS SELECTION ---
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+                        border = BorderStroke(1.dp, LocalAppColors.current.border)
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.People,
+                                        contentDescription = null,
+                                        tint = EmeraldGreen,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "تحديد العمال المشمولين (${selectedWorkers.size} من ${registeredUsers.size}):",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = LocalAppColors.current.text
+                                    )
+                                }
+
+                                TextButton(
+                                    onClick = {
+                                        selectedWorkers = if (selectedWorkers.size == registeredUsers.size) {
+                                            emptySet()
+                                        } else {
+                                            registeredUsers.toSet()
+                                        }
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = if (selectedWorkers.size == registeredUsers.size) "إلغاء التحديد" else "تحديد الكل",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = EmeraldGreen,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Workers List
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                registeredUsers.forEach { workerName ->
+                                    val isSelected = selectedWorkers.contains(workerName)
+                                    val isCurrentActive = workerName == activeUser
+
+                                    Surface(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .clickable {
+                                                selectedWorkers = if (isSelected) {
+                                                    selectedWorkers - workerName
+                                                } else {
+                                                    selectedWorkers + workerName
+                                                }
+                                            },
+                                        color = if (isSelected) EmeraldGreen.copy(alpha = 0.08f) else LocalAppColors.current.bg,
+                                        border = BorderStroke(
+                                            width = if (isSelected) 1.2.dp else 1.dp,
+                                            color = if (isSelected) EmeraldGreen.copy(alpha = 0.6f) else LocalAppColors.current.border
+                                        ),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Checkbox(
+                                                checked = isSelected,
+                                                onCheckedChange = { checked ->
+                                                    selectedWorkers = if (checked) {
+                                                        selectedWorkers + workerName
+                                                    } else {
+                                                        selectedWorkers - workerName
+                                                    }
+                                                },
+                                                colors = CheckboxDefaults.colors(checkedColor = EmeraldGreen)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Icon(
+                                                imageVector = Icons.Default.Person,
+                                                contentDescription = null,
+                                                tint = if (isSelected) EmeraldGreen else LocalAppColors.current.textMuted,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = workerName,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = LocalAppColors.current.text,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            if (isCurrentActive) {
+                                                Surface(
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    color = EmeraldGreen.copy(alpha = 0.15f)
+                                                ) {
+                                                    Text(
+                                                        text = "الحساب الحالي",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = EmeraldGreen,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (selectedWorkers.isEmpty()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "⚠️ يجب تحديد عامل واحد على الأقل لطباعة الكشف",
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+                HorizontalDivider(color = LocalAppColors.current.border)
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Action Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("إلغاء", color = LocalAppColors.current.text)
+                    }
+
+                    Button(
+                        onClick = {
+                            if (selectedWorkers.isNotEmpty()) {
+                                onConfirmPrint(effectiveCutoffMs, selectedWorkers)
+                            }
+                        },
+                        enabled = selectedWorkers.isNotEmpty(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF2E7D32),
+                            disabledContainerColor = LocalAppColors.current.border
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(2f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Print,
+                            contentDescription = null,
+                            tint = Color.White
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (selectedWorkers.isEmpty()) "حدد عمال للطباعة" else "📄 طباعة (${selectedWorkers.size} عمال)",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
 fun WelcomeLoginScreen(
     registeredUsers: List<String>,
-    onLogin: (String) -> Unit,
-    onRegister: (String, Double, Long, String, Double, Boolean, Int, Int, Double) -> Unit,
+    alwaysOpenDefaultAccount: Boolean = false,
+    onToggleAlwaysOpen: ((Boolean, String?) -> Unit)? = null,
+    onLogin: (String, Boolean) -> Unit,
+    onRegister: (String, Double, Long, String, Double, Boolean, Int, Int, Double, Boolean) -> Unit,
     onDeleteUser: (String) -> Unit,
     onPrintBalancesReport: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    var rememberChoice by remember(alwaysOpenDefaultAccount) { mutableStateOf(alwaysOpenDefaultAccount) }
     var nameInput by remember { mutableStateOf("") }
     var salaryInput by remember { mutableStateOf("") }
     var currencyInput by remember { mutableStateOf("ريال يمني") }
     var standardSpendingInput by remember { mutableStateOf("2000") }
+    var isOpeningBalanceCredit by remember { mutableStateOf(true) }
     var openingBalanceInput by remember { mutableStateOf("0") }
     
     var dailyReminderEnabled by remember { mutableStateOf(true) }
@@ -5261,6 +6184,7 @@ fun WelcomeLoginScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .background(LocalAppColors.current.bg, RoundedCornerShape(12.dp))
+                                    .clickable { onLogin(user, rememberChoice) }
                                     .padding(horizontal = 12.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.SpaceBetween
@@ -5281,7 +6205,7 @@ fun WelcomeLoginScreen(
 
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                     Button(
-                                        onClick = { onLogin(user) },
+                                        onClick = { onLogin(user, rememberChoice) },
                                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
                                         shape = RoundedCornerShape(10.dp),
                                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
@@ -5292,6 +6216,51 @@ fun WelcomeLoginScreen(
                                     IconButton(onClick = { onDeleteUser(user) }) {
                                         Icon(imageVector = Icons.Default.Delete, contentDescription = "حذف العامل", tint = CrimsonRed)
                                     }
+                                }
+                            }
+                        }
+
+                        HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { rememberChoice = !rememberChoice },
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (rememberChoice) EmeraldGreen.copy(alpha = 0.12f) else LocalAppColors.current.bg
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, if (rememberChoice) EmeraldGreen else LocalAppColors.current.border)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Switch(
+                                    checked = rememberChoice,
+                                    onCheckedChange = { rememberChoice = it },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = Color.White,
+                                        checkedTrackColor = EmeraldGreen
+                                    )
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "تحديد كحساب دائم (الدخول به دائماً)",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = LocalAppColors.current.text
+                                    )
+                                    Text(
+                                        text = if (rememberChoice)
+                                            "سيتم فتح الحساب المختار تلقائياً في كل مرة تفتح فيها التطبيق دون إظهار هذه القائمة."
+                                            else "ستظهر هذه القائمة لاختيار الحساب في كل مرة تفتح فيها التطبيق.",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (rememberChoice) EmeraldGreen else LocalAppColors.current.textMuted
+                                    )
                                 }
                             }
                         }
@@ -5436,10 +6405,35 @@ fun WelcomeLoginScreen(
 
                     // Opening Balance / Previous Balance
                     Text(
-                        text = "رصيد سابق / حساب مستحق لك (رصيد افتتاحي):",
+                        text = "رصيد سابق / حساب افتتاحي (حالة الرصيد القديم):",
                         style = MaterialTheme.typography.bodyMedium,
                         color = LocalAppColors.current.textSub
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = isOpeningBalanceCredit,
+                            onClick = { isOpeningBalanceCredit = true },
+                            label = { Text("له دائن (+)", fontWeight = if (isOpeningBalanceCredit) FontWeight.Bold else FontWeight.Normal) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = EmeraldGreen,
+                                selectedLabelColor = Color.White
+                            ),
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChip(
+                            selected = !isOpeningBalanceCredit,
+                            onClick = { isOpeningBalanceCredit = false },
+                            label = { Text("عليه سلف/مدين (-)", fontWeight = if (!isOpeningBalanceCredit) FontWeight.Bold else FontWeight.Normal) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = CrimsonRed,
+                                selectedLabelColor = Color.White
+                            ),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                     OutlinedTextField(
                         value = openingBalanceInput,
                         onValueChange = { openingBalanceInput = it },
@@ -5449,7 +6443,7 @@ fun WelcomeLoginScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EmeraldGreen,
+                            focusedBorderColor = if (isOpeningBalanceCredit) EmeraldGreen else CrimsonRed,
                             unfocusedBorderColor = LocalAppColors.current.border,
                             focusedTextColor = LocalAppColors.current.text,
                             unfocusedTextColor = LocalAppColors.current.text
@@ -5556,7 +6550,8 @@ fun WelcomeLoginScreen(
                         val salary = salaryInput.toDoubleOrNull() ?: 0.0
                         val standardSpending = standardSpendingInput.toDoubleOrNull() ?: 2000.0
                         val currency = if (currencyInput.isBlank()) "ريال يمني" else currencyInput.trim()
-                        val openingBalance = openingBalanceInput.toDoubleOrNull() ?: 0.0
+                        val rawOpBal = openingBalanceInput.toDoubleOrNull() ?: 0.0
+                        val openingBalance = if (isOpeningBalanceCredit) Math.abs(rawOpBal) else -Math.abs(rawOpBal)
                         
                         onRegister(
                             nameInput.trim(),
@@ -5567,7 +6562,8 @@ fun WelcomeLoginScreen(
                             dailyReminderEnabled,
                             dailyReminderHour,
                             dailyReminderMinute,
-                            openingBalance
+                            openingBalance,
+                            rememberChoice
                         )
                     }
                 },
@@ -5860,7 +6856,8 @@ fun MainMenuDialog(
     onOpenDeveloperInfo: () -> Unit,
     onSwitchWorker: () -> Unit = {},
     onPrintBalancesReport: () -> Unit = {},
-    onSettleAccount: () -> Unit = {}
+    onSettleAccount: () -> Unit = {},
+    onManageLeaves: () -> Unit = {}
 ) {
     val appLang = AppLanguage.fromCode(appLanguage)
     val strings = LanguageStrings(appLang)
@@ -6019,6 +7016,14 @@ fun MainMenuDialog(
                                 icon = Icons.Default.Group,
                                 color = Color(0xFF00897B),
                                 onClick = { dismissWithAnimation(); onSwitchWorker() }
+                            )
+                            HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
+                            MenuOptionCard(
+                                title = "🏖️ إدارة وسجل الإجازات",
+                                subtitle = "تسجيل إجازة مفتوحة أو محددة وإيقاف المستحقات والصرفيات",
+                                icon = Icons.Default.BeachAccess,
+                                color = AmberOrange,
+                                onClick = { dismissWithAnimation(); onManageLeaves() }
                             )
                             HorizontalDivider(color = LocalAppColors.current.border.copy(alpha = 0.35f), thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 14.dp))
                             MenuOptionCard(
@@ -7354,5 +8359,562 @@ fun SalaryHistoryDialog(
             setOnCancelListener { showDatePicker = false }
             show()
         }
+    }
+}
+
+@Composable
+fun LeaveManagementDialog(
+    leaves: List<LeaveRecord>,
+    currency: String,
+    onAddLeave: (startDate: Long, endDate: Long?, reason: String) -> Unit,
+    onEndOngoingLeave: (leaveId: Int, endDate: Long) -> Unit,
+    onDeleteLeave: (leaveId: Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val sdf = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+
+    var startDateMs by remember {
+        mutableStateOf(Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis)
+    }
+
+    var isOngoing by remember { mutableStateOf(false) }
+
+    var endDateMs by remember {
+        mutableStateOf(Calendar.getInstance().apply {
+            add(Calendar.DAY_OF_YEAR, 7)
+            set(Calendar.HOUR_OF_DAY, 23)
+            set(Calendar.MINUTE, 59)
+            set(Calendar.SECOND, 59)
+            set(Calendar.MILLISECOND, 999)
+        }.timeInMillis)
+    }
+
+    var reasonText by remember { mutableStateOf("سفر") }
+
+    var showStartDatePicker by remember { mutableStateOf(false) }
+    var showEndDatePicker by remember { mutableStateOf(false) }
+    var leaveToDeleteId by remember { mutableStateOf<Int?>(null) }
+    var activeTab by remember { mutableStateOf(0) } // 0 = Add new leave, 1 = History
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp),
+            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .background(AmberOrange.copy(alpha = 0.2f), shape = CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.BeachAccess,
+                                contentDescription = null,
+                                tint = AmberOrange,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = "🏖️ إدارة وسجل الإجازات",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = LocalAppColors.current.text
+                            )
+                            Text(
+                                text = "تحديد أوقات الإجازة وإيقاف الرواتب التلقائية",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = LocalAppColors.current.textSub
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "إغلاق",
+                            tint = LocalAppColors.current.textSub
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = LocalAppColors.current.border, thickness = 1.dp)
+
+                // Tab Switcher (إضافة إجازة / سجل الإجازات)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(LocalAppColors.current.bg, RoundedCornerShape(12.dp))
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Button(
+                        onClick = { activeTab = 0 },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (activeTab == 0) EmeraldGreen else Color.Transparent
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "➕ تسجيل إجازة",
+                            fontWeight = FontWeight.Bold,
+                            color = if (activeTab == 0) Color.White else LocalAppColors.current.textSub,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+
+                    Button(
+                        onClick = { activeTab = 1 },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (activeTab == 1) AmberOrange else Color.Transparent
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "📋 السجل (${leaves.size})",
+                            fontWeight = FontWeight.Bold,
+                            color = if (activeTab == 1) Color.White else LocalAppColors.current.textSub,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                if (activeTab == 0) {
+                    // --- TAB 0: ADD NEW LEAVE FORM ---
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(LocalAppColors.current.bg, RoundedCornerShape(16.dp))
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "تحديد تاريخ بدء الإجازة ونوعها:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = LocalAppColors.current.text
+                        )
+
+                        // Start Date Selector
+                        OutlinedCard(
+                            onClick = { showStartDatePicker = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.outlinedCardColors(containerColor = LocalAppColors.current.surface),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Event,
+                                        contentDescription = null,
+                                        tint = EmeraldGreen,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text("تاريخ بدء الإجازة:", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                                }
+                                Text(
+                                    text = sdf.format(Date(startDateMs)),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = EmeraldGreen
+                                )
+                            }
+                        }
+
+                        // Ongoing Leave Switch (عدها لم تنتهي بعد / مفتوحة)
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (isOngoing) AmberOrange.copy(alpha = 0.12f) else LocalAppColors.current.surface
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, if (isOngoing) AmberOrange else LocalAppColors.current.border)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "إجازة مفتوحة (عدها لم تنتهي بعد)",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = LocalAppColors.current.text
+                                    )
+                                    Text(
+                                        text = if (isOngoing) "الإجازة مستمرة وسارية حتى عودة العامل واستئناف العمل" else "تحديد موعد انتهاء محدد للإجازة",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = LocalAppColors.current.textSub
+                                    )
+                                }
+                                Switch(
+                                    checked = isOngoing,
+                                    onCheckedChange = { isOngoing = it },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AmberOrange, checkedTrackColor = AmberOrange.copy(alpha = 0.5f))
+                                )
+                            }
+                        }
+
+                        // End Date Selector (if not ongoing)
+                        if (!isOngoing) {
+                            OutlinedCard(
+                                onClick = { showEndDatePicker = true },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.outlinedCardColors(containerColor = LocalAppColors.current.surface),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.EventAvailable,
+                                            contentDescription = null,
+                                            tint = EarnedBlue,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Text("تاريخ انتهاء الإجازة:", style = MaterialTheme.typography.bodySmall, color = LocalAppColors.current.textSub)
+                                    }
+                                    Text(
+                                        text = sdf.format(Date(endDateMs)),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = EarnedBlue
+                                    )
+                                }
+                            }
+                        }
+
+                        // Reason / Note
+                        OutlinedTextField(
+                            value = reasonText,
+                            onValueChange = { reasonText = it },
+                            label = { Text("سبب الإجازة أو ملاحظة (سفر، عيد، خاصة)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            singleLine = true
+                        )
+
+                        // Accounting explanation note
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.surface),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, LocalAppColors.current.border)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "💡 معلومات الحساب أثناء الإجازة:",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = EmeraldGreen
+                                )
+                                Text(
+                                    text = "• يتوقف تراكم الأجر اليومي تماماً في أيام الإجازة.\n• تتوقف الصرفيات التلقائية.\n• إذا استلم صرفة يوم سفره أو حولت له سحبية، يمكنك إضافتها وستخصم من رصيده بصورة طبيعية دون احتساب أجر عمل.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = LocalAppColors.current.textSub,
+                                    lineHeight = MaterialTheme.typography.bodySmall.lineHeight
+                                )
+                            }
+                        }
+
+                        // Save Button
+                        Button(
+                            onClick = {
+                                if (!isOngoing && endDateMs < startDateMs) {
+                                    Toast.makeText(context, "تاريخ الانتهاء يجب أن يكون بعد تاريخ البدء", Toast.LENGTH_SHORT).show()
+                                    return@Button
+                                }
+                                onAddLeave(
+                                    startDateMs,
+                                    if (isOngoing) null else endDateMs,
+                                    reasonText
+                                )
+                                activeTab = 1
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "حفظ وتسجيل الإجازة 💾",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                } else {
+                    // --- TAB 1: LEAVE HISTORY ---
+                    if (leaves.isEmpty()) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = LocalAppColors.current.bg),
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text("🏖️", style = MaterialTheme.typography.headlineMedium)
+                                Text(
+                                    text = "لا توجد إجازات مسجلة لهذا العامل",
+                                    fontWeight = FontWeight.Bold,
+                                    color = LocalAppColors.current.text,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = "اضغط على زر (تسجيل إجازة) بالأعلى لإضافة إجازة جديدة.",
+                                    color = LocalAppColors.current.textSub,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            leaves.forEach { leave ->
+                                val isCurrentlyOpen = leave.endDate == null
+                                val daysCount = LeaveUtils.calculateLeaveDays(leave)
+
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (isCurrentlyOpen) AmberOrange.copy(alpha = 0.12f) else LocalAppColors.current.bg
+                                    ),
+                                    shape = RoundedCornerShape(14.dp),
+                                    border = BorderStroke(1.dp, if (isCurrentlyOpen) AmberOrange else LocalAppColors.current.border)
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(8.dp)
+                                                        .background(if (isCurrentlyOpen) EmeraldGreen else Color.Gray, CircleShape)
+                                                )
+                                                Text(
+                                                    text = if (isCurrentlyOpen) "🟢 إجازة جارية حالياً (مفتوحة)" else "⚪ إجازة منتهية",
+                                                    fontWeight = FontWeight.Bold,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = if (isCurrentlyOpen) EmeraldGreen else LocalAppColors.current.textSub
+                                                )
+                                            }
+
+                                            IconButton(
+                                                onClick = { leaveToDeleteId = leave.id },
+                                                modifier = Modifier.size(28.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Delete,
+                                                    contentDescription = "حذف الإجازة",
+                                                    tint = CrimsonRed,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                        }
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column {
+                                                Text(
+                                                    text = "من: ${sdf.format(Date(leave.startDate))} ${if (leave.endDate != null) "إلى: " + sdf.format(Date(leave.endDate)) else "(مستمرة حتى الآن)"}",
+                                                    fontWeight = FontWeight.Bold,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = LocalAppColors.current.text
+                                                )
+                                                Text(
+                                                    text = "المدة: $daysCount يوم ${if (leave.reason.isNotBlank()) "• " + leave.reason else ""}",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = LocalAppColors.current.textSub
+                                                )
+                                            }
+                                        }
+
+                                        if (isCurrentlyOpen) {
+                                            Button(
+                                                onClick = {
+                                                    onEndOngoingLeave(leave.id, System.currentTimeMillis())
+                                                    Toast.makeText(context, "تم إنهاء الإجازة واعتماد تاريخ اليوم كآخر يوم", Toast.LENGTH_SHORT).show()
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen),
+                                                shape = RoundedCornerShape(10.dp),
+                                                modifier = Modifier.fillMaxWidth(),
+                                                contentPadding = PaddingValues(vertical = 6.dp)
+                                            ) {
+                                                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(Modifier.width(6.dp))
+                                                Text(
+                                                    text = "إنهاء الإجازة والعودة للعمل اليوم ◀️",
+                                                    color = Color.White,
+                                                    fontWeight = FontWeight.Bold,
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Close Button
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(containerColor = LocalAppColors.current.border),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("إغلاق", color = LocalAppColors.current.text, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+
+    // Start Date Picker Dialog
+    if (showStartDatePicker) {
+        val cal = Calendar.getInstance().apply { timeInMillis = startDateMs }
+        android.app.DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                val newCal = Calendar.getInstance().apply {
+                    set(year, month, dayOfMonth, 0, 0, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                startDateMs = newCal.timeInMillis
+                showStartDatePicker = false
+            },
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH),
+            cal.get(Calendar.DAY_OF_MONTH)
+        ).apply {
+            setOnCancelListener { showStartDatePicker = false }
+            show()
+        }
+    }
+
+    // End Date Picker Dialog
+    if (showEndDatePicker) {
+        val cal = Calendar.getInstance().apply { timeInMillis = endDateMs }
+        android.app.DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                val newCal = Calendar.getInstance().apply {
+                    set(year, month, dayOfMonth, 23, 59, 59)
+                    set(Calendar.MILLISECOND, 999)
+                }
+                endDateMs = newCal.timeInMillis
+                showEndDatePicker = false
+            },
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH),
+            cal.get(Calendar.DAY_OF_MONTH)
+        ).apply {
+            setOnCancelListener { showEndDatePicker = false }
+            show()
+        }
+    }
+
+    // Delete Confirmation Dialog
+    if (leaveToDeleteId != null) {
+        AlertDialog(
+            onDismissRequest = { leaveToDeleteId = null },
+            title = { Text("تأكيد حذف الإجازة", fontWeight = FontWeight.Bold) },
+            text = { Text("هل أنت متأكد من حذف فترة الإجازة هذه؟ سيتم استئناف احتساب الأيام التابعة لها كأيام عمل.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        leaveToDeleteId?.let { onDeleteLeave(it) }
+                        leaveToDeleteId = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = CrimsonRed)
+                ) {
+                    Text("حذف", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { leaveToDeleteId = null }) {
+                    Text("إلغاء", color = LocalAppColors.current.textSub)
+                }
+            }
+        )
     }
 }

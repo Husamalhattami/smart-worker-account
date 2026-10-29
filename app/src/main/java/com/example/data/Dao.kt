@@ -74,3 +74,27 @@ interface SalaryHistoryDao {
     @Query("DELETE FROM salary_histories")
     suspend fun deleteAllSalaryHistories()
 }
+
+@Dao
+interface LeaveDao {
+    @Query("SELECT * FROM leave_records ORDER BY startDate DESC")
+    fun getAllLeaves(): Flow<List<LeaveRecord>>
+
+    @Query("SELECT * FROM leave_records ORDER BY startDate DESC")
+    suspend fun getAllLeavesDirect(): List<LeaveRecord>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertLeave(leave: LeaveRecord)
+
+    @Update
+    suspend fun updateLeave(leave: LeaveRecord)
+
+    @Delete
+    suspend fun deleteLeave(leave: LeaveRecord)
+
+    @Query("DELETE FROM leave_records WHERE id = :id")
+    suspend fun deleteLeaveById(id: Int)
+
+    @Query("DELETE FROM leave_records")
+    suspend fun deleteAllLeaves()
+}
