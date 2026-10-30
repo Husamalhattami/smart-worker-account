@@ -45,6 +45,7 @@ import com.google.android.gms.ads.AdView
 import com.google.android.gms.ads.FullScreenContentCallback
 import com.google.android.gms.ads.LoadAdError
 import com.google.android.gms.ads.MobileAds
+import com.google.android.gms.ads.RequestConfiguration
 import com.google.android.gms.ads.interstitial.InterstitialAd
 import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
 
@@ -86,13 +87,19 @@ object AdMobManager {
      */
     fun init(context: Context) {
         try {
+            // تسجيل معرفات أجهزة الاختبار لضمان توفير إعلانات الاختبار في المحاكي ومنع خطأ No Fill
+            val requestConfiguration = RequestConfiguration.Builder()
+                .setTestDeviceIds(listOf(AdRequest.DEVICE_ID_EMULATOR))
+                .build()
+            MobileAds.setRequestConfiguration(requestConfiguration)
+
             MobileAds.initialize(context) { initializationStatus ->
                 Log.d("AdMobManager", "AdMob Initialized: $initializationStatus")
                 // تحميل الإعلان البيني فور اكتمال التهيئة
                 loadInterstitial(context.applicationContext)
             }
         } catch (e: Exception) {
-            Log.e("AdMobManager", "Error initializing AdMob: ${e.message}", e)
+            Log.w("AdMobManager", "Notice during AdMob initialization: ${e.message}")
         }
     }
 
@@ -117,19 +124,19 @@ object AdMobManager {
                 adRequest,
                 object : InterstitialAdLoadCallback() {
                     override fun onAdLoaded(ad: InterstitialAd) {
-                        Log.d("AdMobManager", "INTERSTITIAL_LOADED")
-                        Log.d("AdMobManager", "Interstitial Ad Loaded successfully with unit: $adUnitToUse")
+                        Log.d("AdMobManager", "INTERSTITIAL_LOADED: Interstitial Ad Loaded successfully with unit: $adUnitToUse")
                         interstitialAd = ad
                         isLoadingInterstitial = false
                     }
 
                     override fun onAdFailedToLoad(error: LoadAdError) {
-                        Log.e("AdMobManager", "INTERSTITIAL_LOAD_FAILED Code: ${error.code}, Message: ${error.message}")
+                        // عدم توفر مخزون إعلاني (Code 3: No fill) هو سلوك طبيعي لشبكات الإعلانات ولا يعتبر انهياراً في التطبيق
+                        Log.w("AdMobManager", "Interstitial Ad notice: Code ${error.code}, Message: ${error.message}")
                         interstitialAd = null
                         isLoadingInterstitial = false
                         
-                        // إذا فشل الإعلان، نحاول باستخدام معرف الاختبار الإضافي إذا لم نكن نستخدمه
-                        if (!useTestIdFallback) {
+                        // إذا فشل الإعلان وكان المعرف المستخدم مختلفاً عن معرف الاختبار، نحاول بمعرف الاختبار
+                        if (!useTestIdFallback && adUnitToUse != AdMobIds.TEST_INTERSTITIAL_ID) {
                             Log.d("AdMobManager", "Retrying Interstitial load with Google Test ID...")
                             loadInterstitial(context, useTestIdFallback = true)
                         }
@@ -137,7 +144,7 @@ object AdMobManager {
                 }
             )
         } catch (e: Exception) {
-            Log.e("AdMobManager", "INTERSTITIAL_LOAD_FAILED Exception: ${e.message}", e)
+            Log.w("AdMobManager", "Notice on Interstitial load: ${e.message}")
             isLoadingInterstitial = false
         }
     }
@@ -169,7 +176,7 @@ object AdMobManager {
                     }
 
                     override fun onAdFailedToShowFullScreenContent(error: AdError) {
-                        Log.e("AdMobManager", "INTERSTITIAL_LOAD_FAILED Code: ${error.code}, Message: ${error.message}")
+                        Log.w("AdMobManager", "Notice on showing interstitial: Code ${error.code}, Message: ${error.message}")
                         Log.d("AdMobManager", "INTERSTITIAL_DISMISSED")
                         interstitialAd = null
                         loadInterstitial(activity)
@@ -185,7 +192,7 @@ object AdMobManager {
                 onAdClosed()
             }
         } catch (e: Exception) {
-            Log.e("AdMobManager", "INTERSTITIAL_NOT_READY - Exception: ${e.message}", e)
+            Log.w("AdMobManager", "Notice on Interstitial show: ${e.message}")
             onAdClosed()
         }
     }
@@ -266,7 +273,7 @@ fun AdMobBanner(
                                     isAdLoaded = true
                                 }
                                 override fun onAdFailedToLoad(error: LoadAdError) {
-                                    Log.e("AdMobBanner", "Failed to load banner ($currentAdUnit): ${error.message}")
+                                    Log.w("AdMobBanner", "Banner ad notice ($currentAdUnit): Code ${error.code}, Message: ${error.message}")
                                     if (currentAdUnit != AdMobIds.TEST_BANNER_ID) {
                                         currentAdUnit = AdMobIds.TEST_BANNER_ID
                                         this@apply.adUnitId = currentAdUnit

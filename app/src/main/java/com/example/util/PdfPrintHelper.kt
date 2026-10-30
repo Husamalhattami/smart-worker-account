@@ -218,8 +218,7 @@ object PdfPrintHelper {
         }
 
         // Determine effective work period bounds
-        val firstTxMs = transactions.minOfOrNull { it.timestamp } ?: settings.startWorkDate
-        val activeStartBound = minOf(settings.startWorkDate, firstTxMs, openingTx?.timestamp ?: settings.startWorkDate)
+        val activeStartBound = settings.startWorkDate
         val effectiveWorkStart = Calendar.getInstance().apply {
             timeInMillis = activeStartBound
             set(Calendar.HOUR_OF_DAY, 0)

@@ -7948,7 +7948,7 @@ fun AppUpdateDialog(
                                 textAlign = TextAlign.Center
                             )
                             Text(
-                                text = "لا توجد تحديثات جديدة متاحة حالياً.\nإصدارك الحالي: v1.3.0",
+                                text = "لا توجد تحديثات جديدة متاحة حالياً.\nإصدارك الحالي: v1.3.1",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = LocalAppColors.current.textSub,
                                 textAlign = TextAlign.Center
@@ -8049,7 +8049,7 @@ fun DeveloperInfoDialog(
                         horizontalAlignment = Alignment.Start
                     ) {
                         Text(
-                            text = "📱 تطبيق حساب العامل الذكي v1.3.0",
+                            text = "📱 تطبيق حساب العامل الذكي v1.3.1",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = EmeraldGreen

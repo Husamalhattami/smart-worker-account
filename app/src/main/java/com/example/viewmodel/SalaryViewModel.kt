@@ -457,6 +457,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         val result = mutableListOf<WorkerBalanceItem>()
+        val effectiveCutoff = cutoffDateMs ?: System.currentTimeMillis()
+
         for (userName in userList) {
             try {
                 val uDb = AppDatabase.getDatabaseForUser(getApplication(), userName)
@@ -467,16 +469,17 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         uDb.salaryDao().insertOrUpdateSalarySettings(uSettings.copy(employeeName = userName))
                     } catch (_: Exception) {}
                 }
+
+                // مزامنة الصرفيات التلقائية اليومية لهذا العامل أولاً قبل احتساب الرصيد لمنع أي فروقات في الصرفة اليومية
+                if (uSettings.autoAddDailySpending && uSettings.standardSpendingAmount > 0) {
+                    syncAutoDailySpendingsForWorker(userName, uDb, uSettings)
+                }
+
                 val txList = uDb.transactionDao().getAllTransactionsDirect()
                 val histories = uDb.salaryHistoryDao().getAllSalaryHistoriesDirect()
                 val leaves = uDb.leaveDao().getAllLeavesDirect()
 
-                val balance = if (cutoffDateMs == null) {
-                    val m = calculateSalaryMetrics(uSettings, txList, histories, leaves)
-                    m.netBalance
-                } else {
-                    calculateWorkerBalanceAtCutoff(uSettings, txList, histories, leaves, cutoffDateMs)
-                }
+                val balance = calculateWorkerBalanceAtCutoff(uSettings, txList, histories, leaves, effectiveCutoff)
 
                 val curr = if (uSettings.currency.isBlank()) "ريال" else uSettings.currency
                 val status = when {
@@ -526,7 +529,6 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
         val openingTx = txList.firstOrNull { it.type == "OPENING_BALANCE" }
         val initialOpeningAmount = openingTx?.amount ?: settings.openingBalance
-        val initialStartDateMs = openingTx?.timestamp ?: settings.startWorkDate
 
         // Did any SETTLEMENT happen on or before cutoffEndOfDayMs?
         val priorSettlement = txList.filter { it.type == "SETTLEMENT" && it.timestamp <= cutoffEndOfDayMs }
@@ -543,10 +545,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
             }.timeInMillis
             Pair(priorSettlement.amount, nextDayMs)
         } else {
-            val firstTxMs = txList.minOfOrNull { it.timestamp } ?: settings.startWorkDate
-            val workStartMs = minOf(settings.startWorkDate, firstTxMs, initialStartDateMs)
             val startCal = Calendar.getInstance().apply {
-                timeInMillis = workStartMs
+                timeInMillis = settings.startWorkDate
                 set(Calendar.HOUR_OF_DAY, 0)
                 set(Calendar.MINUTE, 0)
                 set(Calendar.SECOND, 0)
@@ -674,7 +674,11 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
         
         val diffInMillis = calNowMidnight.timeInMillis - calStartMidnight.timeInMillis
         val diffInDays = (diffInMillis / (1000 * 60 * 60 * 24)).toInt()
-        val elapsedDays = if (settings.stopWorkDate != null) maxOf(0, diffInDays + 1) else maxOf(0, diffInDays)
+        val elapsedDays = if (calStartMidnight.timeInMillis > calNowMidnight.timeInMillis) {
+            0
+        } else {
+            diffInDays + 1
+        }
 
         // Calculate gross earned day-by-day based on active SalaryHistory for each day, excluding leave days
         var grossEarned = 0.0
@@ -1538,74 +1542,112 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
 
     private val autoAddMutex = Mutex()
 
+    suspend fun syncAutoDailySpendingsForWorker(
+        workerName: String,
+        uDb: AppDatabase,
+        settings: SalarySettings
+    ) = withContext(Dispatchers.IO) {
+        if (!settings.autoAddDailySpending || settings.standardSpendingAmount <= 0) return@withContext
+        autoAddMutex.withLock {
+            try {
+                val txList = uDb.transactionDao().getAllTransactionsDirect()
+                val leaves = uDb.leaveDao().getAllLeavesDirect()
+                val deletedDatesSet = getDeletedSpendingDates(workerName)
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+                
+                // إذا تم تقفيل/تصفية حساب سابق، تبدأ الصرفة التلقائية من اليوم التالي للتصفية
+                val priorSettlement = txList.filter { it.type == "SETTLEMENT" }.maxByOrNull { it.timestamp }
+                val effectiveStartMs = if (priorSettlement != null) {
+                    Calendar.getInstance().apply {
+                        timeInMillis = priorSettlement.timestamp
+                        add(Calendar.DAY_OF_YEAR, 1)
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                } else {
+                    settings.startWorkDate
+                }
+
+                val calStart = Calendar.getInstance().apply {
+                    timeInMillis = effectiveStartMs
+                    set(Calendar.HOUR_OF_DAY, 0)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                
+                val calToday = Calendar.getInstance().apply {
+                    set(Calendar.HOUR_OF_DAY, 0)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+
+                val maxAllowedCal = settings.stopWorkDate?.let { stopMs ->
+                    Calendar.getInstance().apply {
+                        timeInMillis = stopMs
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                }
+                val targetEndCal = if (maxAllowedCal != null && maxAllowedCal.before(calToday)) maxAllowedCal else calToday
+                
+                val existingSpendingDays = txList.filter { it.type == "SPENDING" }.map { tx ->
+                    Calendar.getInstance().apply {
+                        timeInMillis = tx.timestamp
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                }.toSet()
+
+                val listToInsert = mutableListOf<Transaction>()
+                val daysLimit = 180
+                var daysAdded = 0
+                
+                while (!calStart.after(targetEndCal) && daysAdded < daysLimit) {
+                    val dayMidnight = calStart.timeInMillis
+                    val dateStr = dateFormat.format(calStart.time)
+                    val inLeave = LeaveUtils.isDayInLeave(dayMidnight, leaves)
+                    if (!inLeave && !existingSpendingDays.contains(dayMidnight) && !deletedDatesSet.contains(dateStr)) {
+                        listToInsert.add(
+                            Transaction(
+                                type = "SPENDING",
+                                amount = settings.standardSpendingAmount,
+                                timestamp = dayMidnight + 12 * 60 * 60 * 1000, // ظهراً
+                                voiceText = "صرفة يومية تلقائية 🤖"
+                            )
+                        )
+                    }
+                    calStart.add(Calendar.DAY_OF_YEAR, 1)
+                    daysAdded++
+                }
+
+                if (listToInsert.isNotEmpty()) {
+                    for (tx in listToInsert) {
+                        uDb.transactionDao().insertTransaction(tx)
+                    }
+                    if (workerName == activeUser.value && settings.voiceEnabled) {
+                        speakOutText("تمت إضافة الصرفيات التلقائية المتأخرة")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("SalaryViewModel", "Error auto-adding spendings for $workerName", e)
+            }
+        }
+    }
+
     private fun autoAddDailySpendingsIfEnabled(settings: SalarySettings) {
         viewModelScope.launch(Dispatchers.IO) {
-            autoAddMutex.withLock {
-                try {
-                    val txList = repository.getAllTransactionsDirect()
-                    val leaves = repository.getAllLeavesDirect()
-                    val currentUser = activeUser.value
-                    val deletedDatesSet = getDeletedSpendingDates(currentUser)
-                    val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
-                    
-                    val calStart = Calendar.getInstance().apply {
-                        timeInMillis = settings.startWorkDate
-                        set(Calendar.HOUR_OF_DAY, 0)
-                        set(Calendar.MINUTE, 0)
-                        set(Calendar.SECOND, 0)
-                        set(Calendar.MILLISECOND, 0)
-                    }
-                    
-                    val calToday = Calendar.getInstance().apply {
-                        set(Calendar.HOUR_OF_DAY, 0)
-                        set(Calendar.MINUTE, 0)
-                        set(Calendar.SECOND, 0)
-                        set(Calendar.MILLISECOND, 0)
-                    }
-                    
-                    val existingSpendingDays = txList.filter { it.type == "SPENDING" }.map { tx ->
-                        Calendar.getInstance().apply {
-                            timeInMillis = tx.timestamp
-                            set(Calendar.HOUR_OF_DAY, 0)
-                            set(Calendar.MINUTE, 0)
-                            set(Calendar.SECOND, 0)
-                            set(Calendar.MILLISECOND, 0)
-                        }.timeInMillis
-                    }.toSet()
-
-                    val listToInsert = mutableListOf<Transaction>()
-                    val daysLimit = 100 // Prevent adding infinite records
-                    var daysAdded = 0
-                    
-                    while (!calStart.after(calToday) && daysAdded < daysLimit) {
-                        val dayMidnight = calStart.timeInMillis
-                        val dateStr = dateFormat.format(calStart.time)
-                        val inLeave = LeaveUtils.isDayInLeave(dayMidnight, leaves)
-                        if (!inLeave && !existingSpendingDays.contains(dayMidnight) && !deletedDatesSet.contains(dateStr)) {
-                            listToInsert.add(
-                                Transaction(
-                                    type = "SPENDING",
-                                    amount = settings.standardSpendingAmount,
-                                    timestamp = dayMidnight + 12 * 60 * 60 * 1000, // noon
-                                    voiceText = "صرفة يومية تلقائية 🤖"
-                                )
-                            )
-                        }
-                        calStart.add(Calendar.DAY_OF_YEAR, 1)
-                        daysAdded++
-                    }
-
-                    if (listToInsert.isNotEmpty()) {
-                        for (tx in listToInsert) {
-                            repository.insertTransaction(tx)
-                        }
-                        if (settings.voiceEnabled) {
-                            speakOutText("تمت إضافة الصرفيات التلقائية المتأخرة")
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("SalaryViewModel", "Error auto-adding spendings", e)
-                }
+            val user = activeUser.value
+            if (user != null) {
+                val uDb = AppDatabase.getDatabaseForUser(getApplication(), user)
+                syncAutoDailySpendingsForWorker(user, uDb, settings)
             }
         }
     }
@@ -1635,7 +1677,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                     connection.useCaches = false
                     connection.setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate")
                     connection.setRequestProperty("Pragma", "no-cache")
-                    connection.setRequestProperty("User-Agent", "AndroidSalaryApp/1.3.0")
+                    connection.setRequestProperty("User-Agent", "AndroidSalaryApp/1.3.1")
 
                     lastResponseCode = connection.responseCode
                     if (lastResponseCode == 200) {
@@ -1643,12 +1685,12 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         val json = org.json.JSONObject(text)
                         
                         val versionCode = if (json.has("versionCode")) {
-                            json.optInt("versionCode", json.optString("versionCode", "130").toIntOrNull() ?: 130)
+                            json.optInt("versionCode", json.optString("versionCode", "131").toIntOrNull() ?: 131)
                         } else {
-                            json.optInt("version_code", 130)
+                            json.optInt("version_code", 131)
                         }
                         
-                        val versionName = json.optString("versionName", json.optString("version_name", "1.3.0"))
+                        val versionName = json.optString("versionName", json.optString("version_name", "1.3.1"))
                         val changelog = json.optString("changelog", json.optString("notes", ""))
                         val updateUrl = json.optString("updateUrl", json.optString("download_url", "https://github.com/husamalhattami100"))
                         val isMandatory = json.optBoolean("isMandatory", json.optBoolean("is_mandatory", json.optBoolean("forceUpdate", json.optBoolean("force_update", false))))
@@ -1669,7 +1711,7 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
                         } else {
                             _updateInfo.value = UpdateInfo(hasUpdate = false)
                             if (isManual) {
-                                _userNotice.tryEmit("✅ أنت تستخدم أحدث إصدار من التطبيق (v1.3.0)")
+                                _userNotice.tryEmit("✅ أنت تستخدم أحدث إصدار من التطبيق (v1.3.1)")
                             }
                         }
                         success = true
@@ -1694,8 +1736,8 @@ class SalaryViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun isRemoteVersionNewer(remoteCode: Int, remoteName: String): Boolean {
-        val currentCode = 130
-        val currentName = "1.3.0"
+        val currentCode = 131
+        val currentName = "1.3.1"
 
         // If remote code is clearly an integer higher than 130 (e.g. 131, 140, etc.)
         if (remoteCode > currentCode && remoteCode >= 100) {

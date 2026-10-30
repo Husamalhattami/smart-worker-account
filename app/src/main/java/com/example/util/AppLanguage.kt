@@ -264,10 +264,10 @@ class LanguageStrings(val lang: AppLanguage) {
     }
 
     val currentVersionText: String = when (lang) {
-        AppLanguage.ARABIC -> "🏷️ رقم الإصدار الحالي: v1.3.0 (مستقر)"
-        AppLanguage.ENGLISH -> "🏷️ Current Version: v1.3.0 (Stable)"
-        AppLanguage.FRENCH -> "🏷️ Version Actuelle: v1.3.0 (Stable)"
-        AppLanguage.URDU -> "🏷️ موجودہ ورژں: v1.3.0 (مستحکم)"
+        AppLanguage.ARABIC -> "🏷️ رقم الإصدار الحالي: v1.3.1 (مستقر)"
+        AppLanguage.ENGLISH -> "🏷️ Current Version: v1.3.1 (Stable)"
+        AppLanguage.FRENCH -> "🏷️ Version Actuelle: v1.3.1 (Stable)"
+        AppLanguage.URDU -> "🏷️ موجودہ ورژں: v1.3.1 (مستحکم)"
     }
 
     val backupRestoreSection: String = when (lang) {
